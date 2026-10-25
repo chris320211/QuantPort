@@ -80,7 +80,38 @@ def _fmt(value, digits: int = 4) -> str:
     return str(value)
 
 
-def render_model_card(*, request: dict, job_id: str, benchmark: dict, repo_id: str | None) -> str:
+def base_model_license(model_id: str) -> dict:
+    """License fields from the base model's Hub card, so derivatives inherit them.
+
+    `request["license"]` should be preferred by callers when set. Falls back to
+    `other` when the Hub cannot be reached rather than guessing a license.
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        hf_env = child_env(include_hf=True)
+        token = hf_env.get("HUGGINGFACE_HUB_TOKEN") or hf_env.get("HF_TOKEN")
+        info = HfApi(token=token or False).model_info(model_id, timeout=30)
+        card = info.card_data.to_dict() if info.card_data else {}
+    except Exception:
+        card = {}
+    out = {"license": str(card.get("license") or "other")}
+    for key in ("license_name", "license_link"):
+        if card.get(key):
+            out[key] = str(card[key])
+    if out["license"] == "other" and "license_link" not in out and model_id:
+        out["license_link"] = f"https://huggingface.co/{model_id}"
+    return out
+
+
+def render_model_card(
+    *,
+    request: dict,
+    job_id: str,
+    benchmark: dict,
+    repo_id: str | None,
+    license_info: dict | None = None,
+) -> str:
     method = str(request.get("method_name") or "quantization")
     model_id = str(request.get("model_id") or "")
     gpu = str(request.get("gpu_name") or request.get("gpu") or request.get("gpu_instance") or "")
@@ -89,9 +120,13 @@ def render_model_card(*, request: dict, job_id: str, benchmark: dict, repo_id: s
     base = benchmark.get("fp16_baseline") if isinstance(benchmark.get("fp16_baseline"), dict) else {}
     cmp_ = benchmark.get("comparison") if isinstance(benchmark.get("comparison"), dict) else {}
     hub = repo_id or f"<org>/{request.get('slug')}"
+    lic = license_info or {"license": "other"}
+    license_lines = "".join(
+        f"{key}: {lic[key]}\n" for key in ("license", "license_name", "license_link") if lic.get(key)
+    )
     return f"""---
-license: mit
-base_model: {model_id}
+{license_lines}base_model: {model_id}
+base_model_relation: quantized
 library_name: transformers
 pipeline_tag: text-generation
 tags:
@@ -136,8 +171,9 @@ repo (and overlay, if any) is on `QUANT_AGENT_METHOD_REPO`. See
 
 ## License
 
-Base model license (MIT for Phi-3) plus the method repository license.
-Keep `LICENSE` / `NOTICE.md` from the snapshot when present.
+Inherits the license of [`{model_id}`](https://huggingface.co/{model_id})
+(`{lic["license"]}`), plus the method repository license. Keep `LICENSE` /
+`NOTICE.md` from the snapshot when present.
 """
 
 
@@ -203,8 +239,18 @@ def stage_hub_bundle(
         atomic_write_text(dest / "quant_agent_inference_adapter.py", adapter_text, mode=0o644)
         copied.append("quant_agent_inference_adapter.py")
 
+    model_id = str(request.get("model_id") or "")
+    license_info = (
+        {"license": str(request["license"])}
+        if request.get("license")
+        else base_model_license(model_id)
+    )
     card = render_model_card(
-        request=request, job_id=job_id, benchmark=benchmark, repo_id=repo_id
+        request=request,
+        job_id=job_id,
+        benchmark=benchmark,
+        repo_id=repo_id,
+        license_info=license_info,
     )
     atomic_write_text(dest / "README.md", card, mode=0o644)
     metrics = {

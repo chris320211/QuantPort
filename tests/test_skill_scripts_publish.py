@@ -48,6 +48,20 @@ def test_render_model_card_uses_benchmark_numbers():
     assert "20260919T202736Z-5a1860" in card
     assert "snapshot_download" in card
     assert "microsoft/Phi-3-mini-4k-instruct" in card
+    assert "base_model_relation: quantized" in card
+    assert "license: other" in card
+
+
+def test_render_model_card_inherits_base_license():
+    card = publish_mod.render_model_card(
+        request={"method_name": "SmoothQuant", "model_id": "google/gemma-2-2b-it"},
+        job_id="job",
+        benchmark={},
+        repo_id=None,
+        license_info={"license": "gemma"},
+    )
+    assert "license: gemma\n" in card
+    assert "license: mit" not in card
 
 
 def test_upload_requires_org_name_repo_id():
