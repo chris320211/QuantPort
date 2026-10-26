@@ -72,6 +72,19 @@ def _read_json(path: Path) -> dict:
     return data
 
 
+def _weight_files(stage_dir: Path, weight_srcs: list[str]) -> list[str]:
+    """Weight files a Hub bundle will carry: staged copies plus large originals."""
+    staged = []
+    if stage_dir.is_dir():
+        staged = [
+            path.name
+            for path in stage_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _WEIGHT_SUFFIXES
+        ]
+    external = [Path(src).name for src in weight_srcs if Path(src).is_file()]
+    return sorted(set(staged + external))
+
+
 def _fmt(value, digits: int = 4) -> str:
     if isinstance(value, bool) or value is None:
         return str(value)
@@ -273,6 +286,13 @@ def stage_hub_bundle(
     if packed.is_file() and packed.resolve() not in {path.resolve() for path in large_weights}:
         large_weights.append(packed)
     weight_srcs = [str(path.resolve()) for path in large_weights]
+    if not _weight_files(dest, weight_srcs):
+        # A bundle without weights uploads configs only and cannot be reloaded.
+        shutil.rmtree(dest)
+        raise RuntimeError(
+            f"no weight file ({', '.join(sorted(_WEIGHT_SUFFIXES))}) found in {output_dir}; "
+            "refusing to stage a Hub bundle without weights"
+        )
     weight_src = weight_srcs[0] if weight_srcs else None
     manifest = {
         "status": "staged",
@@ -293,6 +313,14 @@ def upload_hub_bundle(manifest: dict, repo_id: str) -> dict:
     require_host_execution("huggingface hub upload")
     if not _REPO_ID_RE.fullmatch(repo_id):
         raise ValueError(f"repo_id is not org/name: {repo_id!r}")
+    weight_srcs = list(manifest.get("weight_srcs") or [])
+    if manifest.get("weight_src"):
+        weight_srcs.append(str(manifest["weight_src"]))
+    stage_dir = manifest.get("stage_dir")
+    if not stage_dir or not _weight_files(Path(stage_dir), weight_srcs):
+        raise RuntimeError(
+            "staged bundle has no weight file; refusing to upload a Hub repo without weights"
+        )
     hf_env = child_env(include_hf=True)
     token = hf_env.get("HUGGINGFACE_HUB_TOKEN") or hf_env.get("HF_TOKEN")
     if not token:
