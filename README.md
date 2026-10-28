@@ -13,6 +13,29 @@ paper and code, runs one job, checks that the saved weights still generate,
 and publishes successful runs. When the format allows, it also publishes a
 vLLM build of the same weights.
 
+```mermaid
+flowchart TD
+  in["You: method + model + GPU"] --> setup["quant-setup<br/>load .env"]
+  setup --> gather["quant-gather<br/>paper, code, model snapshot, venv"]
+  gather --> port["quant-port<br/>adapt the method, up to 3 strategies"]
+  port --> run["quant-run<br/>quantize on the GPU"]
+  run --> verify["quant-verify<br/>saved weights still generate"]
+  verify --> bench["quant-benchmark<br/>WikiText-2 vs fp16"]
+  run -. fails .-> diag
+  verify -. fails .-> diag
+  bench --> diag{"quant-diagnose"}
+  diag -->|retry| run
+  diag -->|kernel| kernel["quant-kernel<br/>packed / prefill kernels"]
+  kernel --> run
+  diag -->|done| ok{"PPL ≤ 1.5× fp16<br/>and faster or smaller?"}
+  ok -->|yes| serve["quant-serve<br/>vLLM export + serve check"]
+  serve --> pub["quant-publish<br/>weights to the Hub, plus a -vllm build if it passed"]
+  pub --> cat["quant-catalog<br/>row in LIBRARY.md"]
+  ok -->|no| att["quant-catalog<br/>row in ATTEMPTS.md"]
+  cat --> sync["quant-sync<br/>push library/, refresh the HF collection"]
+  att --> sync
+```
+
 ## Library
 
 A run is published when perplexity stays within 1.5× fp16 **and** VRAM or
