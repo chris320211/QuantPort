@@ -13,6 +13,8 @@ paper and code, runs one job, checks that the saved weights still generate,
 and publishes successful runs. When the format allows, it also publishes a
 vLLM build of the same weights.
 
+Note: Ports could utilize already existing quantization formats in literature or adapt to unsupported models.
+
 ```mermaid
 flowchart TD
   in["You: method + model + GPU"] --> setup["quant-setup<br/>load .env"]
