@@ -34,10 +34,27 @@
     "ppl_ratio": 1.0285319320033748,
     "hf_ppl_ratio": 1.021530187291258,
     "ppl_ratio_drift": 1.0068541730819358,
-    "prefill_speedup": 1.925614552341063,
+    "prefill_speedup": 2.0161517190148204,
     "decode_speedup": {
-      "1": 1.373888488816414,
-      "16": 1.3949734885553982
+      "1": 1.4083902897566845,
+      "16": 1.3907198108826095
+    },
+    "hf_runtime": {
+      "transformers_version": "4.46.3",
+      "dtype": "bfloat16",
+      "ppl_ratio": 1.0206565222816955,
+      "int8_prefill_speedup": 1.4052849715740692,
+      "int8_decode_speedup": {
+        "1": 0.5341169588490787,
+        "16": 0.5037609012780935
+      },
+      "vllm_prefill_speedup": 3.1275921691645086,
+      "vllm_decode_speedup": {
+        "1": 18.617049314242873,
+        "16": 15.569554901693431
+      },
+      "peak_vram_gb": 8.090173244476318,
+      "baseline_peak_vram_gb": 9.97325849533081
     },
     "checked_at": "2026-10-28",
     "hub_repo_id": "chris320211/smoothquant-gemma2-2b-g52xlarge-vllm",

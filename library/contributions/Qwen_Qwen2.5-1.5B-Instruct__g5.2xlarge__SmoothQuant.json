@@ -30,13 +30,31 @@
     "profile": "w8a8_int8",
     "vllm_version": "0.30.0",
     "gpu_name": "NVIDIA GeForce RTX 3090",
-    "ppl_ratio": 1.0147776267267183,
+    "dtype": "float16",
+    "ppl_ratio": 1.0147780293288762,
     "hf_ppl_ratio": 1.0509194183236885,
-    "ppl_ratio_drift": 0.9656093597979,
-    "prefill_speedup": 1.7787977332763685,
+    "ppl_ratio_drift": 0.9656097428930744,
+    "prefill_speedup": 1.8467338595338085,
     "decode_speedup": {
-      "1": 1.2953244147182013,
-      "16": 1.4238580518197002
+      "1": 1.250394546364483,
+      "16": 1.4188319336669322
+    },
+    "hf_runtime": {
+      "transformers_version": "4.46.3",
+      "dtype": "float16",
+      "ppl_ratio": 1.0509733211494587,
+      "int8_prefill_speedup": 1.189971995197693,
+      "int8_decode_speedup": {
+        "1": 0.41055568750527643,
+        "16": 0.39200321308485586
+      },
+      "vllm_prefill_speedup": 2.038607207645943,
+      "vllm_decode_speedup": {
+        "1": 18.28402069081318,
+        "16": 16.675798193583287
+      },
+      "peak_vram_gb": 4.682332515716553,
+      "baseline_peak_vram_gb": 5.843606472015381
     },
     "checked_at": "2026-10-28",
     "hub_repo_id": "chris320211/smoothquant-qwen25-15b-g52xlarge-vllm",

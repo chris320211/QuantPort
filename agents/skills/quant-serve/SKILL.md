@@ -67,8 +67,12 @@ Do not ask the parent mid-stage. Never read `.env`; this stage needs no tokens.
    vLLM pins its own torch; `.venvs/vllm-serve` is never a method venv. The
    install ends by importing vLLM and checking CUDA, so it reports `failed` on
    a host without a GPU. If the host driver is older than the pinned wheel's
-   CUDA runtime (import error such as `libcudart.so.13`), reinstall with
-   `--vllm-spec vllm==X.Y.Z`.
+   CUDA runtime (import error such as `libcudart.so.13`, or `torch.cuda` false
+   on a CUDA 12.x driver), reinstall with `--vllm-cuda cu129`: the same vLLM
+   version from its CUDA 12.9 release wheel, with torch from the matching
+   PyTorch index. The venv must be the real `.venvs/vllm-serve` directory (a
+   symlink is refused). Keep `datasets<5`: 5.x pulls in `torchcodec`, which
+   breaks the vLLM import on CUDA 12 builds.
 
    ```bash
    $S/serve_check.py --job-id <job_id> --request out/requests/<slug>.json \
@@ -90,6 +94,30 @@ Do not ask the parent mid-stage. Never read `.env`; this stage needs no tokens.
 
    No NVIDIA GPU on this host: stop after step 1 and return `exported`
    (`serve_check: pending`). Never claim vLLM support without a passed check.
+
+3. Same-GPU Transformers comparison (passed checks only, same GPU). The HF
+   benchmark ran on the board's GPU, so its tok/s cannot be set against vLLM.
+   Measure the native artifact and the fp16 snapshot in plain Transformers on
+   this GPU with the **method venv** (never the serve venv), then attach both:
+
+   ```bash
+   M=.venvs/<slug>/bin/python; C=.cache/eval/wikitext-2-raw-v1-test.jsonl
+   QUANT_AGENT_METHOD_REPO=<method repo> PYTHONPATH=<method repo> \
+     $M $S/hf_runtime.py measure --model-dir quantized/<slug> --eval-path $C \
+     --adapter quantized/<slug>/quant_agent_inference_adapter.py --out jobs/<job_id>/hf_runtime_int8.json
+   $M $S/hf_runtime.py measure --model-dir <fp16 snapshot> --eval-path $C \
+     --dtype <the report's dtype> --out jobs/<job_id>/hf_runtime_base.json
+   $S/hf_runtime.py attach --report jobs/<job_id>/vllm.json \
+     --quantized jobs/<job_id>/hf_runtime_int8.json --baseline jobs/<job_id>/hf_runtime_base.json
+   ```
+
+   Same windows and decode test as step 2. `attach` refuses sides from another
+   GPU or a baseline dtype that differs from the serve check's. The result
+   adds Transformers columns to the vLLM results on both Hub cards and a
+   "against plain Transformers" clause to the library line. Plain
+   Transformers int8 decodes slower than fp16 (it quantizes activations at
+   every step); say so, and point serving users to the `-vllm` build. Skip
+   this step if the method venv is gone; the vLLM results stand alone.
 
 ## Backfill an already-published run
 
@@ -116,6 +144,11 @@ $S/library.py --record-vllm --model-id <org/model> --gpu-instance <instance> --m
 A failed or unsupported result is recorded the same way, without
 `publish_vllm.py` and without `--vllm-repo-id`.
 
+To add step 3's numbers to a build that is already published, attach them to
+the serve report, then rerun the two commands above with `--refresh-card` in
+place of `--upload`. It re-uploads only the card and records, never the
+weights, and refreshes the base card's vLLM section.
+
 `--force` replaces only a directory that already holds a `vllm_export.json`,
 and the output may never contain the source. Export runs on any machine (CPU only). The serve check needs a GPU with
 compute capability ≥ 7.5 (T4, A10G, L4, A100, …).
@@ -130,6 +163,7 @@ export_dir: quantized/<slug>-vllm/
 report: jobs/<job_id>/vllm.json          # after a serve check
 ppl_ratio: <vLLM quant / vLLM fp16>  drift: <vs HF benchmark>
 prefill_speedup: <x>  decode_speedup: {1: <x>, 16: <x>}
+hf_runtime: attached | skipped           # step 3
 ```
 
 The parent publishes the native artifact whatever this returns. On

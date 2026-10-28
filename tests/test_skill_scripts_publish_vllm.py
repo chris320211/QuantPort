@@ -153,3 +153,53 @@ def test_card_names_the_baseline_dtype():
         model_id="m", method_name="M", base_repo_id="a/b", repo_id="a/b-vllm",
         report=_report(), export_record={}, license_info=LICENSE,
     )
+
+
+def _with_hf_runtime(report):
+    side = lambda ppl, pre, d1, d16, vram: {  # noqa: E731
+        "dtype": "float16", "perplexity": ppl, "prefill": {"tokens_per_s": pre, "micro_batch": 8},
+        "decode": [{"batch": 1, "tokens_per_s": d1}, {"batch": 16, "tokens_per_s": d16}], "peak_vram_gb": vram,
+    }
+    return {**report, "hf_runtime": {
+        "gpu_name": "NVIDIA GeForce RTX 3090", "dtype": "float16",
+        "torch_version": "2.7.1+cu128", "transformers_version": "4.46.3",
+        "quantized": side(10.5, 21000.0, 6.0, 90.0, 4.68),
+        "baseline": side(10.0, 18000.0, 14.0, 220.0, 5.84),
+        "comparison": {
+            "ppl_ratio": 1.05, "int8_prefill_speedup": 21000 / 18000,
+            "int8_decode_speedup": {"1": 6 / 14, "16": 90 / 220},
+            "vllm_prefill_speedup": 26000 / 18000, "vllm_decode_speedup": {"1": 120 / 14, "16": 1500 / 220},
+        },
+    }}
+
+
+def test_card_adds_transformers_columns_from_the_same_gpu():
+    card = pv.render_vllm_card(
+        model_id="org/model", method_name="SmoothQuant", base_repo_id="me/sq-model", repo_id="me/sq-model-vllm",
+        report=_with_hf_runtime(_report()), export_record={}, license_info=LICENSE,
+    )
+    assert "| | vLLM int8 | vLLM fp16 | Transformers int8 | Transformers fp16 |" in card
+    assert "| Decode tok/s, batch 1 | 120.0 | 100.0 | 6.0 | 14.0 |" in card
+    assert "| Peak VRAM GB | – | – | 4.68 | 5.84 |" in card
+    assert "Transformers 4.46.3 (torch 2.7.1+cu128) on the same GPU" in card
+    assert "vLLM int8 prefill 1.44×" in card
+    assert "compare speed within this table only" not in card
+    plain = pv.render_vllm_card(
+        model_id="org/model", method_name="SmoothQuant", base_repo_id="me/sq-model", repo_id="me/sq-model-vllm",
+        report=_report(), export_record={}, license_info=LICENSE,
+    )
+    assert "Transformers" not in plain and "compare speed within this table only" in plain
+
+
+def test_base_card_section_carries_vllm_results_and_serving_advice():
+    section = pv.render_card_section(
+        repo_id="me/sq-model-vllm", report=_with_hf_runtime(_report()), base_repo_id="me/sq-model", model_id="org/model",
+    )
+    assert section.startswith(pv.CARD_SECTION_BEGIN) and section.rstrip().endswith(pv.CARD_SECTION_END)
+    assert "## vLLM results" in section
+    assert "| | vLLM int8 | vLLM fp16 | Transformers int8 | Transformers fp16 |" in section
+    assert "For serving, use [`me/sq-model-vllm`]" in section
+    assert "## vLLM results" not in pv.render_card_section(repo_id="me/sq-model-vllm", report=_report())
+    card = "# X\n\n## License\n\nMIT\n"
+    once = pv.merge_card_section(card, section)
+    assert pv.merge_card_section(once, section) == once

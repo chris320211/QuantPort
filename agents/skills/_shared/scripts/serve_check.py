@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,10 @@ FALLBACK_DTYPE = "bfloat16"
 # vLLM's refusal when an architecture is not allowed to run in float16.
 _FP16_REFUSED = "does not support float16"
 _DTYPE_LABELS = {"float16": "fp16", "bfloat16": "bf16"}
+_VLLM_RELEASE_WHEEL = (
+    "https://github.com/vllm-project/vllm/releases/download/v{version}/"
+    "vllm-{version}+{cuda}-cp38-abi3-manylinux_2_28_x86_64.whl"
+)
 # Offline: no Hub calls and no vLLM usage-stats upload.
 SERVE_CHILD_ENV = {
     "HF_HUB_OFFLINE": "1",
@@ -256,11 +261,13 @@ def serve_venv_python() -> Path:
     return venv_python(SERVE_VENV_SLUG)
 
 
-def install_serve_venv(python: str, vllm_spec: str | None = None) -> dict:
+def install_serve_venv(python: str, vllm_spec: str | None = None, vllm_cuda: str | None = None) -> dict:
     """Create `.venvs/vllm-serve` with the pinned vLLM. Separate from every method venv.
 
     `vllm_spec` (e.g. `vllm==0.19.0`) overrides the pin when the host driver is
-    older than the pinned wheel's CUDA runtime.
+    older than the pinned wheel's CUDA runtime. `vllm_cuda` (e.g. `cu129`)
+    keeps the version but installs vLLM's release wheel built for that CUDA,
+    with torch from the matching PyTorch index (PyPI's wheel targets CUDA 13).
     """
     from install_venv import _run_argv
 
@@ -282,12 +289,20 @@ def install_serve_venv(python: str, vllm_spec: str | None = None) -> dict:
         if not vllm_spec.startswith("vllm==") or any(ch.isspace() for ch in vllm_spec):
             raise ValueError(f"--vllm-spec must look like vllm==X.Y.Z, got {vllm_spec!r}")
         packages = [vllm_spec if pkg.startswith("vllm==") else pkg for pkg in packages]
+    index_args: list[str] = []
+    if vllm_cuda:
+        if not re.fullmatch(r"cu1\d{2}", vllm_cuda):
+            raise ValueError(f"--vllm-cuda must look like cu129, got {vllm_cuda!r}")
+        version = next(pkg for pkg in packages if pkg.startswith("vllm==")).split("==", 1)[1]
+        wheel = _VLLM_RELEASE_WHEEL.format(version=version, cuda=vllm_cuda)
+        packages = [f"vllm @ {wheel}" if pkg.startswith("vllm==") else pkg for pkg in packages]
+        index_args = ["--extra-index-url", f"https://download.pytorch.org/whl/{vllm_cuda}"]
     venv_dir = paths.VENV_ROOT / SERVE_VENV_SLUG
     scratch = paths.VENV_ROOT / ".scratch" / SERVE_VENV_SLUG
     steps = [
         [python, "-m", "venv", str(venv_dir)],
         [str(venv_dir / "bin" / "python"), "-m", "pip", "install", "--upgrade", "pip", "wheel"],
-        [str(venv_dir / "bin" / "python"), "-m", "pip", "install", *packages],
+        [str(venv_dir / "bin" / "python"), "-m", "pip", "install", *index_args, *packages],
     ]
     results = []
     for argv in steps:
@@ -302,7 +317,10 @@ def install_serve_venv(python: str, vllm_spec: str | None = None) -> dict:
             "venv": str(venv_dir),
             "packages": packages,
             "error": error,
-            "hint": "if the error names libcudart or a CUDA version, reinstall with --vllm-spec vllm==X.Y.Z",
+            "hint": (
+                "if the error names libcudart or a CUDA version, reinstall with --vllm-cuda cu129 "
+                "(CUDA 12.x driver) or --vllm-spec vllm==X.Y.Z"
+            ),
         }
     return {"status": "installed", "venv": str(venv_dir), "packages": packages}
 
@@ -554,12 +572,13 @@ def main() -> int:
     parser.add_argument("--out", type=Path, help="Report path (with --model-dir)")
     parser.add_argument("--python", default=sys.executable, help="Interpreter for --install (>= 3.11)")
     parser.add_argument("--vllm-spec", help="Override the vLLM pin for --install (vllm==X.Y.Z)")
+    parser.add_argument("--vllm-cuda", help="--install vLLM's release wheel for this CUDA (cu129 on a 12.x driver)")
     parser.add_argument("--allow-unsafe-host-execution", action="store_true")
     args = parser.parse_args()
     try:
         with env.host_execution_policy(args.allow_unsafe_host_execution):
             if args.install:
-                result = install_serve_venv(args.python, args.vllm_spec)
+                result = install_serve_venv(args.python, args.vllm_spec, args.vllm_cuda)
                 print(json.dumps(result, indent=2))
                 return 0 if result["status"] == "installed" else 1
             if args.job_id:

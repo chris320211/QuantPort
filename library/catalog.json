@@ -31,13 +31,31 @@
         "profile": "w8a8_int8",
         "vllm_version": "0.30.0",
         "gpu_name": "NVIDIA GeForce RTX 3090",
-        "ppl_ratio": 1.0147776267267183,
+        "dtype": "float16",
+        "ppl_ratio": 1.0147780293288762,
         "hf_ppl_ratio": 1.0509194183236885,
-        "ppl_ratio_drift": 0.9656093597979,
-        "prefill_speedup": 1.7787977332763685,
+        "ppl_ratio_drift": 0.9656097428930744,
+        "prefill_speedup": 1.8467338595338085,
         "decode_speedup": {
-          "1": 1.2953244147182013,
-          "16": 1.4238580518197002
+          "1": 1.250394546364483,
+          "16": 1.4188319336669322
+        },
+        "hf_runtime": {
+          "transformers_version": "4.46.3",
+          "dtype": "float16",
+          "ppl_ratio": 1.0509733211494587,
+          "int8_prefill_speedup": 1.189971995197693,
+          "int8_decode_speedup": {
+            "1": 0.41055568750527643,
+            "16": 0.39200321308485586
+          },
+          "vllm_prefill_speedup": 2.038607207645943,
+          "vllm_decode_speedup": {
+            "1": 18.28402069081318,
+            "16": 16.675798193583287
+          },
+          "peak_vram_gb": 4.682332515716553,
+          "baseline_peak_vram_gb": 5.843606472015381
         },
         "checked_at": "2026-10-28",
         "hub_repo_id": "chris320211/smoothquant-qwen25-15b-g52xlarge-vllm",
@@ -78,10 +96,27 @@
         "ppl_ratio": 1.0285319320033748,
         "hf_ppl_ratio": 1.021530187291258,
         "ppl_ratio_drift": 1.0068541730819358,
-        "prefill_speedup": 1.925614552341063,
+        "prefill_speedup": 2.0161517190148204,
         "decode_speedup": {
-          "1": 1.373888488816414,
-          "16": 1.3949734885553982
+          "1": 1.4083902897566845,
+          "16": 1.3907198108826095
+        },
+        "hf_runtime": {
+          "transformers_version": "4.46.3",
+          "dtype": "bfloat16",
+          "ppl_ratio": 1.0206565222816955,
+          "int8_prefill_speedup": 1.4052849715740692,
+          "int8_decode_speedup": {
+            "1": 0.5341169588490787,
+            "16": 0.5037609012780935
+          },
+          "vllm_prefill_speedup": 3.1275921691645086,
+          "vllm_decode_speedup": {
+            "1": 18.617049314242873,
+            "16": 15.569554901693431
+          },
+          "peak_vram_gb": 8.090173244476318,
+          "baseline_peak_vram_gb": 9.97325849533081
         },
         "checked_at": "2026-10-28",
         "hub_repo_id": "chris320211/smoothquant-gemma2-2b-g52xlarge-vllm",

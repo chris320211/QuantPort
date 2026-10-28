@@ -760,3 +760,37 @@ def test_record_vllm_keeps_the_baseline_dtype(tmp_path, monkeypatch):
     assert "PPL ratio 1.0400 vs vLLM bf16" in (tmp_path / "library" / "LIBRARY.md").read_text()
     with pytest.raises(ValueError, match="vllm.dtype"):
         library_mod.validate_vllm_block({"status": "pending", "dtype": "float32"})
+
+
+def test_record_vllm_keeps_the_same_gpu_transformers_comparison(tmp_path, monkeypatch):
+    import pytest
+
+    _accept_awq(tmp_path, monkeypatch)
+    hf_runtime = {
+        "gpu_name": "NVIDIA GeForce RTX 3090", "dtype": "float16", "transformers_version": "4.46.3",
+        "quantized": {"peak_vram_gb": 4.68}, "baseline": {"peak_vram_gb": 5.84},
+        "comparison": {
+            "ppl_ratio": 1.05, "int8_prefill_speedup": 1.19, "int8_decode_speedup": {"1": 0.41, "16": 0.39},
+            "vllm_prefill_speedup": 2.04, "vllm_decode_speedup": {"1": 18.23, "16": 16.68},
+        },
+    }
+    library_mod.record_vllm(
+        model_id="org/model", gpu_instance="g5.2xlarge", method_name="SmoothQuant",
+        export_record={"status": "exported", "profile": "w8a8_int8"},
+        serve_report={**_serve_report(), "hf_runtime": hf_runtime}, hub_repo_id="me/sq-model-vllm",
+    )
+    block = library_mod.query()[0]["vllm"]["hf_runtime"]
+    assert block["vllm_decode_speedup"] == {"1": 18.23, "16": 16.68}
+    assert block["peak_vram_gb"] == 4.68 and block["baseline_peak_vram_gb"] == 5.84
+    md = (tmp_path / "library" / "LIBRARY.md").read_text()
+    assert (
+        "Against plain Transformers fp16 on the same GPU: vLLM int8 prefill 2.04×, decode 18.23× batch 1, "
+        "16.68× batch 16; the native artifact in Transformers prefill 1.19×, decode 0.41× batch 1, 0.39× batch 16."
+    ) in md
+    with pytest.raises(ValueError, match="hf_runtime"):
+        library_mod.validate_vllm_block({"status": "pending", "hf_runtime": {"ppl_ratio": 1.0}})
+    with pytest.raises(ValueError, match="int8_decode_speedup"):
+        library_mod.validate_vllm_block({
+            "status": "passed", "vllm_version": "0.30.0", "gpu_name": "x", "ppl_ratio": 1.0,
+            "hf_runtime": {**library_mod._hf_runtime_summary(hf_runtime), "int8_decode_speedup": {"1": "fast"}},
+        })

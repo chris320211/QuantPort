@@ -308,3 +308,27 @@ def test_other_load_errors_do_not_retry(check_env, monkeypatch):
 def test_reports_without_dtype_read_as_fp16():
     assert serve_mod.dtype_label({}) == "fp16"
     assert serve_mod.dtype_label({"dtype": "float16"}) == "fp16"
+
+
+def test_install_can_take_the_cuda_12_release_wheel(tmp_path, monkeypatch):
+    import install_venv
+    import paths as paths_mod
+
+    calls = []
+    monkeypatch.setattr(paths_mod, "VENV_ROOT", tmp_path / ".venvs")
+    monkeypatch.setattr(install_venv, "_run_argv", lambda argv, *a, **k: calls.append(argv) or {"ok": True})
+    monkeypatch.setattr(serve_mod, "probe_runtime", lambda *a: None)
+    with env_mod.host_execution_policy(True):
+        result = serve_mod.install_serve_venv(sys.executable, vllm_cuda="cu129")
+    assert result["status"] == "installed"
+    pip = calls[-1]
+    assert pip[pip.index("--extra-index-url") + 1] == "https://download.pytorch.org/whl/cu129"
+    version = next(p for p in serve_mod.SERVE_PACKAGES if p.startswith("vllm==")).split("==")[1]
+    assert (
+        f"vllm @ https://github.com/vllm-project/vllm/releases/download/v{version}/"
+        f"vllm-{version}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl"
+    ) in pip
+    assert not any(p.startswith("vllm==") for p in pip)
+    with pytest.raises(ValueError, match="cu129"):
+        with env_mod.host_execution_policy(True):
+            serve_mod.install_serve_venv(sys.executable, vllm_cuda="12.9")

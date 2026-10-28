@@ -54,6 +54,54 @@ def _decode_rows(side: dict) -> dict[int, dict]:
     return {int(row["batch"]): row for row in side.get("decode") or [] if "batch" in row}
 
 
+def _speedup_text(decode: dict | None, fmt: str = "{v}× at batch {b}") -> str:
+    items = sorted((decode or {}).items(), key=lambda kv: int(kv[0]))
+    return ", ".join(fmt.format(v=_fmt(v, 2), b=b) for b, v in items) or "n/a"
+
+
+def render_results_table(report: dict) -> str:
+    """vLLM int8 vs the vLLM baseline, plus plain-Transformers columns when `hf_runtime` is attached."""
+    ref = dtype_label(report)
+    sides = [("vLLM int8", report.get("quantized") or {}), (f"vLLM {ref}", report.get("fp16_baseline") or {})]
+    hf = report.get("hf_runtime")
+    if isinstance(hf, dict):
+        sides += [("Transformers int8", hf.get("quantized") or {}), (f"Transformers {ref}", hf.get("baseline") or {})]
+    batches = sorted(_decode_rows(sides[0][1]))
+    rows = [
+        ("Perplexity", [_fmt(s.get("perplexity"), 4) for _, s in sides]),
+        ("Prefill tok/s", [_fmt((s.get("prefill") or {}).get("tokens_per_s"), 1) for _, s in sides]),
+        *(
+            (f"Decode tok/s, batch {b}", [_fmt(_decode_rows(s).get(b, {}).get("tokens_per_s"), 1) for _, s in sides])
+            for b in batches
+        ),
+    ]
+    if isinstance(hf, dict):
+        # vLLM preallocates its KV cache, so its peak VRAM says nothing about the weights.
+        rows.append(("Peak VRAM GB", ["–", "–"] + [_fmt(s.get("peak_vram_gb"), 2) for _, s in sides[2:]]))
+    head = "| | " + " | ".join(name for name, _ in sides) + " |\n"
+    rule = "| --- |" + " ---: |" * len(sides) + "\n"
+    return head + rule + "".join(f"| {label} | " + " | ".join(cells) + " |\n" for label, cells in rows)
+
+
+def _hf_runtime_notes(report: dict, base_repo_id: str) -> str:
+    hf = report.get("hf_runtime")
+    if not isinstance(hf, dict):
+        return ""
+    ref = dtype_label(report)
+    cmp_ = hf.get("comparison") or {}
+    q_dtype = (hf.get("quantized") or {}).get("dtype")
+    q_note = f" (in {dtype_label({'dtype': q_dtype})}, as benchmarked)" if q_dtype and q_dtype != hf.get("dtype") else ""
+    return (
+        f"- Transformers columns: the native artifact `{base_repo_id}` through its inference adapter{q_note}, and "
+        f"`{report.get('model_id') or 'the original model'}` in {ref}, in Transformers "
+        f"{hf.get('transformers_version')} (torch {hf.get('torch_version')}) on the same GPU. Transformers "
+        "prefills 8 windows per forward; vLLM schedules all 32.\n"
+        f"- Against Transformers {ref}: vLLM int8 prefill {_fmt(cmp_.get('vllm_prefill_speedup'), 2)}×, decode "
+        f"{_speedup_text(cmp_.get('vllm_decode_speedup'))}. The native artifact in Transformers: prefill "
+        f"{_fmt(cmp_.get('int8_prefill_speedup'), 2)}×, decode {_speedup_text(cmp_.get('int8_decode_speedup'))}.\n"
+    )
+
+
 def render_vllm_card(
     *,
     model_id: str,
@@ -65,7 +113,6 @@ def render_vllm_card(
     license_info: dict | None = None,
 ) -> str:
     quant = report.get("quantized") or {}
-    base = report.get("fp16_baseline") or {}
     cmp_ = report.get("comparison") or {}
     ref = dtype_label(report)
     gpu = quant.get("gpu_name") or "unknown GPU"
@@ -74,16 +121,7 @@ def render_vllm_card(
     license_lines = "".join(
         f"{key}: {lic[key]}\n" for key in ("license", "license_name", "license_link") if lic.get(key)
     )
-    q_decode, b_decode = _decode_rows(quant), _decode_rows(base)
-    decode_rows = "".join(
-        f"| Decode tok/s, batch {batch} | {_fmt(q_decode[batch].get('tokens_per_s'), 1)} "
-        f"| {_fmt(b_decode.get(batch, {}).get('tokens_per_s'), 1)} |\n"
-        for batch in sorted(q_decode)
-    )
-    decode_speedups = ", ".join(
-        f"{_fmt(value, 2)}× at batch {batch}"
-        for batch, value in sorted((cmp_.get("decode_speedup") or {}).items(), key=lambda kv: int(kv[0]))
-    )
+    decode_speedups = _speedup_text(cmp_.get("decode_speedup"))
     drift = cmp_.get("ppl_ratio_drift")
     drift_line = (
         f"- Drift against the HF benchmark ratio ({_fmt(cmp_.get('hf_ppl_ratio'), 4)}): "
@@ -99,6 +137,17 @@ def render_vllm_card(
             "inputs). Same weights, not bit-identical outputs.\n"
         )
     method_tag = method_name.lower().replace(" ", "-")
+    report = {**report, "model_id": model_id}
+    if isinstance(report.get("hf_runtime"), dict):
+        speed_note = (
+            f"All columns are from {gpu}. The HF benchmark in `{base_repo_id}` used a different GPU, "
+            "so compare its speed numbers with this table's Transformers columns, not across GPUs."
+        )
+    else:
+        speed_note = (
+            f"Speed numbers are from {gpu}. The HF benchmark in `{base_repo_id}` used a\n"
+            "different GPU and runtime, so compare speed within this table only."
+        )
     return f"""---
 {license_lines}base_model: {model_id}
 base_model_relation: quantized
@@ -141,16 +190,11 @@ Measured with vLLM {version} on **{gpu}**, against vLLM {ref} of `{model_id}`.
 WikiText-2 test, 2048-token windows ({quant.get("tokens_evaluated", "?")} tokens),
 the same windows as the HF benchmark in `{base_repo_id}`.
 
-| | vLLM int8 | vLLM {ref} |
-| --- | ---: | ---: |
-| Perplexity | {_fmt(quant.get("perplexity"), 4)} | {_fmt(base.get("perplexity"), 4)} |
-| Prefill tok/s | {_fmt((quant.get("prefill") or {}).get("tokens_per_s"), 1)} | {_fmt((base.get("prefill") or {}).get("tokens_per_s"), 1)} |
-{decode_rows}
+{render_results_table(report)}
 - PPL ratio (int8 / {ref}): {_fmt(cmp_.get("ppl_ratio"), 4)}
-{drift_line}- Prefill speedup: {_fmt(cmp_.get("prefill_speedup"), 2)}×. Decode speedup: {decode_speedups or "n/a"}.
-
-Speed numbers are from {gpu}. The HF benchmark in `{base_repo_id}` used a
-different GPU and runtime, so compare speed within this table only.
+{drift_line}- Prefill speedup: {_fmt(cmp_.get("prefill_speedup"), 2)}×. Decode speedup: {decode_speedups}.
+{_hf_runtime_notes(report, base_repo_id)}
+{speed_note}
 
 ## Files
 
@@ -165,15 +209,31 @@ Inherits the license of [`{model_id}`](https://huggingface.co/{model_id})
 """
 
 
-def render_card_section(*, repo_id: str, report: dict) -> str:
-    """The short block added to the base repo's card."""
+def render_card_section(
+    *, repo_id: str, report: dict, base_repo_id: str | None = None, model_id: str | None = None
+) -> str:
+    """The block added to the base repo's card: where the vLLM build is, and its results."""
     quant = report.get("quantized") or {}
     cmp_ = report.get("comparison") or {}
     ref = dtype_label(report)
-    decode = cmp_.get("decode_speedup") or {}
-    decode_text = ", ".join(
-        f"{_fmt(v, 2)}× (batch {b})" for b, v in sorted(decode.items(), key=lambda kv: int(kv[0]))
-    )
+    decode_text = _speedup_text(cmp_.get("decode_speedup"), "{v}× (batch {b})")
+    results = ""
+    if isinstance(report.get("hf_runtime"), dict):
+        int8_decode = (report["hf_runtime"].get("comparison") or {}).get("int8_decode_speedup") or {}
+        slower = any(float(v) < 1 for v in int8_decode.values())
+        results = f"""
+## vLLM results
+
+Measured on {quant.get("gpu_name")}: the vLLM build against vLLM {ref}, and this
+repo's weights in plain Transformers against the original model.
+
+{render_results_table({**report, "model_id": model_id})}
+{_hf_runtime_notes({**report, "model_id": model_id}, base_repo_id or "this repo")}"""
+        if slower:
+            results += (
+                f"\nFor serving, use [`{repo_id}`](https://huggingface.co/{repo_id}). In plain Transformers this "
+                f"artifact decodes slower than {ref}; its gain there is memory.\n"
+            )
     return f"""{CARD_SECTION_BEGIN}
 ## Serve with vLLM
 
@@ -184,9 +244,9 @@ vllm serve {repo_id}
 ```
 
 vLLM PPL ratio {_fmt(cmp_.get("ppl_ratio"), 4)} against vLLM {ref}; prefill
-{_fmt(cmp_.get("prefill_speedup"), 2)}×, decode {decode_text or "n/a"}. Measured on
+{_fmt(cmp_.get("prefill_speedup"), 2)}×, decode {decode_text}. Measured on
 {quant.get("gpu_name")} with vLLM {quant.get("vllm_version")}.
-{CARD_SECTION_END}
+{results}{CARD_SECTION_END}
 """
 
 
@@ -296,6 +356,34 @@ def update_base_card(base_repo_id: str, section: str) -> None:
         raise RuntimeError(_redact(str(exc), token)) from None
 
 
+def refresh_hub_card(manifest: dict) -> dict:
+    """Re-upload the staged card and records to a repo that already holds the weights."""
+    require_host_execution("huggingface hub card refresh")
+    hf_env = child_env(include_hf=True)
+    token = hf_env.get("HUGGINGFACE_HUB_TOKEN") or hf_env.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN / HUGGINGFACE_HUB_TOKEN missing; set it via quant-setup")
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+    repo_id = manifest["repo_id"]
+    try:
+        remote = set(api.list_repo_files(repo_id, repo_type="model"))
+        missing = [Path(src).name for src in manifest.get("weight_srcs") or [] if Path(src).name not in remote]
+        if missing:
+            raise RuntimeError(f"{repo_id} lacks {', '.join(missing)}; publish with --upload instead")
+        api.upload_folder(
+            folder_path=manifest["stage_dir"],
+            repo_id=repo_id,
+            repo_type="model",
+            ignore_patterns=["hub_manifest.json"],
+            commit_message="Refresh vLLM results",
+        )
+    except Exception as exc:
+        raise RuntimeError(_redact(str(exc), token)) from None
+    return {**manifest, "uploaded": True, "refreshed": True}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage/upload a vLLM export as its own Hub repo")
     parser.add_argument("--export-dir", type=Path, required=True, help="quantized/<slug>-vllm")
@@ -305,8 +393,13 @@ def main() -> int:
     parser.add_argument("--model-id", help="Base model id (backfill without a request)")
     parser.add_argument("--method-name", help="Method name (backfill without a request)")
     parser.add_argument("--repo-id", help="Default: <base-repo-id>-vllm")
-    parser.add_argument("--upload", action="store_true")
-    parser.add_argument("--allow-unsafe-host-execution", action="store_true", help="Required for --upload")
+    publish = parser.add_mutually_exclusive_group()
+    publish.add_argument("--upload", action="store_true")
+    publish.add_argument(
+        "--refresh-card", action="store_true",
+        help="Already published: re-upload only the card and records, and refresh the base card",
+    )
+    parser.add_argument("--allow-unsafe-host-execution", action="store_true", help="Required for --upload/--refresh-card")
     args = parser.parse_args()
     try:
         request = load_request(args.request) if args.request else {}
@@ -322,13 +415,20 @@ def main() -> int:
             base_repo_id=args.base_repo_id,
             repo_id=args.repo_id,
         )
-        if args.upload:
+        if args.upload or args.refresh_card:
             if not args.allow_unsafe_host_execution:
                 raise RuntimeError("upload requires --allow-unsafe-host-execution")
             report = json.loads((Path(manifest["stage_dir"]) / SERVE_REPORT).read_text())
+            section = render_card_section(
+                repo_id=manifest["repo_id"], report=report,
+                base_repo_id=args.base_repo_id, model_id=str(model_id),
+            )
             with host_execution_policy(True):
-                manifest = upload_hub_bundle(manifest, manifest["repo_id"])
-                update_base_card(args.base_repo_id, render_card_section(repo_id=manifest["repo_id"], report=report))
+                if args.refresh_card:
+                    manifest = refresh_hub_card(manifest)
+                else:
+                    manifest = upload_hub_bundle(manifest, manifest["repo_id"])
+                update_base_card(args.base_repo_id, section)
             manifest["base_card_updated"] = True
         print(json.dumps(manifest, indent=2))
     except Exception as exc:
