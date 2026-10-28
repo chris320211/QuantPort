@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
   "method_name": "SmoothQuant",
   "gpu_instance": "g5.2xlarge",
@@ -24,5 +24,22 @@
   "job_id": "20260920T220639Z-9e4555",
   "slug": "smoothquant-qwen25-15b-g52xlarge",
   "artifact_dir": "quantized/smoothquant-qwen25-15b-g52xlarge",
-  "verification_status": "passed"
+  "verification_status": "passed",
+  "vllm": {
+    "status": "passed",
+    "profile": "w8a8_int8",
+    "vllm_version": "0.30.0",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "ppl_ratio": 1.0147776267267183,
+    "hf_ppl_ratio": 1.0509194183236885,
+    "ppl_ratio_drift": 0.9656093597979,
+    "prefill_speedup": 1.7787977332763685,
+    "decode_speedup": {
+      "1": 1.2953244147182013,
+      "16": 1.4238580518197002
+    },
+    "checked_at": "2026-10-28",
+    "hub_repo_id": "chris320211/smoothquant-qwen25-15b-g52xlarge-vllm",
+    "hub_url": "https://huggingface.co/chris320211/smoothquant-qwen25-15b-g52xlarge-vllm"
+  }
 }

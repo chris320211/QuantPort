@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "title": "quant-agent library",
   "hf_collection_slug": "chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230",
   "hf_collection_url": "https://huggingface.co/collections/chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230"

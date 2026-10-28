@@ -1,8 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "rows": [
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
       "method_name": "QuaRot",
       "gpu_instance": "g5.2xlarge",
@@ -51,7 +51,7 @@
       "benchmark_status": "passed"
     },
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "model_id": "google/gemma-2-2b-it",
       "method_name": "SpinQuant",
       "gpu_instance": "g5.2xlarge",
