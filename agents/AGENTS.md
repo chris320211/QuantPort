@@ -14,6 +14,7 @@ and follow `agents/skills/quant/SKILL.md`. That file is the parent dispatcher.
 | `agents/skills/quant/SKILL.md` | Parent loop |
 | `agents/skills/quant-setup/SKILL.md` | `.env` once per machine; load every shell |
 | `agents/skills/quant-gather/` … `quant-kernel/` | One GPU-stage skill each |
+| `agents/skills/quant-serve/SKILL.md` | vLLM export + serve check after a beneficial run; never gates publish |
 | `agents/skills/quant-publish/SKILL.md` | Upload weights to Hugging Face |
 | `agents/skills/quant-catalog/SKILL.md` | Library row after a beneficial run; unsuccessful attempt on STOP |
 | `agents/skills/quant-sync/SKILL.md` | Push library to GitHub and refresh the Hub collection |

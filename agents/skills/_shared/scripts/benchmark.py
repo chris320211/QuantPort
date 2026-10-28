@@ -49,8 +49,9 @@ from datasets import load_dataset
 def main() -> int:
     dest, cache = sys.argv[1], sys.argv[2]
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    # The canonical repo id; newer huggingface_hub rejects the bare "wikitext".
     ds = load_dataset(
-        "wikitext",
+        "Salesforce/wikitext",
         "wikitext-2-raw-v1",
         split="test",
         cache_dir=cache,

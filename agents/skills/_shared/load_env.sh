@@ -6,7 +6,8 @@
 #
 # Behavior:
 #   - Refuses a world-readable credential file (mode != 600); auto-tightens to 600.
-#   - Parses an explicit key allowlist without evaluating shell syntax.
+#   - Parses an explicit key allowlist without evaluating shell syntax; other
+#     keys are skipped (named on stderr) and never exported. Works in bash and zsh.
 #   - Aliases HUGGINGFACE_HUB_TOKEN -> HF_TOKEN so libraries reading either name
 #     see the same value.
 #   - Never echoes secret values; only echoes key NAMES that were loaded.
@@ -37,28 +38,48 @@ _quant_load_env() {
     }
   fi
 
-  # Parse data; never `source` the file. Only the documented keys are accepted,
-  # so shell syntax and command substitutions remain inert text.
-  local loaded_keys="" line key value
+  # Parse data; never `source` the file. Only the documented keys are exported,
+  # so shell syntax and command substitutions remain inert text. Other keys
+  # (e.g. credentials for other tools) are skipped by name, never exported.
+  # Split with parameter expansion, not BASH_REMATCH, so zsh parses it too.
+  # Accepted line shapes: KEY=value, export KEY=value, KEY = value,
+  # KEY="value", KEY='value' (CRLF and leading spaces tolerated). Other lines
+  # (multi-line values, other tools' formats) are skipped and reported by line
+  # number only; they can never be an allowlisted key.
+  local loaded_keys="" skipped_keys="" skipped_lines="" line key value lineno=0
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-      echo "[env] malformed assignment; refusing to load" >&2
-      return 1
+    lineno=$((lineno + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == "export "* ]] && line="${line#export }"
+    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]]; then
+      skipped_lines+="$lineno "
+      continue
     fi
-    key="${BASH_REMATCH[1]}"
-    value="${BASH_REMATCH[2]}"
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    if [[ ${#value} -ge 2 && ( "$value" == \"*\" || "$value" == \'*\' ) ]]; then
+      value="${value:1:${#value}-2}"
+    fi
     case "$key" in
       GITHUB_TOKEN|HUGGINGFACE_HUB_TOKEN|HF_TOKEN|QUANT_AGENT_WORKSPACE|QUANT_AGENT_TORCH_SPEC|OPENAI_API_KEY)
         export "$key=$value"
         loaded_keys+="$key "
         ;;
       *)
-        echo "[env] unsupported key $key; refusing to load" >&2
-        return 1
+        skipped_keys+="$key "
         ;;
     esac
   done < "$env_file"
+  if [[ -n "$skipped_keys" ]]; then
+    echo "[env] skipped keys this agent does not use (not exported): $skipped_keys" >&2
+  fi
+  if [[ -n "$skipped_lines" ]]; then
+    echo "[env] skipped lines that are not KEY=value: $skipped_lines" >&2
+  fi
 
   # HuggingFace libraries are split between two env-var names. Normalize.
   if [[ -n "${HUGGINGFACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then

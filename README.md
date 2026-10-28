@@ -79,6 +79,9 @@ token for gated downloads and for publishing quantized weights.
 | Path | What |
 | --- | --- |
 | `quantized/<slug>` | Saved quantized weights |
+| `quantized/<slug>-vllm` | Same weights converted for vLLM, when the format allows |
+| `jobs/<id>/vllm.json` | vLLM WikiText-2 + prefill/decode vs vLLM fp16 |
+| `<you>/<slug>-vllm` on the Hub | The vLLM build, published only after a passed serve check |
 | `jobs/<id>/benchmark.json` | WikiText-2 vs fp16 |
 | `library/LIBRARY.md` | Ranking of published runs |
 | `library/ATTEMPTS.md` | Unsuccessful stops (not ranked) |

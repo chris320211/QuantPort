@@ -653,3 +653,95 @@ def test_catalog_run_records_standard_links(tmp_path, monkeypatch):
         assert "hub-url" in str(exc)
     else:
         raise AssertionError("expected missing hub url rejection")
+
+
+def _serve_report(status="passed", ratio=1.04, drift=1.005, issues=None):
+    return {
+        "status": status,
+        "issue_codes": issues or [],
+        "quantized": {"vllm_version": "0.30.0", "gpu_name": "NVIDIA GeForce RTX 3090", "model_path": "/root/x"},
+        "comparison": {
+            "ppl_ratio": ratio,
+            "hf_ppl_ratio": 1.035,
+            "ppl_ratio_drift": drift,
+            "prefill_speedup": 1.3,
+            "decode_speedup": {"1": 1.2, "16": 1.1},
+        },
+    }
+
+
+def _accept_awq(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(paths_mod, "LIBRARY_ROOT", tmp_path / "library")
+    contrib = {
+        "model_id": "org/model", "method_name": "SmoothQuant", "gpu_instance": "g5.2xlarge",
+        "gpu_name": "NVIDIA A10G", "quality_ok": True, "ppl": 10.5, "ppl_ratio": 1.05,
+        "tokens_per_s": 4000.0, "peak_vram_gb": 4.0, "fp16_ppl": 10.0, "fp16_tokens_per_s": 3000.0,
+        "fp16_peak_vram_gb": 6.0, "hub_repo_id": "me/sq-model", "arxiv_id": "2211.10438",
+        "repo_url": "https://github.com/mit-han-lab/smoothquant",
+    }
+    src = tmp_path / "incoming.json"
+    src.write_text(json.dumps(contrib))
+    library_mod.accept_contribution(src)
+
+
+def test_record_vllm_passed_reaches_catalog_markdown_and_collection(tmp_path, monkeypatch):
+    _accept_awq(tmp_path, monkeypatch)
+    result = library_mod.record_vllm(
+        model_id="org/model", gpu_instance="g5.2xlarge", method_name="SmoothQuant",
+        export_record={"status": "exported", "profile": "w8a8_int8"},
+        serve_report=_serve_report(), hub_repo_id="me/sq-model-vllm",
+    )
+    assert result["vllm"]["status"] == "passed"
+    row = library_mod.query()[0]
+    assert row["vllm"]["hub_repo_id"] == "me/sq-model-vllm"
+    assert row["vllm"]["gpu_name"] == "NVIDIA GeForce RTX 3090"
+    assert row["tokens_per_s"] == 4000.0  # the ranking numbers are untouched
+    md = (tmp_path / "library" / "LIBRARY.md").read_text()
+    assert "| vLLM |" in md
+    assert "[vLLM](https://huggingface.co/me/sq-model-vllm)" in md
+    assert "Measured on NVIDIA GeForce RTX 3090 with vLLM 0.30.0" in md
+    items = [e["item_id"] for e in library_mod.collection_entries()]
+    assert items == ["me/sq-model", "me/sq-model-vllm"]
+    catalog = json.loads((tmp_path / "library" / "catalog.json").read_text())
+    assert catalog["schema_version"] == library_mod.SCHEMA_VERSION == 2
+
+
+def test_record_vllm_unsupported_and_failed_show_why(tmp_path, monkeypatch):
+    _accept_awq(tmp_path, monkeypatch)
+    library_mod.record_vllm(
+        model_id="org/model", gpu_instance="g5.2xlarge", method_name="SmoothQuant",
+        export_record={"status": "unsupported", "reason_code": "activation_bits_unsupported"},
+    )
+    assert "no (`activation_bits_unsupported`)" in (tmp_path / "library" / "LIBRARY.md").read_text()
+    library_mod.record_vllm(
+        model_id="org/model", gpu_instance="g5.2xlarge", method_name="SmoothQuant",
+        export_record={"status": "exported"},
+        serve_report=_serve_report("failed", ratio=1.2, drift=1.15, issues=["vllm_ppl_mismatch"]),
+    )
+    md = (tmp_path / "library" / "LIBRARY.md").read_text()
+    assert "failed (`vllm_ppl_mismatch`)" in md
+    assert library_mod.collection_entries() == [library_mod.collection_entries()[0]]
+
+
+def test_record_vllm_needs_an_existing_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths_mod, "LIBRARY_ROOT", tmp_path / "library")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no library row"):
+        library_mod.record_vllm(
+            model_id="org/none", gpu_instance="g5.2xlarge", method_name="X",
+            export_record={"status": "exported"},
+        )
+
+
+def test_vllm_block_rejects_unbacked_claims():
+    import pytest
+
+    with pytest.raises(ValueError, match="only a passed"):
+        library_mod.validate_vllm_block({"status": "failed", "issue_codes": ["vllm_quality_failed"], "hub_repo_id": "me/x"})
+    with pytest.raises(ValueError, match="drift"):
+        library_mod.vllm_block({"status": "exported"}, {**_serve_report(), "status": "passed"} | {"comparison": {**_serve_report()["comparison"], "ppl_ratio_drift": 1.2}})
+    with pytest.raises(ValueError, match="vllm_version"):
+        library_mod.validate_vllm_block({"status": "passed", "ppl_ratio": 1.0, "gpu_name": "x"})
+    pending = library_mod.vllm_block({"status": "exported", "profile": "w8a8_int8"})
+    assert pending == {"status": "pending", "profile": "w8a8_int8"}

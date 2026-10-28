@@ -27,6 +27,8 @@ value. It does not search, clone, adapt, or run GPU jobs itself.
 - `quant-run` launches **once**. Process failures return `failed`; the parent
   diagnoses. Do not spawn a run subagent that patches overlays.
 - If a subagent fails, stop or retry **that** stage. Do not silently skip ahead.
+  **Serve is the exception:** `quant-serve` never gates. Publish proceeds
+  whatever it returns; report its status alongside.
 - Scripts: `"$PY" agents/skills/_shared/scripts/<name>.py` with
   `PY=$([ -x .venv/bin/python ] && echo .venv/bin/python || command -v python || command -v python3)`.
 

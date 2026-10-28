@@ -36,6 +36,12 @@ Writes `out/hub/<slug>/` (model card, `metrics.json`, tokenizer/config,
 adapter/overlay when present). Large packed weights are referenced from
 `quantized/<slug>` so they are not duplicated.
 
+File selection knows no method names: weights and `.json` configs,
+tokenizer/license files, `.py` that config.json's `auto_map` loads, and the
+inference adapter. Files listed in `quantization_config.json`
+`publish_exclude` are left out. The manifest's `skipped` says why each
+dropped file was dropped; check it before `--upload`.
+
 Upload (needs `HF_TOKEN` already in the parent environment from `.env`;
 never paste the value into chat):
 
@@ -54,6 +60,24 @@ this same parent session.
 If the token is missing, leave the staged bundle and tell the user to set
 `HF_TOKEN` via `quant-setup`, then re-run with `--upload`.
 
+### vLLM build
+
+Only when `jobs/<job_id>/vllm.json` has `status: passed` (quant-serve). Skip
+otherwise; never publish an export without a passed check.
+
+```bash
+$S/publish_vllm.py --export-dir quantized/<slug>-vllm \
+  --serve-report jobs/<job_id>/vllm.json --request out/requests/<slug>.json \
+  --base-repo-id <org>/<name> --upload --allow-unsafe-host-execution
+```
+
+Publishes `<org>/<name>-vllm`: the export's safetensors unchanged, a card
+with `vllm serve`, the vLLM PPL ratio, drift, prefill/decode speedups, and
+the GPU and vLLM version they were measured with, plus `vllm.json` and
+`vllm_export.json` with local paths removed. Then adds a "Serve with vLLM"
+section to `<org>/<name>`'s card (replaced in place on re-runs). Drop
+`--upload` to stage only (`out/hub/<name>-vllm/`).
+
 ## Return
 
 ```text
@@ -61,4 +85,5 @@ status: staged | uploaded
 stage_dir: out/hub/<slug>/
 hub_url: https://huggingface.co/<org>/<name>   # only if uploaded
 metrics: out/hub/<slug>/metrics.json
+vllm_hub_url: https://huggingface.co/<org>/<name>-vllm   # only if the serve check passed
 ```

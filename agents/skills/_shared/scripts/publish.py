@@ -7,6 +7,7 @@ prints it. Staging works without a token.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import shutil
@@ -25,38 +26,21 @@ from request import load_request
 from verify import resolve_workspace_path
 
 _REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$")
-_SKIP_DIRS = {".cache", ".git"}
-_SKIP_FILES = {
-    "README.md",
-    "model.safetensors.index.json",
-    "sample_finetune.py",
-    "SECURITY.md",
-    "CODE_OF_CONDUCT.md",
-    "data_summary_card.md",
-    "flatquant_runtime.pt",
-}
-_SKIP_SUFFIXES = {".metadata"}
 _WEIGHT_SUFFIXES = {".pt", ".pth", ".bin", ".safetensors"}
-_STAGE_SUFFIXES = _WEIGHT_SUFFIXES | {".json", ".py"}
+_STAGE_SUFFIXES = _WEIGHT_SUFFIXES | {".json"}
+# Hub-standard files whose suffix is not staged by default (tokenizers, licenses).
 _COPY_NAMES = {
-    "config.json",
-    "configuration_phi3.py",
-    "modeling_phi3.py",
-    "generation_config.json",
-    "tokenizer.json",
     "tokenizer.model",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "added_tokens.json",
     "merges.txt",
-    "vocab.json",
-    "quantization_config.json",
-    "flatquant_args.json",
-    "LICENSE",
-    "NOTICE.md",
-    "packed_w4a4.pt",
-    "quant_agent_inference_adapter.py",
+    "vocab.txt",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "chat_template.jinja",
 }
+_COPY_PREFIXES = ("LICENSE", "NOTICE")
+_ADAPTER_FILE = "quant_agent_inference_adapter.py"
+# The staged README is the rendered model card, never the artifact's own.
+_MODEL_CARD = "README.md"
 
 
 def _redact(message: str, token: str | None) -> str:
@@ -70,6 +54,73 @@ def _read_json(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"expected object JSON: {path}")
     return data
+
+
+def _auto_map_modules(config: dict) -> set[str]:
+    """`.py` files config.json's auto_map loads (`module.Class` or `repo--module.Class`)."""
+    refs: list[str] = []
+    for value in (config.get("auto_map") or {}).values():
+        refs.extend(value if isinstance(value, list) else [value])
+    return {
+        ref.split("--")[-1].rsplit(".", 1)[0] + ".py"
+        for ref in refs
+        if isinstance(ref, str) and "." in ref
+    }
+
+
+def _publish_excludes(output_dir: Path) -> list[str]:
+    qcfg_path = output_dir / "quantization_config.json"
+    if not qcfg_path.is_file():
+        return []
+    excludes = _read_json(qcfg_path).get("publish_exclude") or []
+    if not isinstance(excludes, list) or not all(isinstance(item, str) for item in excludes):
+        raise ValueError(f"publish_exclude in {qcfg_path} must be a list of file names or globs")
+    return excludes
+
+
+def select_publish_files(output_dir: Path) -> tuple[list[Path], dict[str, str]]:
+    """Pick the artifact files for the Hub bundle without knowing the method.
+
+    Kept: weights and `.json` configs, Hub tokenizer/license files, `.py` that
+    config.json's auto_map loads, and the inference adapter. Dropped: other
+    `.py` (base-repo examples), shard indexes naming missing shards, and
+    whatever the run lists in quantization_config.json `publish_exclude`.
+    Returns (files, {skipped name: reason}).
+    """
+    config_path = output_dir / "config.json"
+    remote_code = _auto_map_modules(_read_json(config_path)) if config_path.is_file() else set()
+    excludes = _publish_excludes(output_dir)
+    present = {path.name for path in output_dir.iterdir() if path.is_file()}
+    selected: list[Path] = []
+    skipped: dict[str, str] = {}
+    for path in sorted(output_dir.iterdir()):
+        name = path.name
+        if not path.is_file() or name.startswith(".") or name == _MODEL_CARD:
+            continue
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in excludes):
+            skipped[name] = "publish_exclude"
+            continue
+        if path.suffix == ".py":
+            if name == _ADAPTER_FILE or name in remote_code:
+                selected.append(path)
+            else:
+                skipped[name] = "not loaded by config.json auto_map"
+            continue
+        if name.endswith(".index.json"):
+            shards = set((_read_json(path).get("weight_map") or {}).values())
+            missing = sorted(shards - present)
+            if missing:
+                skipped[name] = f"names missing shards ({', '.join(missing[:3])})"
+            else:
+                selected.append(path)
+            continue
+        if (
+            path.suffix.lower() in _STAGE_SUFFIXES
+            or name in _COPY_NAMES
+            or name.startswith(_COPY_PREFIXES)
+        ):
+            selected.append(path)
+    return selected, skipped
 
 
 def _weight_files(stage_dir: Path, weight_srcs: list[str]) -> list[str]:
@@ -223,15 +274,8 @@ def stage_hub_bundle(
 
     copied: list[str] = []
     large_weights: list[Path] = []
-    for path in output_dir.iterdir():
-        if path.name in _SKIP_DIRS or path.name in _SKIP_FILES:
-            continue
-        if path.suffix.lower() in _SKIP_SUFFIXES:
-            continue
-        if path.is_dir():
-            continue
-        if path.name not in _COPY_NAMES and path.suffix.lower() not in _STAGE_SUFFIXES:
-            continue
+    selected, skipped = select_publish_files(output_dir)
+    for path in selected:
         target = dest / path.name
         if path.stat().st_size > 64 * 1024 * 1024:
             # Point at the original large weight file instead of duplicating it.
@@ -282,9 +326,6 @@ def stage_hub_bundle(
         "source": str(benchmark_path),
     }
     atomic_write_text(dest / "metrics.json", json.dumps(metrics, indent=2) + "\n", mode=0o644)
-    packed = output_dir / "packed_w4a4.pt"
-    if packed.is_file() and packed.resolve() not in {path.resolve() for path in large_weights}:
-        large_weights.append(packed)
     weight_srcs = [str(path.resolve()) for path in large_weights]
     if not _weight_files(dest, weight_srcs):
         # A bundle without weights uploads configs only and cannot be reloaded.
@@ -303,6 +344,7 @@ def stage_hub_bundle(
         "weight_srcs": weight_srcs,
         "repo_id": repo_id,
         "copied": sorted(set(copied)),
+        "skipped": skipped,
         "uploaded": False,
     }
     atomic_write_text(dest / "hub_manifest.json", json.dumps(manifest, indent=2) + "\n", mode=0o644)

@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "agents" / "skills" / "_shared" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -70,7 +72,7 @@ def _fake_completed_job(tmp_path, monkeypatch, output_files):
     output_dir = tmp_path / "quantized"
     output_dir.mkdir()
     for name in output_files:
-        (output_dir / name).write_text("x")
+        (output_dir / name).write_text("{}" if name.endswith(".json") else "x")
     job_directory = tmp_path / "job"
     job_directory.mkdir()
     (job_directory / "benchmark.json").write_text(
@@ -132,6 +134,72 @@ def test_stage_suffixes_include_safetensors_and_tokenizer_merges():
     assert ".safetensors" in publish_mod._STAGE_SUFFIXES
     assert ".bin" in publish_mod._STAGE_SUFFIXES
     assert "merges.txt" in publish_mod._COPY_NAMES
+
+
+def test_publish_rules_name_no_method_or_model():
+    source = (SCRIPTS / "publish.py").read_text().lower()
+    for name in ("phi3", "phi-3", "flatquant", "w4a4", "smoothquant", "quarot", "awq", "gptq"):
+        assert name not in source, f"publish.py hardcodes {name!r}"
+
+
+def _artifact(tmp_path, files: dict[str, str]) -> Path:
+    root = tmp_path / "art"
+    root.mkdir()
+    for name, text in files.items():
+        (root / name).write_text(text)
+    return root
+
+
+def test_selection_keeps_remote_code_and_drops_base_repo_scripts(tmp_path):
+    config = {"auto_map": {
+        "AutoConfig": "configuration_custom.CustomConfig",
+        "AutoModelForCausalLM": "org/repo--modeling_custom.CustomForCausalLM",
+        "AutoTokenizer": ["tokenization_custom.Slow", None],
+    }}
+    root = _artifact(tmp_path, {
+        "config.json": json.dumps(config),
+        "configuration_custom.py": "", "modeling_custom.py": "", "tokenization_custom.py": "",
+        "sample_finetune.py": "", "quant_agent_inference_adapter.py": "",
+        "model.safetensors": "x", "tokenizer.model": "x", "LICENSE": "x", "NOTICE.md": "x",
+        "README.md": "base card", "SECURITY.md": "x", "notes.txt": "x",
+    })
+    selected, skipped = publish_mod.select_publish_files(root)
+    names = {path.name for path in selected}
+    assert names == {
+        "config.json", "configuration_custom.py", "modeling_custom.py", "tokenization_custom.py",
+        "quant_agent_inference_adapter.py", "model.safetensors", "tokenizer.model", "LICENSE", "NOTICE.md",
+    }
+    assert "sample_finetune.py" in skipped
+
+
+def test_selection_honors_publish_exclude(tmp_path):
+    root = _artifact(tmp_path, {
+        "config.json": "{}",
+        "quantization_config.json": json.dumps({"publish_exclude": ["*_runtime.pt", "calib.json"]}),
+        "packed.pt": "x", "method_runtime.pt": "x", "calib.json": "{}",
+    })
+    selected, skipped = publish_mod.select_publish_files(root)
+    assert {path.name for path in selected} == {"config.json", "quantization_config.json", "packed.pt"}
+    assert skipped == {"method_runtime.pt": "publish_exclude", "calib.json": "publish_exclude"}
+
+
+def test_selection_rejects_malformed_publish_exclude(tmp_path):
+    root = _artifact(tmp_path, {"quantization_config.json": json.dumps({"publish_exclude": "x.pt"})})
+    with pytest.raises(ValueError):
+        publish_mod.select_publish_files(root)
+
+
+def test_selection_keeps_shard_index_only_when_shards_exist(tmp_path):
+    index = {"weight_map": {"a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}
+    root = _artifact(tmp_path, {
+        "model.safetensors.index.json": json.dumps(index),
+        "model-00001-of-00002.safetensors": "x",
+    })
+    selected, skipped = publish_mod.select_publish_files(root)
+    assert "model.safetensors.index.json" in skipped
+    (root / "model-00002-of-00002.safetensors").write_text("x")
+    selected, skipped = publish_mod.select_publish_files(root)
+    assert "model.safetensors.index.json" in {path.name for path in selected}
 
 
 def test_publish_requires_beneficial_comparison():

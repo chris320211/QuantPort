@@ -36,6 +36,18 @@ $S/library.py --catalog --job-id <job_id> \
 $S/library.py --rebuild
 ```
 
+If quant-serve ran, attach its result to the row (always, whatever the
+status: passed, failed, unsupported, or pending without a GPU):
+
+```bash
+$S/library.py --record-vllm --job-id <job_id> --request out/requests/<slug>.json \
+  [--vllm-repo-id <org>/<name>-vllm]   # only when quant-publish uploaded it
+```
+
+This adds the row's `vllm` block and the `LIBRARY.md` vLLM column. It never
+changes the ranking. The vLLM speedups name their own GPU, which may differ
+from the board's.
+
 Do not call `--sync-hf-collection` here. **quant-sync** refreshes the Hub
 collection and pushes GitHub.
 
@@ -74,6 +86,7 @@ paper_url: https://arxiv.org/abs/<id>
 repo_url: https://github.com/<owner>/<repo>
 hub_url: https://huggingface.co/<you>/<slug>
 contribution: library/contributions/<file>.json
+vllm: passed | failed | unsupported | pending | skipped
 ```
 
 Unsuccessful:

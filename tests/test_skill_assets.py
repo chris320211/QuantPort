@@ -15,6 +15,7 @@ SKILL_NAMES = (
     "quant-benchmark",
     "quant-diagnose",
     "quant-kernel",
+    "quant-serve",
     "quant-publish",
     "quant-catalog",
     "quant-sync",
@@ -40,8 +41,11 @@ REQUIRED_SCRIPTS = (
     "torch_spec.py",
     "validate_script.py",
     "verify.py",
+    "export_vllm.py",
+    "serve_check.py",
     "diagnose.py",
     "publish.py",
+    "publish_vllm.py",
     "library.py",
     "sync_remotes.py",
 )
@@ -229,7 +233,7 @@ def test_skills_point_at_shared_scripts():
             if marker in text and path.name == "AGENTS.md":
                 continue
             assert marker not in text, f"{path.relative_to(ROOT)} still mentions {marker}"
-    for name in ("quant-gather", "quant-port", "quant-run", "quant-verify", "quant-benchmark", "quant-diagnose", "quant-kernel", "quant-publish", "quant-catalog", "quant-sync"):
+    for name in ("quant-gather", "quant-port", "quant-run", "quant-verify", "quant-benchmark", "quant-diagnose", "quant-kernel", "quant-serve", "quant-publish", "quant-catalog", "quant-sync"):
         text = (ROOT / "agents" / "skills" / name / "SKILL.md").read_text()
         assert "agents/skills/_shared/scripts" in text
         assert "out/ports/" not in text

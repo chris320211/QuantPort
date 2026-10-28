@@ -32,25 +32,41 @@ Order:
    `none` while retries remain (unless OOM/auth/disk).
 8. Parent **retry loop** (not a new skill): switch on diagnose `recommended_action` with a GPU budget
 9. `quant-kernel` only if diagnose says `kernel`
-10. `quant-publish` in the **parent** after verify + `quality_ok` **and** a
+10. `quant-serve` subagent after a **beneficial** STOP, before publish.
+    `export_vllm.py` (CPU) converts the verified artifact into a checkpoint
+    vLLM loads natively, detected from the saved tensors (today: int8
+    per-channel W8A8 → compressed-tensors). `serve_check.py` (GPU, own
+    `.venvs/vllm-serve`) loads it with vLLM and measures WikiText-2 PPL and
+    prefill/decode tok/s vs vLLM fp16. Never re-quantizes. `unsupported`
+    (e.g. A4 activations) or no GPU is not a failure: publish proceeds with
+    the native artifact; serving status never changes the ranking.
+    Writes `jobs/<id>/vllm_export.json` and `jobs/<id>/vllm.json`; publishing
+    and recording them happen in steps 11 and 12.
+11. `quant-publish` in the **parent** after verify + `quality_ok` **and** a
     VRAM or tok/s win versus fp16 (Hub model card + weights + WikiText-2
     metrics). Uses `HF_TOKEN` like `quant-setup`; never a subagent. Hugging
     Face Hub is the **artifact store** (one repo per method × model run). It
-    is not the comparison UI.
-11. `quant-catalog` in the **parent** after a **beneficial** run (quality_ok and
+    is not the comparison UI. When `jobs/<id>/vllm.json` passed, the same
+    stage publishes the export as its own repo `<native repo>-vllm`
+    (`publish_vllm.py`: card with the vLLM numbers and GPU, raw
+    `vllm.json`) and adds a "Serve with vLLM" section to the native card.
+12. `quant-catalog` in the **parent** after a **beneficial** run (quality_ok and
     better VRAM or tok/s than fp16). Standard row: model, GPU instance, method,
     paper URL, method GitHub, Hugging Face URL. Writes
     `library/contributions/` and rebuilds `library/catalog.json`. On
     unsuccessful STOP (`recommended_action: none` and not beneficial), the
     same skill records `library/attempts/` (`--record-attempt`) so failed
     ports are not lost. Docs: `library/LIBRARY.md`, `library/ATTEMPTS.md`.
-12. `quant-sync` in the **parent** after catalog **or** after recording an
+    After the row exists, `library.py --record-vllm` attaches the serve
+    result (passed with the vLLM repo, failed, unsupported with its reason,
+    or pending) as the row's `vllm` block and the `LIBRARY.md` vLLM column.
+13. `quant-sync` in the **parent** after catalog **or** after recording an
     unsuccessful attempt (or when asked to update GitHub and Hugging Face).
     Rebuilds `library/`, `git push`es allowlisted library/skill paths to this
     remote, and refreshes the one Hub collection (quality_ok repos only).
     Never commits `quantized/`, `jobs/`, `out/`, or `.env`. Third parties
     without push access still PR `library/contributions/`.
-13. Tell the user where weights, metrics, the Hub URL (if uploaded), and
+14. Tell the user where weights, metrics, the Hub URL (if uploaded), and
     `library/` rankings live. The stop report **must** include the WikiText-2
     metric table (quantized vs fp16 PPL / tok/s / VRAM) and whether a
     `kernel_triton` overlay ran. Users filter `model_id` / `method_name` /
@@ -96,6 +112,9 @@ for every new slug.
 - Overlays: `out/overlays/<slug>/<strategy>/<hash>/`
 - Jobs: `jobs/<job_id>/`
 - Weights: `./quantized/<slug>`
+- vLLM export: `./quantized/<slug>-vllm` (`vllm_export.json` inside); records
+  `jobs/<job_id>/vllm_export.json` and `jobs/<job_id>/vllm.json`
+- vLLM venv: `.venvs/vllm-serve` (never a method venv)
 - Library table: `library/catalog.json` (filter `model_id`, `method_name`,
   `gpu_instance`; fetch via `hub_repo_id`)
 - Library boards: `library/index.json` and `library/groups/<model>__<gpu>.json`

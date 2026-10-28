@@ -26,7 +26,8 @@ flowchart TD
   bench --> diag["quant-diagnose"]
   diag -->|"retry or kernel"| run
   diag -->|"done"| ship{"beat fp16?"}
-  ship -->|yes| pub["quant-publish"]
+  ship -->|yes| serve["quant-serve"]
+  serve --> pub["quant-publish"]
   pub --> cat["quant-catalog"]
   cat --> sync["quant-sync"]
   sync --> out["library table + published weights"]
@@ -56,15 +57,17 @@ flowchart TD
 | [quant-benchmark](skills/quant-benchmark/SKILL.md) | Always WikiText-2 vs the fp16 snapshot: PPL, tok/s, VRAM. Does not write the library. |
 | [quant-diagnose](skills/quant-diagnose/SKILL.md) | Classify after a failed run, failed verify, or passed benchmark (including success). A crashed GPU job is not `none`. Does not write overlays. |
 | [quant-kernel](skills/quant-kernel/SKILL.md) | Packed / prefill kernels only when diagnose says `kernel`. |
+| [quant-serve](skills/quant-serve/SKILL.md) | After a beneficial STOP: convert the artifact for vLLM (CPU), then load it with vLLM and measure vs vLLM fp16 (GPU). Not a gate. |
 
 ## After a good run
 
 A run is **beneficial** when `quality_ok` (PPL ≤ 1.5× fp16) and VRAM **or**
 tok/s beat fp16. Then, in the parent:
 
-1. `quant-publish` — quantized weights on the Hub
-2. `quant-catalog` — row in [`library/LIBRARY.md`](../library/LIBRARY.md)
-3. `quant-sync` — GitHub table + [weight collection](https://huggingface.co/collections/chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230)
+1. `quant-serve` subagent — vLLM export + serve check (never blocks the rest)
+2. `quant-publish` — quantized weights on the Hub
+3. `quant-catalog` — row in [`library/LIBRARY.md`](../library/LIBRARY.md)
+4. `quant-sync` — GitHub table + [weight collection](https://huggingface.co/collections/chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230)
 
 Without push access, PR `library/contributions/<model>__<gpu>__<method>.json`.
 See [`library/contributions/README.md`](../library/contributions/README.md).

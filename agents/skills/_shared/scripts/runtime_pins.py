@@ -7,3 +7,10 @@ RUNTIME_PACKAGES: tuple[str, ...] = (
     "sentencepiece==0.2.0",
     "datasets==3.1.0",
 )
+
+# vLLM serve check venv (.venvs/vllm-serve). vLLM brings its own torch and
+# transformers, so it never shares a method venv. Bump after a GPU run passes.
+SERVE_PACKAGES: tuple[str, ...] = (
+    "vllm==0.30.0",
+    "datasets>=3.1,<5",
+)

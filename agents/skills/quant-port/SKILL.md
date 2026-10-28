@@ -119,6 +119,12 @@ must also restore eval-only flags that `state_dict` does not store
 (`restore_packed_eval_runtime`: `_eval_mode`, `use_diag=False`) and must
 not call `reparameterize_model` again on already packed weights.
 
+Publish copies every weight and `.json` file in `OUTPUT_DIR`. If the wrapper
+saves files the reload path never reads (calibration caches, runtime
+snapshots), list them in `quantization_config.json` as
+`"publish_exclude": ["<name or glob>", ...]` rather than leaving them for
+publish to guess.
+
 Place the wrapper next to the overlay as `out/overlays/<slug>/<strategy>/quantize.py`
 or inside the returned bundle notes. Do not launch a job. Do not build custom kernels.
 

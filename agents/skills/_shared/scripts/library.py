@@ -13,6 +13,7 @@ import math
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,8 +24,11 @@ from io_utils import atomic_write_text
 from request import load_request
 from verify import resolve_workspace_path
 
-SCHEMA_VERSION = 1
+# 2: optional per-run `vllm` block (serve-check results for the vLLM export).
+SCHEMA_VERSION = 2
 QUALITY_PPL_RATIO_MAX = 1.5
+VLLM_STATUSES = ("passed", "failed", "unsupported", "pending")
+VLLM_PPL_DRIFT_MAX = 1.02
 COLLECTION_TITLE = "quant-agent library"
 COLLECTION_DESCRIPTION = (
     "One library of quantized LLMs measured by quant-agent. "
@@ -324,7 +328,101 @@ def validate_contribution(data: dict, *, require_hub: bool = True) -> dict:
     data["repo_url"] = repo_url
     if links["repo_commit"]:
         data["repo_commit"] = links["repo_commit"]
+    if data.get("vllm") is not None:
+        data["vllm"] = validate_vllm_block(data["vllm"])
     return data
+
+
+def validate_vllm_block(block: dict) -> dict:
+    """The optional serve-check summary on a run. Never affects ranking."""
+    if not isinstance(block, dict):
+        raise ValueError("vllm must be an object")
+    status = block.get("status")
+    if status not in VLLM_STATUSES:
+        raise ValueError(f"vllm.status must be one of {', '.join(VLLM_STATUSES)}")
+    if status == "unsupported" and not str(block.get("reason_code") or "").strip():
+        raise ValueError("vllm.status unsupported needs reason_code")
+    if status == "failed" and not block.get("issue_codes"):
+        raise ValueError("vllm.status failed needs issue_codes")
+    repo = block.get("hub_repo_id")
+    if repo is not None and not _HUB_REPO_RE.fullmatch(str(repo)):
+        raise ValueError("vllm.hub_repo_id must be org/name")
+    if status == "passed":
+        for key in ("vllm_version", "gpu_name"):
+            if not str(block.get(key) or "").strip():
+                raise ValueError(f"vllm.status passed needs {key}")
+        ratio = block.get("ppl_ratio")
+        if not _finite_number(ratio) or float(ratio) > QUALITY_PPL_RATIO_MAX:
+            raise ValueError(f"vllm.status passed needs ppl_ratio <= {QUALITY_PPL_RATIO_MAX}")
+        drift = block.get("ppl_ratio_drift")
+        if drift is not None and (not _finite_number(drift) or float(drift) > VLLM_PPL_DRIFT_MAX):
+            raise ValueError(f"vllm.status passed needs ppl_ratio_drift <= {VLLM_PPL_DRIFT_MAX}")
+    elif repo is not None:
+        raise ValueError("only a passed vLLM check may link a vLLM Hub repo")
+    return dict(block)
+
+
+def vllm_block(
+    export_record: dict,
+    serve_report: dict | None = None,
+    *,
+    hub_repo_id: str | None = None,
+    checked_at: str | None = None,
+) -> dict:
+    """Summarize `vllm_export.json` + the serve-check report into the library block."""
+    if export_record.get("status") == "unsupported":
+        block = {"status": "unsupported", "reason_code": export_record.get("reason_code")}
+    elif export_record.get("status") != "exported":
+        raise ValueError(f"export record status is {export_record.get('status')!r}")
+    elif not serve_report:
+        block = {"status": "pending", "profile": export_record.get("profile")}
+    else:
+        comparison = serve_report.get("comparison") or {}
+        quantized = serve_report.get("quantized") or {}
+        block = {
+            "status": serve_report.get("status"),
+            "issue_codes": list(serve_report.get("issue_codes") or []) or None,
+            "profile": export_record.get("profile"),
+            "vllm_version": quantized.get("vllm_version"),
+            "gpu_name": quantized.get("gpu_name"),
+            "ppl_ratio": comparison.get("ppl_ratio"),
+            "hf_ppl_ratio": comparison.get("hf_ppl_ratio"),
+            "ppl_ratio_drift": comparison.get("ppl_ratio_drift"),
+            "prefill_speedup": comparison.get("prefill_speedup"),
+            "decode_speedup": comparison.get("decode_speedup"),
+            "checked_at": checked_at,
+        }
+        if hub_repo_id:
+            block["hub_repo_id"] = hub_repo_id
+            block["hub_url"] = f"https://huggingface.co/{hub_repo_id}"
+    return validate_vllm_block({k: v for k, v in block.items() if v is not None})
+
+
+def record_vllm(
+    *,
+    model_id: str,
+    gpu_instance: str,
+    method_name: str,
+    export_record: dict,
+    serve_report: dict | None = None,
+    hub_repo_id: str | None = None,
+) -> dict:
+    """Attach the vLLM result to an existing library contribution and rebuild."""
+    path = contributions_dir() / contribution_filename(model_id, gpu_instance, method_name)
+    if not path.is_file():
+        raise RuntimeError(f"no library row for {model_id} × {gpu_instance} × {method_name} ({path})")
+    data = _read_json(path)
+    data["vllm"] = vllm_block(
+        export_record,
+        serve_report,
+        hub_repo_id=hub_repo_id,
+        checked_at=datetime.now(timezone.utc).date().isoformat(),
+    )
+    data["schema_version"] = SCHEMA_VERSION
+    payload = validate_contribution(data, require_hub=True)
+    atomic_write_text(path, json.dumps(payload, indent=2) + "\n", mode=0o644)
+    rebuild_derived()
+    return {"status": "recorded", "contribution": str(path), "vllm": payload["vllm"]}
 
 
 def _method_from_contribution(data: dict) -> dict:
@@ -351,6 +449,7 @@ def _method_from_contribution(data: dict) -> dict:
         "repo_url": data.get("repo_url"),
         "repo_commit": data.get("repo_commit"),
         "verification_status": data.get("verification_status"),
+        "vllm": data.get("vllm"),
     }
 
 
@@ -436,6 +535,7 @@ def catalog_rows() -> list[dict]:
                     "artifact_dir": method.get("artifact_dir"),
                     "job_id": method.get("job_id"),
                     "slug": method.get("slug"),
+                    "vllm": method.get("vllm"),
                 }
             )
     return rows
@@ -514,6 +614,15 @@ def collection_entries(rows: list[dict] | None = None) -> list[dict]:
             f"{row.get('gpu_instance')} · WikiText-2 ppl_ratio={_num(row.get('ppl_ratio'), 4)}"
         )[:500]
         entries.append({"item_id": repo, "item_type": "model", "note": note})
+        vllm = row.get("vllm") if isinstance(row.get("vllm"), dict) else {}
+        vllm_repo = vllm.get("hub_repo_id")
+        if vllm.get("status") == "passed" and vllm_repo and vllm_repo not in seen:
+            seen.add(vllm_repo)
+            vllm_note = (
+                f"vLLM build of {repo} · {row.get('method_name')} · {row.get('model_id')} · "
+                f"vLLM ppl_ratio={_num(vllm.get('ppl_ratio'), 4)} on {vllm.get('gpu_name')}"
+            )[:500]
+            entries.append({"item_id": vllm_repo, "item_type": "model", "note": vllm_note})
     return entries
 
 
@@ -663,6 +772,9 @@ def _write_markdown() -> Path:
     lines.extend(
         [
             "Rank: `quality_ok`, then tokens/s, then lower VRAM.",
+            "vLLM: a native vLLM build that passed the serve check (linked), or why",
+            "there is none. It never changes the ranking; its speedups are measured",
+            "on the GPU named under the table, not the board's GPU.",
             "Unsuccessful stops stay off this ranking. See [ATTEMPTS.md](ATTEMPTS.md).",
             "Do not edit this file by hand. See the repo README to add a row.",
             "",
@@ -676,18 +788,19 @@ def _write_markdown() -> Path:
             lines.append(f"GPU: {group['gpu_name']}")
         lines.append("")
         lines.append(
-            "| Model | GPU | Method | Paper | Repo | Hugging Face | PPL ratio | tok/s | VRAM GB |"
+            "| Model | GPU | Method | Paper | Repo | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |")
         for row in methods:
             lines.append(
-                "| {model} | {gpu} | {method} | {paper} | {repo} | {hub} | {ratio} | {tps} | {vram} |".format(
+                "| {model} | {gpu} | {method} | {paper} | {repo} | {hub} | {vllm} | {ratio} | {tps} | {vram} |".format(
                     model=group.get("model_id") or "",
                     gpu=group.get("gpu_instance") or "",
                     method=row.get("method_name") or "",
                     paper=_md_link("paper", row.get("paper_url")),
                     repo=_md_link("repo", row.get("repo_url")),
                     hub=_md_link("hub", row.get("hub_url")),
+                    vllm=_vllm_cell(row.get("vllm")),
                     ratio=_num(row.get("ppl_ratio"), 4),
                     tps=_num(row.get("tokens_per_s"), 1),
                     vram=_num(row.get("peak_vram_gb"), 3),
@@ -696,10 +809,45 @@ def _write_markdown() -> Path:
         if best.get("method_name"):
             lines.append("")
             lines.append(f"**Best:** {best['method_name']} (`{best.get('slug') or best.get('method_name')}`).")
+        vllm_lines = [_vllm_detail(row) for row in methods]
+        vllm_lines = [line for line in vllm_lines if line]
+        if vllm_lines:
+            lines.append("")
+            lines.extend(vllm_lines)
         lines.append("")
     dest = paths.LIBRARY_ROOT / "LIBRARY.md"
     atomic_write_text(dest, "\n".join(lines) + "\n", mode=0o644)
     return dest
+
+
+def _vllm_cell(block) -> str:
+    if not isinstance(block, dict):
+        return ""
+    status = block.get("status")
+    if status == "passed":
+        return _md_link("vLLM", block.get("hub_url")) or "passed"
+    if status == "unsupported":
+        return f"no (`{block.get('reason_code')}`)"
+    if status == "failed":
+        return f"failed (`{', '.join(block.get('issue_codes') or [])}`)"
+    return str(status or "")
+
+
+def _vllm_detail(row: dict) -> str | None:
+    block = row.get("vllm")
+    if not isinstance(block, dict) or block.get("status") != "passed":
+        return None
+    decode = block.get("decode_speedup") or {}
+    decode_text = ", ".join(
+        f"{_num(value, 2)}× batch {batch}" for batch, value in sorted(decode.items(), key=lambda kv: int(kv[0]))
+    )
+    return (
+        f"- vLLM {row.get('method_name')}: PPL ratio {_num(block.get('ppl_ratio'), 4)} vs vLLM fp16"
+        f" (drift {_num(block.get('ppl_ratio_drift'), 4)} vs this board), prefill "
+        f"{_num(block.get('prefill_speedup'), 2)}×, decode {decode_text or 'n/a'}. "
+        f"Measured on {block.get('gpu_name')} with vLLM {block.get('vllm_version')}"
+        f"{', ' + block['checked_at'] if block.get('checked_at') else ''}."
+    )
 
 
 def _md_link(label: str, url) -> str:
@@ -1227,6 +1375,33 @@ def accept_contribution(path: Path) -> Path:
     return dest
 
 
+def _record_vllm_cli(args) -> dict:
+    if args.job_id:
+        if args.request is None:
+            raise SystemExit("--request is required with --job-id")
+        request = load_request(args.request)
+        key = (request.get("model_id"), request.get("gpu_instance"), request.get("method_name"))
+        export_path = jobs_mod.job_dir(args.job_id) / "vllm_export.json"
+        report_path = jobs_mod.job_dir(args.job_id) / "vllm.json"
+    else:
+        key = (args.model_id, args.gpu_instance, args.method_name)
+        if not all(key) or args.vllm_export is None:
+            raise SystemExit("--record-vllm needs --job-id/--request, or --model-id --gpu-instance --method --vllm-export")
+        export_path = args.vllm_export
+        report_path = args.serve_report
+    if not export_path.is_file():
+        raise SystemExit(f"{export_path} missing; run export_vllm.py first")
+    serve_report = _read_json(report_path) if report_path is not None and report_path.is_file() else None
+    return record_vllm(
+        model_id=str(key[0]),
+        gpu_instance=str(key[1]),
+        method_name=str(key[2]),
+        export_record=_read_json(export_path),
+        serve_report=serve_report,
+        hub_repo_id=args.vllm_repo_id,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Filter the quantized catalog, record a beneficial row, or record an unsuccessful attempt"
@@ -1268,6 +1443,14 @@ def main() -> int:
         action="store_true",
         help="List unsuccessful attempts instead of the published catalog",
     )
+    parser.add_argument(
+        "--record-vllm",
+        action="store_true",
+        help="Attach the vLLM export + serve-check result to an existing library row",
+    )
+    parser.add_argument("--vllm-export", type=Path, help="vllm_export.json (backfill; job mode reads jobs/<id>/)")
+    parser.add_argument("--serve-report", type=Path, help="serve_check report (backfill; job mode reads jobs/<id>/vllm.json)")
+    parser.add_argument("--vllm-repo-id", help="Hub org/name of the published vLLM build (passed checks only)")
     parser.add_argument("--rebuild", action="store_true", help="Rewrite catalog.json from groups + contributions")
     parser.add_argument(
         "--sync-hf-collection",
@@ -1289,6 +1472,9 @@ def main() -> int:
             return 0
         if args.rebuild:
             print(json.dumps(rebuild_derived(), indent=2))
+            return 0
+        if args.record_vllm:
+            print(json.dumps(_record_vllm_cli(args), indent=2))
             return 0
         if args.job_id:
             if args.request is None:
