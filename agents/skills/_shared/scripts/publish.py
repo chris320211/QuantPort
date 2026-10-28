@@ -43,6 +43,9 @@ _ADAPTER_FILE = "quant_agent_inference_adapter.py"
 _MODEL_CARD = "README.md"
 
 
+QUANTPORT_URL = "https://github.com/chris320211/QuantPort"
+
+
 def _redact(message: str, token: str | None) -> str:
     if token:
         return message.replace(token, "***")
@@ -195,15 +198,15 @@ library_name: transformers
 pipeline_tag: text-generation
 tags:
 - quantized
-- quant-agent
+- quantport
 - {method.lower().replace(" ", "-")}
 - wikitext-2
 ---
 
 # {method} {model_id}
 
-Quantized derivative of [`{model_id}`](https://huggingface.co/{model_id}).
-Not Hub fp16. Weights are the packed/runtime artifact from job `{job_id}`.
+Quantized derivative of [`{model_id}`](https://huggingface.co/{model_id}), made with
+[QuantPort]({QUANTPORT_URL}). Not Hub fp16. Weights are the packed/runtime artifact from job `{job_id}`.
 
 ## WikiText-2 (test, 2048-token windows, 65504 tokens)
 

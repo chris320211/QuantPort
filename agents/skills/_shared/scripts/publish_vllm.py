@@ -21,7 +21,7 @@ import paths
 from env import child_env, host_execution_policy, require_host_execution
 from export_vllm import EXPORT_RECORD
 from io_utils import atomic_write_text
-from publish import _REPO_ID_RE, _fmt, _redact, base_model_license, upload_hub_bundle
+from publish import QUANTPORT_URL, _REPO_ID_RE, _fmt, _redact, base_model_license, upload_hub_bundle
 from request import load_request
 from serve_check import EXPORT_PPL_DRIFT_MAX, dtype_label
 
@@ -154,7 +154,7 @@ base_model_relation: quantized
 pipeline_tag: text-generation
 tags:
 - quantized
-- quant-agent
+- quantport
 - {method_tag}
 - vllm
 - compressed-tensors
@@ -168,7 +168,8 @@ A native vLLM checkpoint of [`{base_repo_id}`](https://huggingface.co/{base_repo
 the {method_name} quantization of [`{model_id}`](https://huggingface.co/{model_id}).
 The int8 weights are the same bytes, renamed into the `compressed-tensors`
 format (`int-quantized`: per-channel int8 weights, dynamic per-token int8
-activations). No custom code, no `trust_remote_code`.
+activations). No custom code, no `trust_remote_code`. Made with
+[QuantPort]({QUANTPORT_URL}).
 
 ## Serve
 

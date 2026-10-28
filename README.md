@@ -55,7 +55,8 @@ third-party method code there.
 ```bash
 git clone https://github.com/chris320211/QuantPort.git
 cd QuantPort
-python -m pip install -c constraints.txt -e '.[dev]'
+PY=$(command -v python || command -v python3)
+"$PY" -m pip install -c constraints.txt -e '.[dev]'
 cp .env.example .env && chmod 600 .env   # then set HF_TOKEN in your editor
 source agents/skills/_shared/load_env.sh .env
 ```
