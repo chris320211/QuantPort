@@ -19,7 +19,7 @@ Default credential store is a **local `.env`**. Create it **once per machine**
 to recreate `.env` if it already exists.
 
 - **Skills path:** Codex/Claude/Cursor run these skills in the active session.
-  There is no `quant-agent` CLI.
+  There is no `quantport` CLI.
 - **Interpreter:** `PY=$([ -x .venv/bin/python ] && echo .venv/bin/python || command -v python || command -v python3)`. Deep Learning
   AMI / Ubuntu GPU hosts often have `python3` only. Install helper deps once:
   `"$PY" -m pip install -c constraints.txt -e '.[dev]'`.

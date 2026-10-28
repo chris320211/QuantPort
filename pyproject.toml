@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quant-agent"
+name = "quantport"
 version = "0.2.0"
-description = "Skills for your own AI agent on a GPU: port any quantization method onto any model, measure vs fp16, publish beneficial runs."
+description = "QuantPort: agent skills that port a quantization method onto a model on a GPU and measure it against fp16."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

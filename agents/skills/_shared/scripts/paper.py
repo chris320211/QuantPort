@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 60
 _MAX_HTTP_BYTES = 50 * 1024 * 1024
-_UA = {"User-Agent": "quant-agent/0.1 (+https://github.com/)"}
+_UA = {"User-Agent": "quantport/0.2 (+https://github.com/chris320211/QuantPort)"}
 _ARXIV_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 

@@ -1,7 +1,7 @@
 # Skills
 
 This folder is the skill tree your AI agent follows on a GPU host. You do
-not start a separate quant-agent process — open this repo in Cursor, Claude
+not start a separate QuantPort process — open this repo in Cursor, Claude
 Code, Codex, or similar, and invoke `quant`.
 
 The parent skill collects **method**, **model**, and **GPU instance**, then
