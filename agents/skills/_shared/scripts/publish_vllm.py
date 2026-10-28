@@ -23,7 +23,7 @@ from export_vllm import EXPORT_RECORD
 from io_utils import atomic_write_text
 from publish import _REPO_ID_RE, _fmt, _redact, base_model_license, upload_hub_bundle
 from request import load_request
-from serve_check import EXPORT_PPL_DRIFT_MAX
+from serve_check import EXPORT_PPL_DRIFT_MAX, dtype_label
 
 SERVE_REPORT = "vllm.json"
 VLLM_REPO_SUFFIX = "-vllm"
@@ -67,6 +67,7 @@ def render_vllm_card(
     quant = report.get("quantized") or {}
     base = report.get("fp16_baseline") or {}
     cmp_ = report.get("comparison") or {}
+    ref = dtype_label(report)
     gpu = quant.get("gpu_name") or "unknown GPU"
     version = quant.get("vllm_version") or "unknown"
     lic = license_info or {"license": "other"}
@@ -93,7 +94,7 @@ def render_vllm_card(
     if drift is not None and drift < 1 / EXPORT_PPL_DRIFT_MAX:
         drift_line += (
             "- vLLM scores better than the HF benchmark. vLLM's int8 path quantizes only "
-            "the inputs of linear layers and keeps attention in fp16, so this build rounds "
+            f"the inputs of linear layers and keeps attention in {ref}, so this build rounds "
             "less than the benchmarked model (for example, one that also quantized attention "
             "inputs). Same weights, not bit-identical outputs.\n"
         )
@@ -136,16 +137,16 @@ print(llm.generate("Hello", SamplingParams(max_tokens=32))[0].outputs[0].text)
 
 ## vLLM results
 
-Measured with vLLM {version} on **{gpu}**, against vLLM fp16 of `{model_id}`.
+Measured with vLLM {version} on **{gpu}**, against vLLM {ref} of `{model_id}`.
 WikiText-2 test, 2048-token windows ({quant.get("tokens_evaluated", "?")} tokens),
 the same windows as the HF benchmark in `{base_repo_id}`.
 
-| | vLLM int8 | vLLM fp16 |
+| | vLLM int8 | vLLM {ref} |
 | --- | ---: | ---: |
 | Perplexity | {_fmt(quant.get("perplexity"), 4)} | {_fmt(base.get("perplexity"), 4)} |
 | Prefill tok/s | {_fmt((quant.get("prefill") or {}).get("tokens_per_s"), 1)} | {_fmt((base.get("prefill") or {}).get("tokens_per_s"), 1)} |
 {decode_rows}
-- PPL ratio (int8 / fp16): {_fmt(cmp_.get("ppl_ratio"), 4)}
+- PPL ratio (int8 / {ref}): {_fmt(cmp_.get("ppl_ratio"), 4)}
 {drift_line}- Prefill speedup: {_fmt(cmp_.get("prefill_speedup"), 2)}×. Decode speedup: {decode_speedups or "n/a"}.
 
 Speed numbers are from {gpu}. The HF benchmark in `{base_repo_id}` used a
@@ -155,7 +156,7 @@ different GPU and runtime, so compare speed within this table only.
 
 - `{SERVE_REPORT}`: the full serve-check report.
 - `{EXPORT_RECORD}`: how the checkpoint was converted (profile `{export_record.get("profile")}`,
-  {_count(len(export_record.get("ignore") or []), "module")} kept in fp16).
+  {_count(len(export_record.get("ignore") or []), "module")} kept in {ref}).
 
 ## License
 
@@ -168,6 +169,7 @@ def render_card_section(*, repo_id: str, report: dict) -> str:
     """The short block added to the base repo's card."""
     quant = report.get("quantized") or {}
     cmp_ = report.get("comparison") or {}
+    ref = dtype_label(report)
     decode = cmp_.get("decode_speedup") or {}
     decode_text = ", ".join(
         f"{_fmt(v, 2)}× (batch {b})" for b, v in sorted(decode.items(), key=lambda kv: int(kv[0]))
@@ -181,7 +183,7 @@ A native vLLM build of these weights: [`{repo_id}`](https://huggingface.co/{repo
 vllm serve {repo_id}
 ```
 
-vLLM PPL ratio {_fmt(cmp_.get("ppl_ratio"), 4)} against vLLM fp16; prefill
+vLLM PPL ratio {_fmt(cmp_.get("ppl_ratio"), 4)} against vLLM {ref}; prefill
 {_fmt(cmp_.get("prefill_speedup"), 2)}×, decode {decode_text or "n/a"}. Measured on
 {quant.get("gpu_name")} with vLLM {quant.get("vllm_version")}.
 {CARD_SECTION_END}

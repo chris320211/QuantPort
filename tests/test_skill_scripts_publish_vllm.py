@@ -137,3 +137,19 @@ def test_card_explains_a_vllm_build_that_beats_the_hf_ratio(tmp_path, out_root):
         model_id="m", method_name="M", base_repo_id="a/b", repo_id="a/b-vllm",
         report=_report(), export_record={}, license_info=LICENSE,
     )
+
+
+def test_card_names_the_baseline_dtype():
+    report = {**_report(), "dtype": "bfloat16"}
+    card = pv.render_vllm_card(
+        model_id="m", method_name="M", base_repo_id="a/b", repo_id="a/b-vllm",
+        report=report, export_record={"ignore": ["lm_head"]}, license_info=LICENSE,
+    )
+    assert "against vLLM bf16 of `m`" in card
+    assert "| | vLLM int8 | vLLM bf16 |" in card
+    assert "fp16" not in card
+    assert "against vLLM bf16;" in pv.render_card_section(repo_id="a/b-vllm", report=report)
+    assert "vLLM int8 | vLLM fp16 |" in pv.render_vllm_card(
+        model_id="m", method_name="M", base_repo_id="a/b", repo_id="a/b-vllm",
+        report=_report(), export_record={}, license_info=LICENSE,
+    )

@@ -745,3 +745,18 @@ def test_vllm_block_rejects_unbacked_claims():
         library_mod.validate_vllm_block({"status": "passed", "ppl_ratio": 1.0, "gpu_name": "x"})
     pending = library_mod.vllm_block({"status": "exported", "profile": "w8a8_int8"})
     assert pending == {"status": "pending", "profile": "w8a8_int8"}
+
+
+def test_record_vllm_keeps_the_baseline_dtype(tmp_path, monkeypatch):
+    import pytest
+
+    _accept_awq(tmp_path, monkeypatch)
+    library_mod.record_vllm(
+        model_id="org/model", gpu_instance="g5.2xlarge", method_name="SmoothQuant",
+        export_record={"status": "exported", "profile": "w8a8_int8"},
+        serve_report={**_serve_report(), "dtype": "bfloat16"}, hub_repo_id="me/sq-model-vllm",
+    )
+    assert library_mod.query()[0]["vllm"]["dtype"] == "bfloat16"
+    assert "PPL ratio 1.0400 vs vLLM bf16" in (tmp_path / "library" / "LIBRARY.md").read_text()
+    with pytest.raises(ValueError, match="vllm.dtype"):
+        library_mod.validate_vllm_block({"status": "pending", "dtype": "float32"})

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "model_id": "google/gemma-2-2b-it",
   "method_name": "SmoothQuant",
   "gpu_instance": "g5.2xlarge",
@@ -24,5 +24,23 @@
   "job_id": "20260921T132955Z-21a810",
   "slug": "smoothquant-gemma2-2b-g52xlarge",
   "artifact_dir": "quantized/smoothquant-gemma2-2b-g52xlarge",
-  "verification_status": "passed"
+  "verification_status": "passed",
+  "vllm": {
+    "status": "passed",
+    "profile": "w8a8_int8",
+    "vllm_version": "0.30.0",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "dtype": "bfloat16",
+    "ppl_ratio": 1.0285319320033748,
+    "hf_ppl_ratio": 1.021530187291258,
+    "ppl_ratio_drift": 1.0068541730819358,
+    "prefill_speedup": 1.925614552341063,
+    "decode_speedup": {
+      "1": 1.373888488816414,
+      "16": 1.3949734885553982
+    },
+    "checked_at": "2026-10-28",
+    "hub_repo_id": "chris320211/smoothquant-gemma2-2b-g52xlarge-vllm",
+    "hub_url": "https://huggingface.co/chris320211/smoothquant-gemma2-2b-g52xlarge-vllm"
+  }
 }

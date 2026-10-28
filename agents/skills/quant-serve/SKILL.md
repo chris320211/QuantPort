@@ -76,7 +76,9 @@ Do not ask the parent mid-stage. Never read `.env`; this stage needs no tokens.
    ```
 
    Writes `jobs/<job_id>/vllm.json` and stamps `serve_check` on
-   `quantized/<slug>-vllm/vllm_export.json`. Gates:
+   `quantized/<slug>-vllm/vllm_export.json`. Both sides run in float16. If
+   vLLM refuses float16 for the architecture (Gemma 2), both rerun in
+   bfloat16; the report's `dtype` and the published card say so. Gates:
 
    | issue code | Meaning |
    | --- | --- |

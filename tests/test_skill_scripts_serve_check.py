@@ -247,3 +247,64 @@ def test_skill_documents_every_reason_and_issue_code():
     assert codes, "no codes found; the regexes no longer match the sources"
     missing = sorted(code for code in codes if f"`{code}`" not in skill)
     assert not missing, f"quant-serve/SKILL.md does not document: {missing}"
+
+
+_FP16_REFUSAL = (
+    "vLLM serve check failed for vllm_quantized (exit=1). Last log lines:\n"
+    "  Value error, The model type 'gemma2' does not support float16. Reason: Numerical instability."
+)
+
+
+def test_run_side_passes_dtype_to_the_child(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, *, stdout, stderr, env, timeout, check):
+        cfg = json.loads(Path(argv[-1]).read_text())
+        seen.update(cfg)
+        Path(cfg["output_json"]).write_text(json.dumps({"perplexity": 1.0}))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(serve_mod.subprocess, "run", fake_run)
+    serve_mod._run_side(
+        model_path=tmp_path / "m", work_dir=tmp_path / "w", venv_py=Path(sys.executable),
+        corpus=tmp_path / "c.txt", result_name="side", dtype="bfloat16",
+    )
+    assert seen["dtype"] == "bfloat16"
+
+
+def test_fp16_refusal_reruns_both_sides_in_bf16(check_env, monkeypatch):
+    run, _ = check_env
+    calls = []
+
+    def fake_side(*, result_name, dtype, **kwargs):
+        calls.append((result_name, dtype))
+        if dtype == "float16":
+            raise RuntimeError(_FP16_REFUSAL)
+        return side(10.2 if result_name == "vllm_quantized" else 10.0, 2, {1: 2})
+
+    monkeypatch.setattr(serve_mod, "_run_side", fake_side)
+    report = run()
+    assert calls == [("vllm_quantized", "float16"), ("vllm_quantized", "bfloat16"), ("vllm_fp16", "bfloat16")]
+    assert report["status"] == "passed"
+    assert report["dtype"] == "bfloat16"
+    assert serve_mod.dtype_label(report) == "bf16"
+
+
+def test_other_load_errors_do_not_retry(check_env, monkeypatch):
+    run, _ = check_env
+    calls = []
+
+    def fake_side(*, result_name, dtype, **kwargs):
+        calls.append(dtype)
+        raise RuntimeError("KeyError: 'model.layers.0.self_attn.q_proj.weight_scale'")
+
+    monkeypatch.setattr(serve_mod, "_run_side", fake_side)
+    report = run()
+    assert calls == ["float16"]
+    assert report["issue_codes"] == ["vllm_load_failed"]
+    assert report["dtype"] == "float16"
+
+
+def test_reports_without_dtype_read_as_fp16():
+    assert serve_mod.dtype_label({}) == "fp16"
+    assert serve_mod.dtype_label({"dtype": "float16"}) == "fp16"

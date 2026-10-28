@@ -29,6 +29,7 @@ SCHEMA_VERSION = 2
 QUALITY_PPL_RATIO_MAX = 1.5
 VLLM_STATUSES = ("passed", "failed", "unsupported", "pending")
 VLLM_PPL_DRIFT_MAX = 1.02
+VLLM_DTYPES = {"float16": "fp16", "bfloat16": "bf16"}
 COLLECTION_TITLE = "quant-agent library"
 COLLECTION_DESCRIPTION = (
     "One library of quantized LLMs measured by quant-agent. "
@@ -344,6 +345,8 @@ def validate_vllm_block(block: dict) -> dict:
         raise ValueError("vllm.status unsupported needs reason_code")
     if status == "failed" and not block.get("issue_codes"):
         raise ValueError("vllm.status failed needs issue_codes")
+    if block.get("dtype") is not None and block["dtype"] not in VLLM_DTYPES:
+        raise ValueError(f"vllm.dtype must be one of {', '.join(VLLM_DTYPES)}")
     repo = block.get("hub_repo_id")
     if repo is not None and not _HUB_REPO_RE.fullmatch(str(repo)):
         raise ValueError("vllm.hub_repo_id must be org/name")
@@ -385,6 +388,7 @@ def vllm_block(
             "profile": export_record.get("profile"),
             "vllm_version": quantized.get("vllm_version"),
             "gpu_name": quantized.get("gpu_name"),
+            "dtype": serve_report.get("dtype"),
             "ppl_ratio": comparison.get("ppl_ratio"),
             "hf_ppl_ratio": comparison.get("hf_ppl_ratio"),
             "ppl_ratio_drift": comparison.get("ppl_ratio_drift"),
@@ -842,7 +846,8 @@ def _vllm_detail(row: dict) -> str | None:
         f"{_num(value, 2)}× batch {batch}" for batch, value in sorted(decode.items(), key=lambda kv: int(kv[0]))
     )
     return (
-        f"- vLLM {row.get('method_name')}: PPL ratio {_num(block.get('ppl_ratio'), 4)} vs vLLM fp16"
+        f"- vLLM {row.get('method_name')}: PPL ratio {_num(block.get('ppl_ratio'), 4)} vs vLLM "
+        f"{VLLM_DTYPES.get(block.get('dtype') or 'float16')}"
         f" (drift {_num(block.get('ppl_ratio_drift'), 4)} vs this board), prefill "
         f"{_num(block.get('prefill_speedup'), 2)}×, decode {decode_text or 'n/a'}. "
         f"Measured on {block.get('gpu_name')} with vLLM {block.get('vllm_version')}"

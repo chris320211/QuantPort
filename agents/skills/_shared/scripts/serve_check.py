@@ -10,6 +10,10 @@ Gates:
 - runtime: the serve venv imports vLLM and sees a CUDA device (`vllm_runtime_unavailable`)
 - smoke: the export loads and generates alphanumeric text (`vllm_load_failed`)
 - baseline: vLLM fp16 loads and gives a finite PPL (`vllm_baseline_failed`)
+
+Both sides run in float16. When vLLM itself refuses float16 for the
+architecture (e.g. Gemma 2, for numerical stability), both rerun in bfloat16
+and the report records `dtype`.
 - quality: vLLM PPL ratio vs vLLM fp16 <= 1.5 (`vllm_quality_failed`)
 - consistency: vLLM PPL ratio / HF PPL ratio <= 1.02 (`vllm_ppl_mismatch`, an
   export bug such as a wrong scale convention, not a quantization problem)
@@ -51,6 +55,11 @@ GPU_MEMORY_UTILIZATION = 0.85
 _RUN_TIMEOUT_S = 1800
 _INSTALL_TIMEOUT_S = 3600  # vLLM + CUDA wheels are ~5 GB; slow mirrors need the room
 _PROBE_TIMEOUT_S = 300
+DEFAULT_DTYPE = "float16"
+FALLBACK_DTYPE = "bfloat16"
+# vLLM's refusal when an architecture is not allowed to run in float16.
+_FP16_REFUSED = "does not support float16"
+_DTYPE_LABELS = {"float16": "fp16", "bfloat16": "bf16"}
 # Offline: no Hub calls and no vLLM usage-stats upload.
 SERVE_CHILD_ENV = {
     "HF_HUB_OFFLINE": "1",
@@ -314,7 +323,15 @@ def probe_runtime(venv_py: Path, scratch: Path) -> str | None:
     return "\n".join(tail) or f"exit {proc.returncode}"
 
 
-def _run_side(*, model_path: Path, work_dir: Path, venv_py: Path, corpus: Path, result_name: str) -> dict:
+def dtype_label(report: dict | None) -> str:
+    """Short name of the dtype both sides ran in (`fp16` for reports that predate `dtype`)."""
+    dtype = (report or {}).get("dtype") or DEFAULT_DTYPE
+    return _DTYPE_LABELS.get(dtype, dtype)
+
+
+def _run_side(
+    *, model_path: Path, work_dir: Path, venv_py: Path, corpus: Path, result_name: str, dtype: str = DEFAULT_DTYPE
+) -> dict:
     work_dir.mkdir(parents=True, exist_ok=True)
     script_path = work_dir / "serve_infer.py"
     script_path.write_text(SERVE_SCRIPT)
@@ -328,7 +345,7 @@ def _run_side(*, model_path: Path, work_dir: Path, venv_py: Path, corpus: Path, 
                 "model_path": str(model_path),
                 "output_json": str(output_json),
                 "eval_path": str(corpus),
-                "dtype": "float16",
+                "dtype": dtype,
                 "max_seq_len": DEFAULT_MAX_SEQ_LEN,
                 "stride": DEFAULT_STRIDE,
                 "max_tokens": DEFAULT_MAX_TOKENS,
@@ -435,14 +452,30 @@ def serve_check(
     if runtime_error:
         return {**report, "status": "failed", "issue_codes": ["vllm_runtime_unavailable"], "error": runtime_error}
     corpus = ensure_wikitext2_corpus(venv_py)
+    dtype = DEFAULT_DTYPE
     try:
-        quantized = _run_side(model_path=model_dir, work_dir=work_dir, venv_py=venv_py, corpus=corpus, result_name="vllm_quantized")
+        try:
+            quantized = _run_side(
+                model_path=model_dir, work_dir=work_dir, venv_py=venv_py, corpus=corpus,
+                result_name="vllm_quantized", dtype=dtype,
+            )
+        except RuntimeError as exc:
+            if _FP16_REFUSED not in str(exc):
+                raise
+            dtype = FALLBACK_DTYPE
+            quantized = _run_side(
+                model_path=model_dir, work_dir=work_dir, venv_py=venv_py, corpus=corpus,
+                result_name="vllm_quantized", dtype=dtype,
+            )
     except RuntimeError as exc:
-        return {**report, "status": "failed", "issue_codes": ["vllm_load_failed"], "error": str(exc)}
+        return {**report, "dtype": dtype, "status": "failed", "issue_codes": ["vllm_load_failed"], "error": str(exc)}
+    report["dtype"] = dtype
     # From here on keep the quantized measurements, whatever the baseline does.
+    # The baseline runs in the same dtype, so the ratio compares like with like.
     try:
         baseline = _run_side(
-            model_path=Path(baseline_dir).resolve(), work_dir=work_dir, venv_py=venv_py, corpus=corpus, result_name="vllm_fp16"
+            model_path=Path(baseline_dir).resolve(), work_dir=work_dir, venv_py=venv_py, corpus=corpus,
+            result_name="vllm_fp16", dtype=dtype,
         )
     except RuntimeError as exc:
         return {**report, "status": "failed", "issue_codes": ["vllm_baseline_failed"], "quantized": quantized, "error": str(exc)}

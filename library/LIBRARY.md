@@ -33,9 +33,11 @@ GPU: NVIDIA A10G
 
 | Model | GPU | Method | Paper | Repo | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |
 | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| google/gemma-2-2b-it | g5.2xlarge | SmoothQuant | [paper](https://arxiv.org/abs/2211.10438) | [repo](https://github.com/mit-han-lab/smoothquant) | [hub](https://huggingface.co/chris320211/smoothquant-gemma2-2b-g52xlarge) |  | 1.0215 | 6322.2 | 8.090 |
+| google/gemma-2-2b-it | g5.2xlarge | SmoothQuant | [paper](https://arxiv.org/abs/2211.10438) | [repo](https://github.com/mit-han-lab/smoothquant) | [hub](https://huggingface.co/chris320211/smoothquant-gemma2-2b-g52xlarge) | [vLLM](https://huggingface.co/chris320211/smoothquant-gemma2-2b-g52xlarge-vllm) | 1.0215 | 6322.2 | 8.090 |
 
 **Best:** SmoothQuant (`smoothquant-gemma2-2b-g52xlarge`).
+
+- vLLM SmoothQuant: PPL ratio 1.0285 vs vLLM bf16 (drift 1.0069 vs this board), prefill 1.93×, decode 1.37× batch 1, 1.39× batch 16. Measured on NVIDIA GeForce RTX 3090 with vLLM 0.30.0, 2026-10-28.
 
 ## ibm-granite/granite-3.3-2b-instruct on g5.2xlarge
 GPU: NVIDIA A10G
