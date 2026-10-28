@@ -56,6 +56,50 @@
       "peak_vram_gb": 8.090173244476318,
       "baseline_peak_vram_gb": 9.97325849533081
     },
+    "runtimes": [
+      {
+        "runtime": "vLLM",
+        "precision": "int8",
+        "ppl": 15.244646918347307,
+        "prefill_tokens_per_s": 30696.74063338263,
+        "decode_tokens_per_s": {
+          "1": 176.00823644395288,
+          "16": 2332.508292615842
+        }
+      },
+      {
+        "runtime": "vLLM",
+        "precision": "bf16",
+        "ppl": 14.821753651006032,
+        "prefill_tokens_per_s": 15225.412028209064,
+        "decode_tokens_per_s": {
+          "1": 124.97120842430711,
+          "16": 1677.1949851893846
+        }
+      },
+      {
+        "runtime": "Transformers",
+        "precision": "int8",
+        "ppl": 15.128110253503799,
+        "prefill_tokens_per_s": 13792.612960763134,
+        "decode_tokens_per_s": {
+          "1": 5.049617820473443,
+          "16": 75.46949717868821
+        },
+        "peak_vram_gb": 8.090173244476318
+      },
+      {
+        "runtime": "Transformers",
+        "precision": "bf16",
+        "ppl": 14.821940509119212,
+        "prefill_tokens_per_s": 9814.81567067065,
+        "decode_tokens_per_s": {
+          "1": 9.454142462269719,
+          "16": 149.81213704202588
+        },
+        "peak_vram_gb": 9.97325849533081
+      }
+    ],
     "checked_at": "2026-10-28",
     "hub_repo_id": "chris320211/smoothquant-gemma2-2b-g52xlarge-vllm",
     "hub_url": "https://huggingface.co/chris320211/smoothquant-gemma2-2b-g52xlarge-vllm"

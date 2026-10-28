@@ -113,8 +113,8 @@ Do not ask the parent mid-stage. Never read `.env`; this stage needs no tokens.
 
    Same windows and decode test as step 2. `attach` refuses sides from another
    GPU or a baseline dtype that differs from the serve check's. The result
-   adds Transformers columns to the vLLM results on both Hub cards and a
-   "against plain Transformers" clause to the library line. Plain
+   adds Transformers columns to the vLLM results on both Hub cards and
+   Transformers rows to the vLLM table under the library board. Plain
    Transformers int8 decodes slower than fp16 (it quantizes activations at
    every step); say so, and point serving users to the `-vllm` build. Skip
    this step if the method venv is gone; the vLLM results stand alone.

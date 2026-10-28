@@ -794,3 +794,41 @@ def test_record_vllm_keeps_the_same_gpu_transformers_comparison(tmp_path, monkey
             "status": "passed", "vllm_version": "0.30.0", "gpu_name": "x", "ppl_ratio": 1.0,
             "hf_runtime": {**library_mod._hf_runtime_summary(hf_runtime), "int8_decode_speedup": {"1": "fast"}},
         })
+
+
+def test_record_vllm_renders_a_table_per_serving_gpu(tmp_path, monkeypatch):
+    _accept_awq(tmp_path, monkeypatch)
+    side = lambda ppl, pre, d1, d16, **kw: {  # noqa: E731
+        "perplexity": ppl, "prefill": {"tokens_per_s": pre},
+        "decode": [{"batch": 1, "tokens_per_s": d1}, {"batch": 16, "tokens_per_s": d16}], **kw,
+    }
+    report = {
+        **_serve_report(),
+        "dtype": "bfloat16",
+        "quantized": {**_serve_report()["quantized"], **side(10.4, 30000.0, 176.0, 2333.0)},
+        "fp16_baseline": side(10.0, 15000.0, 125.0, 1677.0),
+        "hf_runtime": {
+            "transformers_version": "4.46.3", "dtype": "bfloat16",
+            "quantized": side(10.3, 13800.0, 5.0, 75.5, peak_vram_gb=8.09),
+            "baseline": side(10.0, 9800.0, 9.5, 149.8, peak_vram_gb=9.97),
+            "comparison": {
+                "ppl_ratio": 1.03, "int8_prefill_speedup": 1.41, "int8_decode_speedup": {"1": 0.53, "16": 0.5},
+                "vllm_prefill_speedup": 3.06, "vllm_decode_speedup": {"1": 18.5, "16": 15.6},
+            },
+        },
+    }
+    library_mod.record_vllm(
+        model_id="org/model", gpu_instance="g5.2xlarge", method_name="SmoothQuant",
+        export_record={"status": "exported", "profile": "w8a8_int8"},
+        serve_report=report, hub_repo_id="me/sq-model-vllm",
+    )
+    md = (tmp_path / "library" / "LIBRARY.md").read_text()
+    assert "**vLLM** (GPU: NVIDIA GeForce RTX 3090)" in md
+    assert (
+        "| SmoothQuant | vLLM | [int8](https://huggingface.co/me/sq-model-vllm) | 10.4000 | 1.0400 | 30000.0 | 176.0 | 2333.0 | – |"
+    ) in md
+    assert "| SmoothQuant | vLLM | bf16 | 10.0000 | 1.0000 | 15000.0 | 125.0 | 1677.0 | – |" in md
+    assert "| SmoothQuant | Transformers | int8 | 10.3000 | 1.0300 | 13800.0 | 5.0 | 75.5 | 8.09 |" in md
+    assert "export drift 1.0050 vs this board" in md and "Transformers 4.46.3" in md
+    assert "- vLLM SmoothQuant:" not in md  # the table replaces the summary line
+    assert [r["runtime"] for r in library_mod.query()[0]["vllm"]["runtimes"]] == ["vLLM", "vLLM", "Transformers", "Transformers"]
