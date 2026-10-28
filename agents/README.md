@@ -67,7 +67,7 @@ tok/s beat fp16. Then, in the parent:
 1. `quant-serve` subagent — vLLM export + serve check (never blocks the rest)
 2. `quant-publish` — quantized weights on the Hub
 3. `quant-catalog` — row in [`library/LIBRARY.md`](../library/LIBRARY.md)
-4. `quant-sync` — GitHub table + [weight collection](https://huggingface.co/collections/chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230)
+4. `quant-sync` — GitHub table + [weight collection](https://huggingface.co/collections/chris320211/quantport-library-6aaf22fcafd69b39eabc9230)
 
 Without push access, PR `library/contributions/<model>__<gpu>__<method>.json`.
 See [`library/contributions/README.md`](../library/contributions/README.md).

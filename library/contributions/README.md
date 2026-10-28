@@ -2,7 +2,7 @@
 
 The ranking is [library/LIBRARY.md](../LIBRARY.md). Quantized weights stay on
 **your** public Hub repo. The collection is
-https://huggingface.co/collections/chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230
+https://huggingface.co/collections/chris320211/quantport-library-6aaf22fcafd69b39eabc9230
 
 Do not commit weight files. Do not edit `catalog.json`.
 

@@ -45,7 +45,7 @@ speed beats fp16.
 
 - [LIBRARY.md](library/LIBRARY.md): ranked runs, with vLLM results
 - [ATTEMPTS.md](library/ATTEMPTS.md): unsuccessful runs
-- [Hugging Face collection](https://huggingface.co/collections/chris320211/quant-agent-library-6aaf22fcafd69b39eabc9230): the weights
+- [Hugging Face collection](https://huggingface.co/collections/chris320211/quantport-library-6aaf22fcafd69b39eabc9230): the weights
 
 ## Setup
 
