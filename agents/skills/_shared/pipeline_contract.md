@@ -57,6 +57,11 @@ Order:
     unsuccessful STOP (`recommended_action: none` and not beneficial), the
     same skill records `library/attempts/` (`--record-attempt`) so failed
     ports are not lost. Docs: `library/LIBRARY.md`, `library/ATTEMPTS.md`.
+    The same call stores the run's overlay patch, manifest and wrapper in
+    `library/ports/<model>__<gpu>__<method>/` (attempts:
+    `library/ports/attempts/<model>__<gpu>__<method>/`; `library.py
+    --export-port` backfills an older row), so a result can be reviewed and
+    replayed.
     After the row exists, `library.py --record-vllm` attaches the serve
     result (passed with the vLLM repo, failed, unsupported with its reason,
     or pending) as the row's `vllm` block and the `LIBRARY.md` vLLM column.
@@ -121,6 +126,9 @@ for every new slug.
 - Third-party runs: `library/contributions/<model>__<gpu>__<method>.json` (PR)
 - Unsuccessful stops: `library/attempts/` and `library/ATTEMPTS.md`
   (not ranked; no Hub weights)
+- Ports: `library/ports/<model>__<gpu>__<method>/` (`overlay.patch`,
+  `manifest.json`, `quantize.py`, `port.json`); for an attempt, the best
+  job's port under `library/ports/attempts/`
 
 ## Invariants
 

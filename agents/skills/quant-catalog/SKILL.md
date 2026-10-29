@@ -27,7 +27,11 @@ tok/s**. Need the Hub URL from `quant-publish`.
 
 Standard row: **model**, **GPU instance**, **method**, **paper**, **method
 repo**, **weights**. Same shape every time. Writes
-`library/contributions/` and rebuilds `library/catalog.json`.
+`library/contributions/` and rebuilds `library/catalog.json`. It also stores
+the port behind the row (overlay patch, manifest, wrapper script) in
+`library/ports/<model>__<gpu>__<method>/` and links it from the **Port**
+column. A port with a token-shaped string, or whose job snapshot is gone, is
+skipped and the row is still recorded; check the return for `port`.
 
 ```bash
 $S/library.py --catalog --job-id <job_id> \
@@ -68,8 +72,13 @@ $S/library.py --rebuild
 ```
 
 Writes `library/attempts/<model>__<gpu>__<method>.json` and
-`library/ATTEMPTS.md`. Failed WikiText-2 jobs stay off
+`library/ATTEMPTS.md`, and stores the best job's port in
+`library/ports/attempts/` so a failure can be told apart from a bad port. It
+never touches the port behind a published row. Failed WikiText-2 jobs stay off
 `library/catalog.json`. List later with `$S/library.py --attempts`.
+
+A row recorded before ports existed: on the host that still has `jobs/<job_id>/`,
+`$S/library.py --export-port --job-id <job_id> --request out/requests/<slug>.json`.
 
 Docs: `library/LIBRARY.md`, `library/ATTEMPTS.md`.
 
@@ -86,6 +95,7 @@ paper_url: https://arxiv.org/abs/<id>
 repo_url: https://github.com/<owner>/<repo>
 hub_url: https://huggingface.co/<you>/<slug>
 contribution: library/contributions/<file>.json
+port: library/ports/<model>__<gpu>__<method> | skipped (<reason>)
 vllm: passed | failed | unsupported | pending | skipped
 ```
 

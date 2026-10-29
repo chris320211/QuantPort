@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -832,3 +833,317 @@ def test_record_vllm_renders_a_table_per_serving_gpu(tmp_path, monkeypatch):
     assert "export drift 1.0050 vs this board" in md and "Transformers 4.46.3" in md
     assert "- vLLM SmoothQuant:" not in md  # the table replaces the summary line
     assert [r["runtime"] for r in library_mod.query()[0]["vllm"]["runtimes"]] == ["vLLM", "vLLM", "Transformers", "Transformers"]
+
+
+_PATCH = (
+    "diff --git a/model.py b/model.py\n"
+    "--- a/model.py\n"
+    "+++ b/model.py\n"
+    "@@ -1 +1 @@\n"
+    "-OLD\n"
+    "+NEW\n"
+)
+
+
+def _write_port_job(tmp_path: Path, job_id: str, *, extra_script: str = "") -> None:
+    """A job directory the way launch.py leaves it: overlay snapshot + script.py."""
+    import hashlib
+
+    job_dir = jobs_mod.job_dir(job_id)
+    overlay = job_dir / "overlay"
+    overlay.mkdir(parents=True)
+    (overlay / "overlay.patch").write_text(_PATCH)
+    manifest = {
+        "schema_version": 1,
+        "method_id": "flatquant-phi3-mini-4k-g52xlarge",
+        "model_id": "microsoft/Phi-3-mini-4k-instruct",
+        "base_commit": "9d88ffcb7d2c6bda59fb5c44dad36adc101aadb1",
+        "patch_sha256": hashlib.sha256(_PATCH.encode()).hexdigest(),
+        "rationale": "add Phi-3 fused qkv",
+    }
+    (overlay / "manifest.json").write_text(json.dumps(manifest))
+    (job_dir / "script.py").write_text(
+        f"# QUANT_AGENT_OVERLAY_DIR={tmp_path}/out/overlays/x/dispatch/abc\n"
+        f'MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"\n'
+        f'OUTPUT_DIR = "./quantized/x"\n'
+        f'CACHE = "{tmp_path}/.cache"\n' + extra_script
+    )
+
+
+_PORT_REQUEST = {
+    "method_name": "FlatQuant",
+    "model_id": "microsoft/Phi-3-mini-4k-instruct",
+    "gpu_instance": "g5.2xlarge",
+    "gpu_name": "NVIDIA A10G",
+    "slug": "flatquant-phi3-mini-4k-g52xlarge",
+    "arxiv_id": "2410.09426",
+    "repo_url": "https://github.com/ruikangliu/FlatQuant",
+    "repo_commit": "9d88ffcb7d2c6bda59fb5c44dad36adc101aadb1",
+}
+
+
+def _patch_roots(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(paths_mod, "JOBS_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr(paths_mod, "LIBRARY_ROOT", tmp_path / "library")
+    monkeypatch.setattr(paths_mod, "REPO_ROOT", tmp_path)
+
+
+def test_catalog_run_stores_the_port_next_to_the_row(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaaaa1"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    _write_port_job(tmp_path, job_id)
+    result = library_mod.catalog_run(
+        job_id=job_id, request=_PORT_REQUEST, hub_url="https://huggingface.co/you/flatquant-phi3"
+    )
+    assert result["status"] == "cataloged"
+    stem = "microsoft_Phi-3-mini-4k-instruct__g5.2xlarge__FlatQuant"
+    assert result["port"] == f"library/ports/{stem}"
+    port = tmp_path / "library" / "ports" / stem
+    assert (port / "overlay.patch").read_text() == _PATCH
+    record = json.loads((port / "port.json").read_text())
+    assert record["kind"] == "contribution"
+    assert record["job_id"] == job_id
+    assert record["repo_commit"] == _PORT_REQUEST["repo_commit"]
+    assert record["files"] == ["manifest.json", "overlay.patch", "quantize.py"]
+    script = (port / "quantize.py").read_text()
+    assert str(tmp_path) not in script
+    assert "# QUANT_AGENT_OVERLAY_DIR=<overlay>" in script
+    assert 'CACHE = "<repo>/.cache"' in script
+    contribution = json.loads(
+        (tmp_path / "library" / "contributions" / f"{stem}.json").read_text()
+    )
+    assert contribution["port"] == f"library/ports/{stem}"
+    assert library_mod.query(method_name="FlatQuant")[0]["port"] == f"library/ports/{stem}"
+    assert f"[port](ports/{stem})" in (tmp_path / "library" / "LIBRARY.md").read_text()
+
+
+def test_row_without_an_overlay_snapshot_is_recorded_without_a_port(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaaaa2"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    result = library_mod.catalog_run(
+        job_id=job_id, request=_PORT_REQUEST, hub_url="https://huggingface.co/you/flatquant-phi3"
+    )
+    assert result["port"] == "skipped (no_overlay_snapshot)"
+    assert not (tmp_path / "library" / "ports").exists()
+    assert "port" not in library_mod.query(method_name="FlatQuant")[0]
+    assert "[port]" not in (tmp_path / "library" / "LIBRARY.md").read_text()
+
+
+def test_token_shaped_content_keeps_the_port_out_of_the_library(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaaaa3"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    _write_port_job(tmp_path, job_id, extra_script='TOKEN = "hf_' + "a" * 34 + '"\n')
+    library_mod.catalog_run(
+        job_id=job_id, request=_PORT_REQUEST, hub_url="https://huggingface.co/you/flatquant-phi3"
+    )
+    assert not (tmp_path / "library" / "ports").exists()
+    assert "port" not in library_mod.query(method_name="FlatQuant")[0]
+    skipped = library_mod.export_port(job_id=job_id, request=_PORT_REQUEST, kind="contribution")
+    assert skipped == {"status": "skipped", "reason": "secret_like_content"}
+
+
+def test_record_attempt_stores_the_best_jobs_port(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    best, last = "20260101T000000Z-aaaaa4", "20260101T000000Z-aaaaa5"
+    _write_job(tmp_path, best, packed=False, tps=100.0, ratio=8.76)
+    _write_job(tmp_path, last, packed=False, tps=100.0, ratio=9.5)
+    _write_port_job(tmp_path, best)
+    request = dict(
+        _PORT_REQUEST, best_job_id=best, retry_gpu_jobs_used=14, retry_gpu_jobs_max=14
+    )
+    result = library_mod.record_attempt(job_id=last, request=request)
+    stem = "microsoft_Phi-3-mini-4k-instruct__g5.2xlarge__FlatQuant"
+    assert result["port"] == f"library/ports/attempts/{stem}"
+    record = json.loads(
+        (tmp_path / "library" / "ports" / "attempts" / stem / "port.json").read_text()
+    )
+    assert record["kind"] == "attempt"
+    assert record["job_id"] == best
+    row = library_mod.query_attempts()[0]
+    assert row["port"] == f"library/ports/attempts/{stem}"
+    assert f"[port](ports/attempts/{stem})" in (tmp_path / "library" / "ATTEMPTS.md").read_text()
+
+
+def test_successful_catalog_replaces_a_stale_attempt_port(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    failed, won = "20260101T000000Z-aaaaa6", "20260101T000000Z-aaaaa7"
+    _write_job(tmp_path, failed, packed=False, tps=100.0, ratio=8.76)
+    _write_port_job(tmp_path, failed)
+    library_mod.record_attempt(
+        job_id=failed, request=dict(_PORT_REQUEST, best_job_id=failed)
+    )
+    _write_job(tmp_path, won, packed=True, tps=5105.9, ratio=1.17)
+    library_mod.catalog_run(
+        job_id=won, request=_PORT_REQUEST, hub_url="https://huggingface.co/you/flatquant-phi3"
+    )
+    stem = "microsoft_Phi-3-mini-4k-instruct__g5.2xlarge__FlatQuant"
+    assert library_mod.query_attempts() == []
+    assert not (tmp_path / "library" / "ports" / "attempts" / stem).exists()
+
+
+def test_attach_port_backfills_an_existing_row(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaaaa8"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    library_mod.catalog_run(
+        job_id=job_id, request=_PORT_REQUEST, hub_url="https://huggingface.co/you/flatquant-phi3"
+    )
+    assert "port" not in library_mod.query(method_name="FlatQuant")[0]
+    try:
+        library_mod.attach_port(job_id=job_id, request=_PORT_REQUEST)
+    except RuntimeError as exc:
+        assert "no_overlay_snapshot" in str(exc)
+    else:
+        raise AssertionError("expected nothing to store")
+    _write_port_job(tmp_path, job_id)
+    result = library_mod.attach_port(job_id=job_id, request=_PORT_REQUEST)
+    assert result["status"] == "attached"
+    assert result["kind"] == "contribution"
+    assert library_mod.query(method_name="FlatQuant")[0]["port"].startswith("library/ports/")
+    try:
+        library_mod.attach_port(
+            job_id=job_id, request=dict(_PORT_REQUEST, method_name="AWQ")
+        )
+    except RuntimeError as exc:
+        assert "no library row" in str(exc)
+    else:
+        raise AssertionError("expected missing row rejection")
+
+
+def test_validate_contribution_rejects_a_port_outside_library_ports():
+    base = json.loads(
+        next((ROOT / "library" / "contributions").glob("*.json")).read_text()
+    )
+    own = library_mod.port_ref(
+        base["model_id"], base["gpu_instance"], base["method_name"], kind="contribution"
+    )
+    library_mod.validate_contribution(dict(base, port=own))
+    for bad in (
+        "../x",
+        "library/ports/../x",
+        "library/ports/..",
+        "/etc/passwd",
+        "ports/x",
+        "library/ports/ok_name",
+        own.replace("library/ports/", "library/ports/attempts/"),
+    ):
+        try:
+            library_mod.validate_contribution(dict(base, port=bad))
+        except ValueError as exc:
+            assert "port" in str(exc)
+        else:
+            raise AssertionError(f"accepted {bad!r}")
+
+
+_STEM = "microsoft_Phi-3-mini-4k-instruct__g5.2xlarge__FlatQuant"
+_HUB = "https://huggingface.co/you/flatquant-phi3"
+
+
+def test_failed_rerun_leaves_the_published_port_alone(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    won, failed = "20260101T000000Z-aaab01", "20260101T000000Z-aaab02"
+    _write_job(tmp_path, won, packed=True, tps=5105.9, ratio=1.17)
+    _write_port_job(tmp_path, won)
+    library_mod.catalog_run(job_id=won, request=_PORT_REQUEST, hub_url=_HUB)
+    _write_job(tmp_path, failed, packed=False, tps=100.0, ratio=8.76)
+    _write_port_job(tmp_path, failed)
+    library_mod.record_attempt(job_id=failed, request=dict(_PORT_REQUEST, best_job_id=failed))
+    ports = tmp_path / "library" / "ports"
+    assert json.loads((ports / _STEM / "port.json").read_text())["job_id"] == won
+    assert json.loads((ports / "attempts" / _STEM / "port.json").read_text())["job_id"] == failed
+    assert library_mod.query(method_name="FlatQuant")[0]["port"] == f"library/ports/{_STEM}"
+
+
+def test_recatalog_without_a_snapshot_keeps_the_same_jobs_port(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id, other = "20260101T000000Z-aaab03", "20260101T000000Z-aaab04"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    _write_port_job(tmp_path, job_id)
+    library_mod.catalog_run(job_id=job_id, request=_PORT_REQUEST, hub_url=_HUB)
+    shutil.rmtree(jobs_mod.job_dir(job_id) / "overlay")
+    result = library_mod.catalog_run(job_id=job_id, request=_PORT_REQUEST, hub_url=_HUB)
+    assert result["port"] == f"library/ports/{_STEM}"
+    assert (tmp_path / "library" / "ports" / _STEM / "overlay.patch").read_text() == _PATCH
+    assert library_mod.query(method_name="FlatQuant")[0]["port"] == f"library/ports/{_STEM}"
+    # A different job without a snapshot: the old port no longer describes the row.
+    _write_job(tmp_path, other, packed=True, tps=5105.9, ratio=1.17)
+    result = library_mod.catalog_run(job_id=other, request=_PORT_REQUEST, hub_url=_HUB)
+    assert result["port"] == "skipped (no_overlay_snapshot)"
+    assert not (tmp_path / "library" / "ports" / _STEM).exists()
+    assert "port" not in library_mod.query(method_name="FlatQuant")[0]
+
+
+def test_a_row_that_fails_validation_writes_no_port(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaab05"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    _write_port_job(tmp_path, job_id)
+    try:
+        library_mod.export_contribution(
+            job_id=job_id, request=dict(_PORT_REQUEST, repo_url="https://example.com/x"), hub_url=_HUB
+        )
+    except ValueError as exc:
+        assert "repo_url" in str(exc)
+    else:
+        raise AssertionError("expected validation failure")
+    assert not (tmp_path / "library" / "ports").exists()
+
+
+def test_port_write_failure_still_records_the_attempt(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaab06"
+    _write_job(tmp_path, job_id, packed=False, tps=100.0, ratio=8.76)
+    _write_port_job(tmp_path, job_id)
+
+    def fail(self, data):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(Path, "write_bytes", fail)
+    result = library_mod.record_attempt(job_id=job_id, request=dict(_PORT_REQUEST, best_job_id=job_id))
+    assert result["status"] == "recorded"
+    assert result["port"] == "skipped (write_failed:PermissionError)"
+    assert "port" not in library_mod.query_attempts()[0]
+    assert not (tmp_path / "library" / "ports" / "attempts" / _STEM).exists()
+
+
+def test_bad_manifest_skips_the_port_instead_of_raising(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaab07"
+    _write_job(tmp_path, job_id, packed=False, tps=100.0, ratio=8.76)
+    _write_port_job(tmp_path, job_id)
+    (jobs_mod.job_dir(job_id) / "overlay" / "manifest.json").write_text("[1, 2]")
+    result = library_mod.record_attempt(job_id=job_id, request=dict(_PORT_REQUEST, best_job_id=job_id))
+    assert result["port"] == "skipped (invalid_manifest)"
+
+
+def test_port_records_the_overlay_base_commit(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    job_id = "20260101T000000Z-aaab08"
+    _write_job(tmp_path, job_id, packed=True, tps=5105.9, ratio=1.17)
+    _write_port_job(tmp_path, job_id)
+    request = dict(_PORT_REQUEST, repo_commit="1111111111111111111111111111111111111111")
+    library_mod.catalog_run(job_id=job_id, request=request, hub_url=_HUB)
+    record = json.loads((tmp_path / "library" / "ports" / _STEM / "port.json").read_text())
+    assert record["repo_commit"] == "9d88ffcb7d2c6bda59fb5c44dad36adc101aadb1"
+
+
+def test_accept_contribution_needs_the_linked_port_folder(tmp_path, monkeypatch):
+    _patch_roots(tmp_path, monkeypatch)
+    base = json.loads(next((ROOT / "library" / "contributions").glob("*.json")).read_text())
+    own = library_mod.port_ref(
+        base["model_id"], base["gpu_instance"], base["method_name"], kind="contribution"
+    )
+    incoming = tmp_path / "incoming.json"
+    incoming.write_text(json.dumps(dict(base, port=own)))
+    try:
+        library_mod.accept_contribution(incoming)
+    except ValueError as exc:
+        assert "port.json" in str(exc)
+    else:
+        raise AssertionError("expected missing port folder rejection")
+    (tmp_path / own).mkdir(parents=True)
+    (tmp_path / own / "port.json").write_text("{}")
+    assert library_mod.accept_contribution(incoming).is_file()

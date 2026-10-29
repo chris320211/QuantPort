@@ -4,7 +4,9 @@ The ranking is [library/LIBRARY.md](../LIBRARY.md). Quantized weights stay on
 **your** public Hub repo. The collection is
 https://huggingface.co/collections/chris320211/quantport-library-6aaf22fcafd69b39eabc9230
 
-Do not commit weight files. Do not edit `catalog.json`.
+Do not commit weight files. Do not edit `catalog.json`. Include the port
+(`library/ports/<model>__<gpu>__<method>/`, see [ports](../ports/README.md))
+that `quant-catalog` wrote, and set `"port": "library/ports/<name>"` in the JSON.
 
 A run counts if WikiText-2 stays within 1.5× fp16 perplexity **and** VRAM or
 tok/s beat fp16. Then:

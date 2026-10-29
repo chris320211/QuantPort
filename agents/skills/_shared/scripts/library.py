@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,12 @@ _NOTES_MAX = 8
 _SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _HUB_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$")
 _GITHUB_REPO_RE = re.compile(r"^https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_OVERLAY_HEADER_RE = re.compile(r"^# QUANT_AGENT_OVERLAY_DIR=.*$", re.MULTILINE)
+_PORT_FILE_MAX = 400_000
+_PORT_RE = re.compile(r"^library/ports/(?:attempts/)?[A-Za-z0-9_-][A-Za-z0-9._-]*$")
+_PORT_KINDS = ("contribution", "attempt")
+# Token-shaped values only; a patch may legitimately name HF_TOKEN.
+_PORT_SECRET_RE = re.compile(r"hf_[A-Za-z0-9]{30,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}")
 _REQUIRED_NUMS = (
     "ppl",
     "ppl_ratio",
@@ -100,6 +107,182 @@ def clear_attempt(model_id: str, gpu_instance: str, method_name: str) -> None:
     dest = attempt_path(model_id, gpu_instance, method_name)
     if dest.is_file():
         dest.unlink()
+    shutil.rmtree(port_path(model_id, gpu_instance, method_name, kind="attempt"), ignore_errors=True)
+
+
+def ports_dir() -> Path:
+    return paths.LIBRARY_ROOT / "ports"
+
+
+def port_ref(model_id: str, gpu_instance: str, method_name: str, *, kind: str) -> str:
+    """Where a row's port lives. Attempts get their own folder so a failed re-run
+    never touches the port behind published weights."""
+    if kind not in _PORT_KINDS:
+        raise ValueError("port kind must be contribution or attempt")
+    stem = contribution_filename(model_id, gpu_instance, method_name).removesuffix(".json")
+    return f"library/ports/attempts/{stem}" if kind == "attempt" else f"library/ports/{stem}"
+
+
+def port_path(model_id: str, gpu_instance: str, method_name: str, *, kind: str) -> Path:
+    ref = port_ref(model_id, gpu_instance, method_name, kind=kind)
+    return ports_dir() / ref.removeprefix("library/ports/")
+
+
+def _portable_text(text: str) -> str:
+    """Drop host paths so a stored port reads the same on any machine."""
+    text = _OVERLAY_HEADER_RE.sub("# QUANT_AGENT_OVERLAY_DIR=<overlay>", text)
+    return text.replace(str(paths.REPO_ROOT), "<repo>")
+
+
+def _port_sources(job_id: str) -> dict[str, bytes] | str:
+    """Files to store for a job's port, or the reason there is nothing to store."""
+    job_directory = jobs_mod.job_dir(job_id)
+    snapshot = job_directory / "overlay"
+    script = job_directory / "script.py"
+    if not snapshot.is_dir() or not script.is_file():
+        return "no_overlay_snapshot"
+    files: dict[str, bytes] = {}
+    try:
+        for path in sorted(snapshot.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            files[path.relative_to(snapshot).as_posix()] = path.read_bytes()
+        files["quantize.py"] = script.read_bytes()
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+    if "overlay.patch" not in files or "manifest.json" not in files:
+        return "incomplete_overlay"
+    for name, data in list(files.items()):
+        if len(data) > _PORT_FILE_MAX:
+            return f"file_too_large:{name}"
+        text = data.decode("utf-8", errors="replace")
+        if _PORT_SECRET_RE.search(text):
+            return "secret_like_content"
+        files[name] = _portable_text(text).encode("utf-8") if name != "overlay.patch" else data
+    return files
+
+
+def _row_names(request: dict) -> tuple[str, str, str]:
+    model_id = str(request.get("model_id") or "").strip()
+    gpu_instance = str(request.get("gpu_instance") or "").strip()
+    method_name = str(request.get("method_name") or "").strip()
+    if not (model_id and gpu_instance and method_name):
+        raise ValueError("request must include model_id, gpu_instance, and method_name")
+    return model_id, gpu_instance, method_name
+
+
+def build_port(*, job_id: str, request: dict, kind: str) -> dict:
+    """The port behind a run, held in memory so nothing is written before its row validates.
+
+    The patch is stored byte-for-byte (its sha256 is in the manifest); the wrapper
+    and adapter lose host paths. A job with nothing to store gives `skipped` and a
+    reason; only a request without model, GPU, and method raises.
+    """
+    model_id, gpu_instance, method_name = _row_names(request)
+    ref = port_ref(model_id, gpu_instance, method_name, kind=kind)
+    if not jobs_mod.valid_job_id(job_id):
+        return {"status": "skipped", "reason": "invalid_job_id"}
+    sources = _port_sources(job_id)
+    if isinstance(sources, str):
+        return {"status": "skipped", "reason": sources}
+    try:
+        manifest = json.loads(sources["manifest.json"])
+    except ValueError:
+        manifest = None
+    if not isinstance(manifest, dict):
+        return {"status": "skipped", "reason": "invalid_manifest"}
+    links = source_links(request)
+    record = {
+        "schema_version": 1,
+        "kind": kind,
+        "model_id": model_id,
+        "method_name": method_name,
+        "gpu_instance": gpu_instance,
+        "slug": request.get("slug"),
+        "job_id": job_id,
+        "repo_url": links["repo_url"],
+        # The patch applies to the commit the overlay was made against.
+        "repo_commit": manifest.get("base_commit") or links["repo_commit"],
+        "patch_sha256": manifest.get("patch_sha256"),
+        "files": sorted(sources),
+    }
+    files = dict(sources)
+    files["port.json"] = (json.dumps(record, indent=2) + "\n").encode("utf-8")
+    return {"status": "ready", "path": ref, "job_id": job_id, "files": files}
+
+
+def write_port(port: dict) -> dict:
+    """Swap a built port into place. A filesystem error gives `skipped`, never raises."""
+    if port["status"] != "ready":
+        return port
+    dest = paths.REPO_ROOT / port["path"]
+    staging = dest.with_name(f".{dest.name}.tmp")
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        for name, data in port["files"].items():
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        shutil.rmtree(dest, ignore_errors=True)
+        staging.rename(dest)
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"status": "skipped", "reason": f"write_failed:{type(exc).__name__}", "path": port["path"]}
+    return {"status": "exported", "path": port["path"], "job_id": port["job_id"]}
+
+
+def export_port(*, job_id: str, request: dict, kind: str) -> dict:
+    """Copy the overlay and wrapper behind a run into library/ports/ so it can be reviewed."""
+    return write_port(build_port(job_id=job_id, request=request, kind=kind))
+
+
+def _stored_port_job(ref: str) -> str | None:
+    try:
+        record = json.loads((paths.REPO_ROOT / ref / "port.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return record.get("job_id") if isinstance(record, dict) else None
+
+
+def _row_port(*, job_ids: list[str], request: dict, kind: str) -> dict:
+    """Port for a row about to be written: the first of job_ids with one to store
+    (an attempt's best job may differ from its last), else the stored port if it
+    came from one of those jobs."""
+    ref = port_ref(*_row_names(request), kind=kind)
+    job_ids = [job_id for job_id in dict.fromkeys(job_ids) if job_id]
+    result = {"status": "skipped", "reason": "no_job"}
+    for job_id in job_ids:
+        result = build_port(job_id=job_id, request=request, kind=kind)
+        if result["status"] == "ready":
+            return result
+    if _stored_port_job(ref) in job_ids:
+        return {"status": "kept", "path": ref}
+    return {**result, "path": ref}
+
+
+def _with_row_port(payload: dict, port: dict, validate) -> tuple[dict, dict]:
+    """Validate a row with its port link, then write the port. Nothing is written if
+    validation raises; a port from another job is removed; a port that fails to
+    write is unlinked and the row is kept."""
+    if port["status"] in ("ready", "kept"):
+        payload = {**payload, "port": port["path"]}
+    payload = validate(payload)
+    if port["status"] == "ready":
+        port = write_port(port)
+    elif port["status"] == "skipped":
+        shutil.rmtree(paths.REPO_ROOT / port["path"], ignore_errors=True)
+    if port["status"] not in ("exported", "kept"):
+        payload.pop("port", None)
+    return payload, port
+
+
+def port_summary(port: dict | None) -> str:
+    """The `port:` line of the quant-catalog return."""
+    if not port:
+        return "skipped (no_row)"
+    if port["status"] in ("exported", "kept"):
+        return port["path"]
+    return f"skipped ({port['reason']})"
 
 
 def _read_json(path: Path) -> dict:
@@ -333,7 +516,19 @@ def validate_contribution(data: dict, *, require_hub: bool = True) -> dict:
         data["repo_commit"] = links["repo_commit"]
     if data.get("vllm") is not None:
         data["vllm"] = validate_vllm_block(data["vllm"])
+    _check_port_link(data, kind="contribution")
     return data
+
+
+def _check_port_link(data: dict, *, kind: str) -> None:
+    """A row may only link its own port folder."""
+    if data.get("port") is None:
+        return
+    expected = port_ref(
+        str(data["model_id"]), str(data["gpu_instance"]), str(data["method_name"]), kind=kind
+    )
+    if data["port"] != expected:
+        raise ValueError(f"{kind} port must be {expected}")
 
 
 def validate_vllm_block(block: dict) -> dict:
@@ -522,6 +717,7 @@ def _method_from_contribution(data: dict) -> dict:
         "repo_commit": data.get("repo_commit"),
         "verification_status": data.get("verification_status"),
         "vllm": data.get("vllm"),
+        "port": data.get("port"),
     }
 
 
@@ -578,7 +774,7 @@ def catalog_rows() -> list[dict]:
         for method in methods:
             hub_url = method.get("hub_url")
             repo = _hub_repo_id(hub_url if isinstance(hub_url, str) else None)
-            rows.append(
+            row = (
                 {
                     "model_id": group.get("model_id"),
                     "method_name": method.get("method_name"),
@@ -610,6 +806,9 @@ def catalog_rows() -> list[dict]:
                     "vllm": method.get("vllm"),
                 }
             )
+            if method.get("port"):
+                row["port"] = method["port"]
+            rows.append(row)
     return rows
 
 
@@ -853,17 +1052,18 @@ def _write_markdown() -> Path:
             lines.append(f"GPU: {group['gpu_name']}")
         lines.append("")
         lines.append(
-            "| Model | GPU | Method | Paper | Repo | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |"
+            "| Model | GPU | Method | Paper | Repo | Port | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |")
         for row in methods:
             lines.append(
-                "| {model} | {gpu} | {method} | {paper} | {repo} | {hub} | {vllm} | {ratio} | {tps} | {vram} |".format(
+                "| {model} | {gpu} | {method} | {paper} | {repo} | {port} | {hub} | {vllm} | {ratio} | {tps} | {vram} |".format(
                     model=group.get("model_id") or "",
                     gpu=group.get("gpu_instance") or "",
                     method=row.get("method_name") or "",
                     paper=_md_link("paper", row.get("paper_url")),
                     repo=_md_link("repo", row.get("repo_url")),
+                    port=_port_link(row.get("port")),
                     hub=_md_link("hub", row.get("hub_url")),
                     vllm=_vllm_cell(row.get("vllm")),
                     ratio=_num(row.get("ppl_ratio"), 4),
@@ -988,6 +1188,13 @@ def _vllm_tables(methods: list[dict]) -> list[str]:
 def _decode_text(decode) -> str:
     items = sorted((decode or {}).items(), key=lambda kv: int(kv[0]))
     return ", ".join(f"{_num(value, 2)}× batch {batch}" for batch, value in items) or "n/a"
+
+
+def _port_link(port) -> str:
+    """Relative link from library/*.md to a stored port, or empty."""
+    if not isinstance(port, str) or not _PORT_RE.fullmatch(port):
+        return ""
+    return f"[port]({port.removeprefix('library/')})"
 
 
 def _md_link(label: str, url) -> str:
@@ -1148,6 +1355,7 @@ def validate_attempt(data: dict) -> dict:
     }
     if is_beneficial(comparison):
         raise ValueError("beneficial runs belong in the catalog, not attempts")
+    _check_port_link(data, kind="attempt")
     payload = dict(data)
     payload["stop_reason"] = reason
     payload["quality_ok"] = data.get("quality_ok") is True
@@ -1216,9 +1424,9 @@ def _write_attempts() -> dict:
         lines.append("")
     else:
         lines.append(
-            "| Model | GPU | Method | Paper | Repo | Stop | Issues | PPL ratio | Retries | Job |"
+            "| Model | GPU | Method | Paper | Repo | Port | Stop | Issues | PPL ratio | Retries | Job |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |")
         for row in rows:
             issues = row.get("issue_codes") if isinstance(row.get("issue_codes"), list) else []
             used = row.get("retry_gpu_jobs_used")
@@ -1227,12 +1435,13 @@ def _write_attempts() -> dict:
             if isinstance(used, int) and isinstance(maximum, int):
                 retries = f"{used}/{maximum}"
             lines.append(
-                "| {model} | {gpu} | {method} | {paper} | {repo} | {stop} | {issues} | {ratio} | {retries} | {job} |".format(
+                "| {model} | {gpu} | {method} | {paper} | {repo} | {port} | {stop} | {issues} | {ratio} | {retries} | {job} |".format(
                     model=row.get("model_id") or "",
                     gpu=row.get("gpu_instance") or "",
                     method=row.get("method_name") or "",
                     paper=_md_link("paper", row.get("paper_url")),
                     repo=_md_link("repo", row.get("repo_url")),
+                    port=_port_link(row.get("port")),
                     stop=row.get("stop_reason") or "",
                     issues=", ".join(str(item) for item in issues[:4]),
                     ratio=_num(row.get("ppl_ratio") or row.get("best_ppl_ratio"), 4),
@@ -1323,7 +1532,8 @@ def record_attempt(*, job_id: str, request: dict) -> dict:
         "verification_status": meta.verification_status,
         "benchmark_status": meta.benchmark_status or ("passed" if comparison else None),
     }
-    payload = validate_attempt(payload)
+    port = _row_port(job_ids=[payload["best_job_id"], job_id], request=request, kind="attempt")
+    payload, port = _with_row_port(payload, port, validate_attempt)
     dest = attempt_path(model_id, gpu_instance, method_name)
     atomic_write_text(dest, json.dumps(payload, indent=2) + "\n", mode=0o644)
     rebuild_derived()
@@ -1343,6 +1553,7 @@ def record_attempt(*, job_id: str, request: dict) -> dict:
         "ppl_ratio": payload.get("ppl_ratio") or payload.get("best_ppl_ratio"),
         "retry_gpu_jobs_used": payload["retry_gpu_jobs_used"],
         "retry_gpu_jobs_max": payload["retry_gpu_jobs_max"],
+        "port": port_summary(port),
     }
 
 
@@ -1416,15 +1627,17 @@ def record_job(
     effective_hub = merged.get("hub_url")
     if row["quality_ok"] and effective_hub:
         try:
-            group["contribution"] = str(
-                export_contribution(job_id=job_id, request=request, hub_url=str(effective_hub))
+            dest, port = export_contribution(
+                job_id=job_id, request=request, hub_url=str(effective_hub)
             )
+            group["contribution"] = str(dest)
+            group["port"] = port_summary(port)
         except Exception:
             pass
     return group
 
 
-def export_contribution(*, job_id: str, request: dict, hub_url: str) -> Path:
+def export_contribution(*, job_id: str, request: dict, hub_url: str) -> tuple[Path, dict]:
     meta = jobs_mod.refresh_status(job_id)
     benchmark = _read_json(jobs_mod.job_dir(job_id) / "benchmark.json")
     comparison = benchmark.get("comparison") if isinstance(benchmark.get("comparison"), dict) else {}
@@ -1460,7 +1673,8 @@ def export_contribution(*, job_id: str, request: dict, hub_url: str) -> Path:
         "artifact_dir": _public_artifact_dir(output_dir) if output_dir.exists() else None,
         "verification_status": meta.verification_status,
     }
-    payload = validate_contribution(payload, require_hub=True)
+    port = _row_port(job_ids=[job_id], request=request, kind="contribution")
+    payload, port = _with_row_port(payload, port, validate_contribution)
     dest = contributions_dir() / contribution_filename(
         str(payload["model_id"]),
         str(payload["gpu_instance"]),
@@ -1468,7 +1682,7 @@ def export_contribution(*, job_id: str, request: dict, hub_url: str) -> Path:
     )
     atomic_write_text(dest, json.dumps(payload, indent=2) + "\n", mode=0o644)
     rebuild_derived()
-    return dest
+    return dest, port
 
 
 def catalog_run(*, job_id: str, request: dict, hub_url: str) -> dict:
@@ -1496,6 +1710,7 @@ def catalog_run(*, job_id: str, request: dict, hub_url: str) -> dict:
         "hub_url": hub_url,
         "hub_repo_id": _hub_repo_id(hub_url),
         "contribution": group.get("contribution"),
+        "port": group.get("port") or port_summary(None),
         "catalog": str(paths.LIBRARY_ROOT / "catalog.json"),
         "quality_ok": True,
         "improved_vram": comparison.get("improved_vram"),
@@ -1505,6 +1720,9 @@ def catalog_run(*, job_id: str, request: dict, hub_url: str) -> dict:
 
 def accept_contribution(path: Path) -> Path:
     payload = validate_contribution(_read_json(path), require_hub=True)
+    port = payload.get("port")
+    if port and not (paths.REPO_ROOT / port / "port.json").is_file():
+        raise ValueError(f"contribution links {port} but it has no port.json; include the port folder")
     dest = contributions_dir() / contribution_filename(
         str(payload["model_id"]),
         str(payload["gpu_instance"]),
@@ -1513,6 +1731,35 @@ def accept_contribution(path: Path) -> Path:
     atomic_write_text(dest, json.dumps(payload, indent=2) + "\n", mode=0o644)
     rebuild_derived()
     return dest
+
+
+def attach_port(*, job_id: str, request: dict) -> dict:
+    """Store the overlay behind a run that is already in the library (backfill).
+
+    Run on the host that still has jobs/<job_id>/. The matching contribution or
+    attempt gains a `port` link; nothing else about the row changes.
+    """
+    model_id, gpu_instance, method_name = _row_names(request)
+    contribution = contributions_dir() / contribution_filename(model_id, gpu_instance, method_name)
+    attempt = attempt_path(model_id, gpu_instance, method_name)
+    if contribution.is_file():
+        kind, target = "contribution", contribution
+    elif attempt.is_file():
+        kind, target = "attempt", attempt
+    else:
+        raise RuntimeError("no library row for this model, GPU, and method; catalog or record it first")
+    port = build_port(job_id=job_id, request=request, kind=kind)
+    if port["status"] != "ready":
+        raise RuntimeError(f"nothing to store for job {job_id}: {port['reason']}")
+    data = _read_json(target)
+    data["port"] = port["path"]
+    data = validate_contribution(data) if kind == "contribution" else validate_attempt(data)
+    port = write_port(port)
+    if port["status"] != "exported":
+        raise RuntimeError(f"could not store the port for job {job_id}: {port['reason']}")
+    atomic_write_text(target, json.dumps(data, indent=2) + "\n", mode=0o644)
+    rebuild_derived()
+    return {"status": "attached", "kind": kind, "port": port["path"], "row": str(target)}
 
 
 def _record_vllm_cli(args) -> dict:
@@ -1584,6 +1831,11 @@ def main() -> int:
         help="List unsuccessful attempts instead of the published catalog",
     )
     parser.add_argument(
+        "--export-port",
+        action="store_true",
+        help="Store the overlay + wrapper behind an existing row in library/ports/ (backfill)",
+    )
+    parser.add_argument(
         "--record-vllm",
         action="store_true",
         help="Attach the vLLM export + serve-check result to an existing library row",
@@ -1632,15 +1884,25 @@ def main() -> int:
                 payload = record_attempt(job_id=args.job_id, request=request)
                 print(json.dumps(payload, indent=2))
                 return 0
+            if args.export_port:
+                print(json.dumps(attach_port(job_id=args.job_id, request=request), indent=2))
+                return 0
             if args.export_contribution:
                 if not args.hub_url:
                     raise SystemExit("--export-contribution needs --hub-url (public Hub repo)")
-                dest = export_contribution(
+                dest, port = export_contribution(
                     job_id=args.job_id, request=request, hub_url=args.hub_url
                 )
-                print(json.dumps({"status": "exported", "path": str(dest)}, indent=2))
+                print(
+                    json.dumps(
+                        {"status": "exported", "path": str(dest), "port": port_summary(port)},
+                        indent=2,
+                    )
+                )
                 return 0
-            raise SystemExit("library write requires --catalog, --record-attempt, or --export-contribution")
+            raise SystemExit(
+                "library write requires --catalog, --record-attempt, --export-contribution, or --export-port"
+            )
         if args.attempts:
             rows = query_attempts(
                 model_id=args.model_id,
