@@ -25,6 +25,20 @@ this GPU type. Do not ask the parent mid-stage. If `HF_TOKEN` is unset and
 
 ## Do
 
+0. Check the shared kernel library first
+   ([`_shared/kernels/`](../_shared/kernels/README.md)):
+
+   ```bash
+   $S/kernels.py match --job-id <job_id> --compute-capability <major.minor>
+   ```
+
+   Entries are keyed by the artifact's saved format (its
+   `quantization_config.json`), not by model or GPU. If one matches and is
+   `supported`, build the overlay on it: copy a `module` entry's file into
+   the adapter and call its entry points, or take the listed pieces from a
+   `port` entry's `overlay.patch`. With `retune: true`, tune on this GPU
+   before the parent runs the job (`tune_config` for `w8a8_int8`). Write a
+   new kernel only for hot paths no entry covers.
 1. Profile hot Python/CUDA ops from the completed job logs **and**
    `jobs/<job_id>/diagnose.json` `error_excerpt` / `notes` (do not edit the clone).
    Packed dtype/loader verify failures are parent `author_fix`, not this stage.

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "flatquant_packed_int4_deploy",
+  "kind": "port",
+  "port": "library/ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__FlatQuant",
+  "match": {
+    "format": ["packed_int4"],
+    "quant_method": ["flatquant"],
+    "w_bits": [4],
+    "a_bits": [4],
+    "online_transforms": [true]
+  },
+  "requires": ["torch", "triton", "FlatQuant deploy._CUDA (CUTLASS int4 GEMM)"],
+  "min_compute_capability": "7.5",
+  "tuned_on": [
+    {
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "compute_capability": "8.6",
+      "torch": "2.7.1+cu128",
+      "triton": "3.3.1"
+    }
+  ],
+  "results": [
+    {
+      "method_name": "FlatQuant",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "gpu_instance": "vast-rtx3090",
+      "job_id": "20261102T052711Z-015c0e",
+      "ppl_ratio": 1.1396,
+      "prefill_tokens_per_s": 11555.3,
+      "fp16_prefill_tokens_per_s": 12682.5,
+      "port": "library/ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__FlatQuant"
+    }
+  ],
+  "notes": "Reuse the port's overlay.patch pieces, not the whole port: (1) dequantize the exact int32 accumulator in fp32 instead of the repo's deploy.sym_dequant, which truncates it to a multiple of 10 (deploy/kernels/quant.cu, ~3% error per projection, Llama path included); (2) a torch matmul for the head-axis o_proj transform when the head count is not a power of two (the repo's Triton block_matmul does not compile for 12 heads); (3) a load-time probe that picks Triton kron_matmul or torch per Kronecker shape (non-power-of-two factors such as (32,48) and (80,112) passed); (4) an int4 KV cache that keeps the learned KV clip. Kernel files live inside the repo's deploy/ tree, so they apply to FlatQuant checkouts only."
+}
