@@ -70,8 +70,10 @@ $S/port_smoke.py slice --request out/requests/<slug>.json   # once per slug; reu
   Hadamard/rotation utilities, smoothing, GPTQ solver, packing, save/load
   classes, kernels) and which are glue for specific model families, and
   which entry point the repo's own pipeline uses.
-- **Recipes**: library rows for this method on the same `model_id` or
-  `model_type`. A positive recipe's `port` (its `method`, `mapping`,
+- **Recipes**: library rows for this method, the same `model_id` first,
+  then the same `model_type`, then any other model (`match: method`). For a
+  `method` match, reuse how the method was mapped and what failed, not its
+  module names. A positive recipe's `port` (its `method`, `mapping`,
   `differences`, rationale, `addresses`) is a head start; read its
   `method.md`. A negative recipe (an attempt) names what already failed
   (`root_cause`, `issue_codes`, `packed_quality_gap`, notes): do not plan the

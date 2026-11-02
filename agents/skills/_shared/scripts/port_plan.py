@@ -15,9 +15,10 @@ coverage, then lower relative logit error, then smaller patch, then fewer
 files. Only passing overlays are ranked; ``--write`` stores the winner in the
 request JSON.
 
-``recipes`` lists what the library already knows about this method on this
-model or model family: published rows are positive recipes, attempts that
-stopped short are negative ones.
+``recipes`` lists what the library already knows about this method: on this
+model, then this model family, then any other model (``match: method``).
+Published rows are positive recipes, attempts that stopped short are negative
+ones.
 """
 from __future__ import annotations
 
@@ -388,7 +389,7 @@ def _port_summary(ref: str | None) -> dict | None:
 
 
 def recipes(*, method: str, model_type: str | None = None, model_id: str | None = None) -> dict:
-    """Library rows for ``method`` on the same model or model_type, best evidence first."""
+    """Library rows for ``method``: same model, then model_type, then any model."""
     root = paths.LIBRARY_ROOT
     rows: list[tuple[str, dict]] = []
     for kind, folder in (("positive", root / "contributions"), ("negative", root / "attempts")):
@@ -399,13 +400,15 @@ def recipes(*, method: str, model_type: str | None = None, model_id: str | None 
     out = []
     for kind, row in rows:
         port = _port_summary(row.get("port"))
-        row_type = (port or {}).get("model_type")
+        row_type = row.get("model_type") or (port or {}).get("model_type")
         if model_id and _norm(row.get("model_id")) == _norm(model_id):
             match = "model_id"
         elif model_type and row_type and _norm(row_type) == _norm(model_type):
             match = "model_type"
         else:
-            continue
+            # Same method on another architecture: how the method was mapped
+            # and what broke still carries over; module names do not.
+            match = "method"
         if kind == "positive" and row.get("quality_ok") is False:
             kind = "negative"
         item = {
@@ -413,6 +416,7 @@ def recipes(*, method: str, model_type: str | None = None, model_id: str | None 
             "match": match,
             "row": row["_file"],
             "model_id": row.get("model_id"),
+            "model_type": row_type,
             "gpu_instance": row.get("gpu_instance"),
             "packed": row.get("packed"),
             "ppl_ratio": row.get("ppl_ratio"),
@@ -429,7 +433,8 @@ def recipes(*, method: str, model_type: str | None = None, model_id: str | None 
                 retry_gpu_jobs_used=row.get("retry_gpu_jobs_used"),
             )
         out.append(item)
-    out.sort(key=lambda item: (item["match"] != "model_id", item["outcome"] != "positive", item["row"]))
+    rank = {"model_id": 0, "model_type": 1, "method": 2}
+    out.sort(key=lambda item: (rank[item["match"]], item["outcome"] != "positive", item["row"]))
     return {"status": "ok", "method": method, "model_type": model_type, "model_id": model_id, "recipes": out}
 
 
@@ -460,7 +465,7 @@ def main() -> int:
                         help="candidate bundle (repeat); default: every smoked bundle for the slug")
     rank_p.add_argument("--write", action="store_true", help="store winner/ranked in the request JSON")
 
-    rec_p = sub.add_parser("recipes", help="Library rows for this method on this model or family")
+    rec_p = sub.add_parser("recipes", help="Library rows for this method: this model, family, then any")
     rec_p.add_argument("--request", type=Path, help="fills method, model id and model_type")
     rec_p.add_argument("--method")
     rec_p.add_argument("--model-type")

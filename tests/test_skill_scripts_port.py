@@ -551,7 +551,7 @@ def _write_row(root: Path, folder: str, stem: str, row: dict, port: dict | None 
     (rows / f"{stem}.json").write_text(json.dumps(row))
 
 
-def test_recipes_find_positive_and_negative_rows_by_model_or_family(workspace):
+def test_recipes_rank_model_then_family_then_same_method_elsewhere(workspace):
     _write_row(workspace, "attempts", "Qwen_Qwen2.5-1.5B-Instruct__g5.2xlarge__QuaRot", {
         "model_id": MODEL_ID, "method_name": "QuaRot", "gpu_instance": "g5.2xlarge",
         "quality_ok": False, "root_cause": "packed_quality_gap", "issue_codes": ["packed_quality_gap"],
@@ -571,7 +571,10 @@ def test_recipes_find_positive_and_negative_rows_by_model_or_family(workspace):
     result = port_plan.recipes(method="quarot", model_type="qwen2", model_id="Qwen/Qwen2.5-0.5B-Instruct")
     assert [(r["outcome"], r["match"], r["model_id"]) for r in result["recipes"]] == [
         ("positive", "model_type", "Qwen/Qwen2.5-7B-Instruct"),
+        ("positive", "method", "meta-llama/Llama-3.2-1B"),
+        ("negative", "method", MODEL_ID),
     ]
+    assert result["recipes"][1]["model_type"] == "llama"
     positive = result["recipes"][0]
     assert positive["port"]["addresses"] == ["D1"]
     assert positive["port"]["differences"][0]["id"] == "D1"
@@ -580,11 +583,21 @@ def test_recipes_find_positive_and_negative_rows_by_model_or_family(workspace):
     assert positive["port"]["method"].endswith("/method.md")
 
     same_model = port_plan.recipes(method="QuaRot", model_type="qwen2", model_id=MODEL_ID)["recipes"]
-    assert [r["outcome"] for r in same_model] == ["negative", "positive"]
+    assert [(r["outcome"], r["match"]) for r in same_model] == [
+        ("negative", "model_id"), ("positive", "model_type"), ("positive", "method"),
+    ]
     negative = same_model[0]
     assert negative["root_cause"] == "packed_quality_gap"
     assert negative["best_ppl_ratio"] == 1.504
     assert len(negative["notes"]) == 4
+
+
+def test_recipes_read_model_type_from_a_row_without_a_port(workspace):
+    _write_row(workspace, "contributions", "Qwen_Qwen2.5-7B__g5.2xlarge__FlatQuant", {
+        "model_id": "Qwen/Qwen2.5-7B", "method_name": "FlatQuant", "quality_ok": True, "model_type": "qwen2",
+    })
+    found = port_plan.recipes(method="flatquant", model_type="qwen2", model_id=MODEL_ID)["recipes"]
+    assert [(r["match"], r["model_type"], r["port"]) for r in found] == [("model_type", "qwen2", None)]
 
 
 def test_snapshot_model_type(tmp_path):
