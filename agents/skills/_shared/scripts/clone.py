@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Clone a GitHub repo into .venvs/<slug>/repo."""
+"""Clone a GitHub repo into .venvs/<slug>/repo, with its git submodules.
+
+Submodules are fetched only from GitHub (or a URL relative to the GitHub
+origin); any other URL is skipped and listed in ``submodules_skipped``.
+"""
 from __future__ import annotations
 
 import sys
@@ -22,6 +26,9 @@ from paths import VENV_ROOT, require_slug
 _GITHUB_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$")
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_RELATIVE_URL_RE = re.compile(r"^(\.\./)+[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?/?$")
+_GITMODULES_SECTION_RE = re.compile(r'^\[submodule "(.+)"\]$')
+_SUBMODULE_DEPTH = 3
 _CLONE_TIMEOUT = 300
 _GIT_TIMEOUT = 15
 
@@ -69,6 +76,88 @@ def _head_sha(repo: Path) -> str | None:
     return sha
 
 
+def parse_gitmodules(text: str) -> list[dict]:
+    """Submodules declared in a .gitmodules file, as {name, path, url}."""
+    modules: list[dict] = []
+    current: dict | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        section = _GITMODULES_SECTION_RE.match(line)
+        if section:
+            current = {"name": section.group(1)}
+            modules.append(current)
+        elif line.startswith("["):
+            current = None
+        elif current is not None and "=" in line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            if key in ("path", "url"):
+                current[key] = value
+    return [m for m in modules if m.get("path") and m.get("url")]
+
+
+def submodule_skip_reason(module: dict) -> str | None:
+    path = Path(module["path"])
+    if path.is_absolute() or ".." in path.parts:
+        return "path escapes the checkout"
+    url = module["url"]
+    if _GITHUB_URL_RE.match(url) or _RELATIVE_URL_RE.match(url):
+        return None
+    return "url is not GitHub or relative to the GitHub origin"
+
+
+def _update_submodule(repo: Path, path: str) -> subprocess.CompletedProcess[str]:
+    base = ["git", "-C", str(repo), "-c", "protocol.file.allow=never", "-c", "core.symlinks=false",
+            "submodule", "update", "--init"]
+    result = _git([*base, "--depth", "1", "--", path], _CLONE_TIMEOUT)
+    if result.returncode != 0:
+        # The pinned commit may not be reachable from a shallow fetch.
+        result = _git([*base, "--", path], _CLONE_TIMEOUT)
+    return result
+
+
+def init_submodules(repo: Path, depth: int = 0, prefix: str = "") -> dict:
+    """Fetch every allowed submodule, then theirs; idempotent on a ready checkout."""
+    out: dict = {"submodules": [], "submodules_skipped": []}
+    gitmodules = repo / ".gitmodules"
+    if not gitmodules.is_file():
+        return out
+    for module in parse_gitmodules(gitmodules.read_text(errors="replace")):
+        shown = prefix + module["path"]
+        reason = submodule_skip_reason(module)
+        if reason is None and depth >= _SUBMODULE_DEPTH:
+            reason = f"nested deeper than {_SUBMODULE_DEPTH}"
+        if reason:
+            out["submodules_skipped"].append({"path": shown, "url": module["url"], "reason": reason})
+            continue
+        try:
+            result = _update_submodule(repo, module["path"])
+        except subprocess.TimeoutExpired:
+            return {**out, "error": f"submodule {shown} timed out after {_CLONE_TIMEOUT}s"}
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "submodule update failed").strip()
+            return {**out, "error": f"submodule {shown}: {err}"}
+        out["submodules"].append(shown)
+        nested = init_submodules(repo / module["path"], depth + 1, f"{shown}/")
+        out["submodules"] += nested["submodules"]
+        out["submodules_skipped"] += nested["submodules_skipped"]
+        if "error" in nested:
+            return {**out, "error": nested["error"]}
+    return out
+
+
+def _with_submodules(repo: Path, payload: dict) -> dict:
+    result = init_submodules(repo)
+    if "error" in result:
+        return {"status": "error", "error": result["error"], "path": str(repo)}
+    if result["submodules"]:
+        payload["submodules"] = result["submodules"]
+    if result["submodules_skipped"]:
+        payload["submodules_skipped"] = result["submodules_skipped"]
+    return payload
+
+
 def clone_repo(slug: str, repo_url: str) -> dict:
     try:
         require_slug(slug)
@@ -99,13 +188,13 @@ def clone_repo(slug: str, repo_url: str) -> dict:
             sha = _head_sha(repo)
             if sha is None:
                 return {"status": "error", "error": "existing checkout HEAD is not a 40-char SHA"}
-            return {
+            return _with_submodules(repo, {
                 "status": "ok",
                 "path": str(repo),
                 "commit_sha": sha,
                 "repo_url": expected,
                 "already_present": True,
-            }
+            })
 
         if repo.exists():
             shutil.rmtree(repo)
@@ -131,13 +220,13 @@ def clone_repo(slug: str, repo_url: str) -> dict:
         sha = _head_sha(repo)
         if sha is None:
             return {"status": "error", "error": "cloned HEAD is not a 40-char SHA"}
-        return {
+        return _with_submodules(repo, {
             "status": "ok",
             "path": str(repo),
             "commit_sha": sha,
             "repo_url": expected,
             "already_present": False,
-        }
+        })
 
 
 def main() -> int:

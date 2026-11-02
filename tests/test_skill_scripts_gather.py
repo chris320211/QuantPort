@@ -43,6 +43,40 @@ def test_clone_rejects_gitlab_and_shell_metacharacters():
         assert "not a plain GitHub repo URL" in payload["error"]
 
 
+def _clone_mod():
+    sys.path.insert(0, str(SCRIPTS))
+    import clone as clone_mod  # noqa: E402
+
+    return clone_mod
+
+
+def test_clone_parses_gitmodules_and_screens_urls():
+    clone_mod = _clone_mod()
+    modules = clone_mod.parse_gitmodules(
+        '[submodule "third-party/cutlass"]\n\tpath = third-party/cutlass\n'
+        "\turl = https://github.com/NVIDIA/cutlass.git\n"
+        '[submodule "rel"]\n\tpath = kernels\n\turl = ../kernels.git\n'
+        '[submodule "ssh"]\n\tpath = ssh\n\turl = git@github.com:a/b.git\n'
+        '[submodule "local"]\n\tpath = local\n\turl = /tmp/evil\n'
+        '[submodule "escape"]\n\tpath = ../out\n\turl = https://github.com/a/b\n'
+        '[submodule "nourl"]\n\tpath = x\n'
+    )
+    assert [m["name"] for m in modules] == ["third-party/cutlass", "rel", "ssh", "local", "escape"]
+    reasons = {m["name"]: clone_mod.submodule_skip_reason(m) for m in modules}
+    assert reasons["third-party/cutlass"] is None and reasons["rel"] is None
+    assert "not GitHub" in reasons["ssh"] and "not GitHub" in reasons["local"]
+    assert reasons["escape"] == "path escapes the checkout"
+
+
+def test_clone_skips_disallowed_submodules_without_running_git(tmp_path):
+    clone_mod = _clone_mod()
+    assert clone_mod.init_submodules(tmp_path) == {"submodules": [], "submodules_skipped": []}
+    (tmp_path / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n\turl = file:///etc\n')
+    result = clone_mod.init_submodules(tmp_path)
+    assert result["submodules"] == []
+    assert result["submodules_skipped"][0]["path"] == "x"
+
+
 def test_request_json_missing_fields(tmp_path):
     sys.path.insert(0, str(SCRIPTS))
     import request as request_mod  # noqa: E402

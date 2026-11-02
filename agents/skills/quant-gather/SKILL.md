@@ -47,6 +47,10 @@ request JSON / error.
      --allow-unsafe-host-execution
    ```
 
+   It also fetches the repo's git submodules (GitHub or relative URLs only).
+   If the return lists `submodules_skipped`, say so in the gather return;
+   a build that needs one of them will fail.
+
 4. Snapshot the named model (uses `HF_TOKEN` from the environment when the
    download is gated or Hub-hosted; never print it):
 
