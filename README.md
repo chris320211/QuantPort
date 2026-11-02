@@ -19,7 +19,7 @@ Note: Ports could utilize already existing quantization formats in literature or
 flowchart TD
   in["You: method + model + GPU"] --> setup["quant-setup<br/>load .env"]
   setup --> gather["quant-gather<br/>paper, code, model snapshot, venv"]
-  gather --> port["quant-port<br/>adapt the method, up to 3 strategies"]
+  gather --> port["quant-port<br/>plan from evidence, 2-layer smoke gate"]
   port --> run["quant-run<br/>quantize on the GPU"]
   run --> verify["quant-verify<br/>saved weights still generate"]
   verify --> bench["quant-benchmark<br/>WikiText-2 vs fp16"]

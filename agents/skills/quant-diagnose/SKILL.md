@@ -16,7 +16,7 @@ You are a **subagent**. Do only diagnose: run the helper and return its JSON.
 Need `job_id` and the request JSON. Do **not** write an overlay. Do not launch
 a GPU job. Do not invent a retry loop; the parent executes
 `recommended_action` with a GPU budget (`author_fix` → one port worker
-`strategy: diagnose_fix`). The helper is **method-agnostic**: same issue codes
+`plan: diagnose_fix`). The helper is **method-agnostic**: same issue codes
 for every method × model × GPU. Do not ask the parent mid-stage. If
 `HF_TOKEN` is unset and `.env` exists,
 `source agents/skills/_shared/load_env.sh .env` (never print values).
@@ -75,10 +75,11 @@ switches only on `recommended_action`:
 2. **`author_fix`** — no remaining overlay keeps runtime, and a GPU job is
    still allowed (retry budget remains, **or** packed-path overage when
    remaining is 0). Return `author_fix` with empty `next_overlay_dir`. The
-   **parent** launches one port worker `strategy: diagnose_fix` (validate only). That
-   worker uses `overlay.py write` + `apply-check` + `validate_script.py` +
-   `adapter.py --check-hub-id` and reads `error_excerpt` / `notes` /
-   `prior_issue_codes`. Do not compile CUDA here. Do not retune from raw PPL.
+   **parent** launches one port worker `plan: diagnose_fix` (validate + smoke). That
+   worker uses `overlay.py write` + `apply-check` + `validate_script.py
+   --smoke-hooks` + `adapter.py --check-hub-id` + `port_smoke.py run` (the
+   2-layer smoke must pass before a GPU job) and reads `error_excerpt` /
+   `notes` / `prior_issue_codes` and the request's `port_spec_path`. Do not compile CUDA here. Do not retune from raw PPL.
 3. **`kernel`** — quality is inside the 1.5× gate but the run is still dense
    fakequant, VRAM-flat, slower tokens/s, or packed GEMM without a prefill
    kernel (`prefill_kernel_missing`). Parent launches `quant-kernel`. The

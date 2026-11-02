@@ -22,7 +22,7 @@ Order:
     once per machine from `.env.example`; load it every shell. Do not recreate
     `.env` if it exists. Session `export` is fallback only.
 2. `quant-gather` subagent — paper + GitHub + clone + HF snapshot + GPU facts + **one** venv install
-3. `quant-port` coordinator — up to three named strategy subagents; validate; pick a winner (no GPU yet)
+3. `quant-port` coordinator — probe the model, read repo/paper/library recipes, write the differences spec, 1-4 plan workers; each overlay must pass a 2-layer smoke test; rank a winner (no GPU job yet)
 4. `quant-run` subagent — one GPU launch per job; no inner overlay patches
 5. `quant-verify` subagent — saved artifact must generate (not Hub fp16)
 6. `quant-benchmark` subagent — **always** WikiText-2 LLM metrics vs the fp16 snapshot
@@ -101,7 +101,8 @@ Required keys:
 | `slug` | Path-safe id used for venv, overlays, jobs |
 
 Optional keys gather may add: `instance_type`, `gpu_arch`, `vram_gb`, `gpu`,
-`venv_python`. Port may add `winner_overlay_dir`, `winner_script`, `ranked`.
+`venv_python`. Port may add `winner_overlay_dir`, `winner_script`, `ranked`,
+`port_spec_path` (`out/analysis/<slug>/differences.json`).
 The parent retry loop may add `tried_overlays`, `retry_gpu_jobs_used`,
 `retry_gpu_jobs_max` (default 14), `last_job_id`, `last_diagnose_path`,
 `best_job_id`, `best_overlay_dir`, `best_ppl_ratio` (lowest WikiText-2
@@ -114,7 +115,10 @@ for every new slug.
 
 - Canonical clone: `.venvs/<slug>/repo` (never edited)
 - Venv python: `.venvs/<slug>/bin/python`
-- Overlays: `out/overlays/<slug>/<strategy>/<hash>/`
+- Port analysis: `out/analysis/<slug>/arch.json`, `out/analysis/<slug>/differences.json`
+- Smoke slice: `.cache/smoke-slices/<slug>-L2/` (first 2 layers, real weights)
+- Overlays: `out/overlays/<slug>/<plan>/<hash>/`, wrapper `out/overlays/<slug>/<plan>/quantize.py`
+- Smoke results: `out/smoke/<slug>/<plan>/<hash>/smoke.json`
 - Jobs: `jobs/<job_id>/`
 - Weights: `./quantized/<slug>`
 - vLLM export: `./quantized/<slug>-vllm` (`vllm_export.json` inside); records
@@ -127,8 +131,9 @@ for every new slug.
 - Unsuccessful stops: `library/attempts/` and `library/ATTEMPTS.md`
   (not ranked; no Hub weights)
 - Ports: `library/ports/<model>__<gpu>__<method>/` (`overlay.patch`,
-  `manifest.json`, `quantize.py`, `port.json`); for an attempt, the best
-  job's port under `library/ports/attempts/`
+  `manifest.json`, `quantize.py`, `port.json`, and `differences.json` when
+  quant-port wrote one); for an attempt, the best job's port under
+  `library/ports/attempts/`. `port_plan.py recipes` reads them back.
 
 ## Invariants
 
@@ -139,7 +144,8 @@ for every new slug.
 - Installers, git, dry-import, and measurements receive no cloud credentials.
 - Quantization and verify receive HF auth only when the model is gated.
 - Host-mutating scripts require `--allow-unsafe-host-execution`.
-- One GPU job at a time. Port fans out **validate-only** workers.
+- One GPU job at a time. Port fans out workers that validate and smoke
+  (2 layers, serialized by a lock); they never launch a job.
 - Verify must reload the **saved** quantized artifact, not the Hub snapshot.
 - `quant-benchmark` always compares WikiText-2 perplexity (and throughput/VRAM)
   for that artifact against the original fp16 snapshot. `verify.py --baseline`
@@ -212,7 +218,7 @@ Budget (method/model/GPU-agnostic — same numbers for AWQ, FlatQuant, GPTQ, …
 | `recommended_action` | Parent does |
 | --- | --- |
 | `retry_ranked_overlay` | One `quant-run` on `next_overlay_dir`, then verify + benchmark (benchmark only if verify passed). Record the overlay on `tried_overlays` and increment `retry_gpu_jobs_used`. |
-| `author_fix` | One validate-only port worker `strategy: diagnose_fix` (issue codes + `error_excerpt`, not raw PPL), then one `quant-run` if budget remains. Diagnose does not write the overlay. |
+| `author_fix` | One port worker `plan: diagnose_fix` (validate + 2-layer smoke) (issue codes + `error_excerpt`, not raw PPL), then one `quant-run` if budget remains. Diagnose does not write the overlay. |
 | `kernel` | `quant-kernel` when diagnose says so. Parent does not inspect the overlay for SDPA. Packed GEMM-only is `prefill_kernel_missing`, not a stop. A packed kernel that failed verify is not a stop. |
 | `none` | Stop. Report the WikiText-2 metric table from `benchmark.json` plus `diagnose.json`. |
 

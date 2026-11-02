@@ -59,6 +59,8 @@ OPTIONAL = (
     "best_job_id",
     "best_overlay_dir",
     "best_ppl_ratio",
+    # out/analysis/<slug>/differences.json, written by quant-port's planner.
+    "port_spec_path",
 )
 
 ALLOWED_KEYS = frozenset(REQUIRED + OPTIONAL)

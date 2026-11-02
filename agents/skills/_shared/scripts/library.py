@@ -162,6 +162,38 @@ def _port_sources(job_id: str) -> dict[str, bytes] | str:
     return files
 
 
+def _snapshot_model_type(request: dict) -> str | None:
+    snapshot = request.get("hf_snapshot_path")
+    if not snapshot:
+        return None
+    try:
+        config = json.loads((Path(str(snapshot)).expanduser() / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    value = config.get("model_type") if isinstance(config, dict) else None
+    return str(value) if value else None
+
+
+def _port_spec(request: dict) -> bytes | str | None:
+    """The planner's differences spec for this slug, or a skip reason, or None."""
+    slug = request.get("slug")
+    if not isinstance(slug, str) or not paths.SLUG_RE.fullmatch(slug):
+        return None
+    path = paths.ANALYSIS_ROOT / slug / "differences.json"
+    if not path.is_file():
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+    if len(data) > _PORT_FILE_MAX:
+        return "file_too_large:differences.json"
+    text = data.decode("utf-8", errors="replace")
+    if _PORT_SECRET_RE.search(text):
+        return "secret_like_content"
+    return _portable_text(text).encode("utf-8")
+
+
 def _row_names(request: dict) -> tuple[str, str, str]:
     model_id = str(request.get("model_id") or "").strip()
     gpu_instance = str(request.get("gpu_instance") or "").strip()
@@ -191,11 +223,18 @@ def build_port(*, job_id: str, request: dict, kind: str) -> dict:
         manifest = None
     if not isinstance(manifest, dict):
         return {"status": "skipped", "reason": "invalid_manifest"}
+    spec = _port_spec(request)
+    if isinstance(spec, str):
+        return {"status": "skipped", "reason": spec}
+    if spec is not None:
+        sources["differences.json"] = spec
     links = source_links(request)
     record = {
         "schema_version": 1,
         "kind": kind,
         "model_id": model_id,
+        # Lets quant-port find recipes for the same family on a different checkpoint.
+        "model_type": _snapshot_model_type(request),
         "method_name": method_name,
         "gpu_instance": gpu_instance,
         "slug": request.get("slug"),

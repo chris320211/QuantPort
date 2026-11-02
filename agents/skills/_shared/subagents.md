@@ -21,9 +21,12 @@ value. It does not search, clone, adapt, or run GPU jobs itself.
   `quant-sync`), not a Hub leaderboard and not a subagent. Unsuccessful
   STOPs use `--record-attempt` in that same parent skill.
 - Wait until a subagent returns before starting the next **stage**.
-- **Port is the exception:** the port coordinator launches up to three *named*
-  strategy subagents at once (author + validate only). The parent still runs
-  **one** GPU job, using the winner, then the next ranked overlay if verify fails.
+- **Port is the exception:** the port coordinator plans from evidence. It
+  launches read-only context subagents (method repo, paper) in parallel, writes
+  `out/analysis/<slug>/differences.json`, then launches 1-4 plan workers at
+  once. Workers author an overlay and pass a 2-layer smoke test (serialized on
+  the GPU); none launches a job. The parent still runs **one** GPU job, using
+  the winner, then the next ranked overlay if verify fails.
 - `quant-run` launches **once**. Process failures return `failed`; the parent
   diagnoses. Do not spawn a run subagent that patches overlays.
 - If a subagent fails, stop or retry **that** stage. Do not silently skip ahead.
@@ -62,15 +65,16 @@ skill. Do not paste WikiText-2 numbers into port workers to retune. Pass
 `issue:` codes, `jobs/<job_id>/diagnose.json` (`error_excerpt` + `notes`),
 and `parent_job_id`. Workers infer the patch from that traceback.
 
-## Example (port — three strategies, one GPU winner)
+## Example (port — planned workers, one GPU winner)
 
 Parent launches **one coordinator**:
 
 ```text
 Read agents/skills/quant-port/SKILL.md and follow it.
 Request JSON: out/requests/awq-qwen25-05b-g5xlarge.json
-You are the port coordinator. Spawn workers for dispatch, llama_alias, and
-adapter_only. Validate only. Return a ranked winner. Do not launch a GPU job.
+You are the port coordinator. Gather context, write the differences spec,
+pick 1-4 plans, and have workers smoke their overlays. Return a ranked winner.
+Do not launch a GPU job.
 ```
 
 Each worker:
@@ -78,8 +82,11 @@ Each worker:
 ```text
 Read agents/skills/quant-port/SKILL.md and follow it.
 Request JSON: out/requests/awq-qwen25-05b-g5xlarge.json
-strategy: llama_alias
-Do only this strategy. Write out/overlays/<slug>/llama_alias/. Return validate ok/fail.
+Spec: out/analysis/awq-qwen25-05b-g5xlarge/differences.json
+plan: bias_rotate (addresses D1, D3)
+Approach: reuse the repo's Llama rotation path and rotate q/k/v biases with
+the same matrix it applies to the weights.
+Do only this plan. Write out/overlays/<slug>/bias_rotate/. Return smoke passed/failed.
 ```
 
 Run **one** `quant-run` on the winner. If verify fails, diagnose first.

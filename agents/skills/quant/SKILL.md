@@ -27,7 +27,7 @@ Then launch **one subagent per stage**, in order. Do not do stage work yourself.
 ## Order
 
 1. Gather → `out/requests/<slug>.json` (seeds `retry_gpu_jobs_max=14`, `used=0`)
-2. Port → ranked overlays under `out/overlays/<slug>/<strategy>/`
+2. Port → differences spec `out/analysis/<slug>/differences.json`, smoke-passed ranked overlays under `out/overlays/<slug>/<plan>/`
 3. Run → `job_id` (winner overlay only)
 4. Verify → saved artifact must generate (not Hub fp16)
 5. Benchmark → **always** WikiText-2 vs the fp16 snapshot
@@ -95,7 +95,7 @@ HANDLE:
       job = quant-run(next_overlay_dir, next_script, parent_job_id, issue)
   elif action == author_fix:
       if next_overlay_dir is set: treat as retry_ranked_overlay
-      else: diagnose_fix worker (validate only); job = quant-run(that overlay)
+      else: diagnose_fix worker (validate + smoke); job = quant-run(that overlay)
   elif action == kernel:
       overlay = quant-kernel; job = quant-run(kernel overlay)
   record-retry(tried overlay, new job_id, diagnose path)
@@ -128,7 +128,7 @@ A second kernel is only for `prefill_kernel_missing`.
 | action | You launch |
 | --- | --- |
 | `retry_ranked_overlay` | `quant-run` with `next_overlay_dir` / `next_script`, `parent_job_id`, `issue:` from `issue_codes`, and `diagnose_json` (worker reads `error_excerpt`). Then verify; benchmark only if verify passed. |
-| `author_fix` | One port-style worker `strategy: diagnose_fix` with `issue:` codes, `diagnose.json` (`error_excerpt` + `notes` + `prior_issue_codes`), and parent job stderr (validate only). Then one `quant-run` if diagnose still wants a GPU job. |
+| `author_fix` | One port-style worker `plan: diagnose_fix` with `issue:` codes, `diagnose.json` (`error_excerpt` + `notes` + `prior_issue_codes`), and parent job stderr (validate + 2-layer smoke; it must pass before the GPU job). Then one `quant-run` if diagnose still wants a GPU job. |
 | `kernel` | `quant-kernel` only when diagnose says so (quality OK, efficiency not, or `prefill_kernel_missing`). Not a quality retry. |
 | `none` | Stop and report the metric table (Report below). Helper returns this for success, budget exhausted, or terminal OOM/auth/disk — not for a crashed GPU process or failed WikiText-2 while retries remain. If the run is not beneficial, `quant-catalog --record-attempt` then `quant-sync`. |
 
@@ -151,8 +151,9 @@ User: “port AWQ to Qwen/Qwen2.5-0.5B-Instruct on g5.xlarge”
 Same steps for FlatQuant, GPTQ, or any other method name, any HF id, any
 instance string. Launch gather (see [_shared/subagents.md](../_shared/subagents.md)).
 
-Then launch **port** as a coordinator (it fans out up to three strategy
-subagents). Use the **winner** overlay for run. If verify fails on an arch/loader
+Then launch **port** as a coordinator (it plans from the model's structure,
+the repo, the paper and library recipes, and fans out 1-4 plan workers whose
+overlays must pass a 2-layer smoke test). Use the **winner** overlay for run. If verify fails on an arch/loader
 bug, try the next ranked overlay — do not launch three GPU jobs at once.
 
 Then run:

@@ -11,10 +11,17 @@ re-run never replaces the port behind published weights. Linked from the **Port*
 | `overlay.patch` | Git diff against the method repo at `repo_commit` (the overlay's `base_commit`). Stored byte-for-byte. |
 | `manifest.json` | Rationale, target modules, `base_commit`, `patch_sha256`. |
 | `quantize.py` | The wrapper the job ran: calibration data, settings, how the artifact is saved. |
-| `port.json` | Provenance: job id, method repo and commit, file list. |
+| `differences.json` | The planner's spec: what this model does that the method repo did not handle (`D1`, `D2`, ... with severity and evidence), and the smoke thresholds. Present when quant-port wrote one. |
+| `port.json` | Provenance: job id, method repo and commit, `model_type`, file list. |
 
 For a library row this is the port that produced the published weights. For an
 attempt it is the best job's port, which may differ from the last job's.
+
+quant-port reads these back as recipes before planning a new port
+(`port_plan.py recipes`): a row for the same method on the same `model_id` or
+`model_type` is a positive recipe; an attempt is a negative one, with its
+`root_cause` and notes. `manifest.json` `addresses` names the differences a
+patch handled.
 
 ## Check and replay
 

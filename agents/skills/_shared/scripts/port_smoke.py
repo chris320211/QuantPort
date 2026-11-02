@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import re
@@ -527,6 +528,8 @@ def run_smoke(
         "schema_version": 1,
         "overlay_dir": str(overlay_dir),
         "script": str(script.resolve()),
+        # rank treats a wrapper edited after its smoke as unsmoked.
+        "script_sha256": hashlib.sha256(code.encode("utf-8")).hexdigest(),
         "plan": overlay_dir.parent.name,
         "settings": settings.model_dump(),
         "slice_layers": num_layers,
