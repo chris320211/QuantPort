@@ -35,6 +35,13 @@
       "gpu_name": "NVIDIA A10G",
       "n_methods": 1,
       "best_method": "FlatQuant"
+    },
+    {
+      "model_id": "microsoft/Phi-3.5-mini-instruct",
+      "gpu_instance": "vast-rtx3090",
+      "gpu_name": "NVIDIA GeForce RTX 3090",
+      "n_methods": 1,
+      "best_method": "SmoothQuant"
     }
   ]
 }

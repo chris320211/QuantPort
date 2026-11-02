@@ -11,15 +11,32 @@
     "tune_config"
   ],
   "match": {
-    "format": ["w8a8_int8"],
-    "w_bits": [8],
-    "a_bits": [8],
-    "weight_quant": ["per_channel"],
-    "act_quant": ["per_token"],
-    "w_sym": [true],
-    "a_sym": [true]
+    "format": [
+      "w8a8_int8"
+    ],
+    "w_bits": [
+      8
+    ],
+    "a_bits": [
+      8
+    ],
+    "weight_quant": [
+      "per_channel"
+    ],
+    "act_quant": [
+      "per_token"
+    ],
+    "w_sym": [
+      true
+    ],
+    "a_sym": [
+      true
+    ]
   },
-  "requires": ["torch", "triton"],
+  "requires": [
+    "torch",
+    "triton"
+  ],
   "min_compute_capability": "8.0",
   "tuned_on": [
     {
@@ -27,6 +44,12 @@
       "compute_capability": "8.6",
       "torch": "2.7.1+cu128",
       "triton": "3.3.1"
+    },
+    {
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "compute_capability": "8.6",
+      "torch": "2.9.1+cu130",
+      "triton": "3.5.1"
     }
   ],
   "results": [
@@ -40,6 +63,17 @@
       "fp16_prefill_tokens_per_s": 12248.2,
       "previous_prefill_tokens_per_s": 10077.2,
       "port": "library/ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__SmoothQuant"
+    },
+    {
+      "method_name": "SmoothQuant",
+      "model_id": "microsoft/Phi-3.5-mini-instruct",
+      "gpu_instance": "vast-rtx3090",
+      "job_id": "20261102T212454Z-0531e9",
+      "ppl_ratio": 1.0297,
+      "prefill_tokens_per_s": 12268.5,
+      "fp16_prefill_tokens_per_s": 4218.8,
+      "port": "library/ports/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__SmoothQuant",
+      "reused": "copied into the port adapter by quant-port; no kernel stage"
     }
   ],
   "notes": "Replaces a dequantize-to-fp16-then-matmul adapter: 2048-token prefill went from 0.78x to 1.51x fp16 with the same weights and quality. Decode (M=1) is launch-bound and not faster than fp16; serve with vLLM for decode."

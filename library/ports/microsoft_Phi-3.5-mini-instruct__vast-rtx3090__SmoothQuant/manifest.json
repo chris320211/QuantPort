@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "method_id": "smoothquant-phi35-mini-vastrtx3090",
+  "model_id": "microsoft/Phi-3.5-mini-instruct",
+  "base_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+  "patch_sha256": "95b0322576b16636f949365717a9bf8475dd612727811db8abd1db0b221e01cc",
+  "rationale": "Extends the repo own SmoothQuant pipeline to Phi-3 (positive method recipe: Qwen2.5-1.5B qwen2_llama_path + kernel_triton). smooth.py: Phi3DecoderLayer branch smoothing input_layernorm into the fused self_attn.qkv_proj and post_attention_layernorm into the fused mlp.gate_up_proj with their own act-scale keys, Phi3RMSNorm accepted (D1-D3). fake_quant.py: quantize_phi3 (qkv_proj, o_proj, gate_up_proj, down_proj to W8A8Linear), Phi3PreTrainedModel dispatch, keep_int8 per-channel int8 + scale buffers (D1, D4). int8_export.py: w8a8_int8 artifact (int8 weight, fp16 [N,1] weight_scale, fp16 norms/embeddings/untied lm_head, quantization_config.json) with auto_map stripped from config.json (D4, D5). quant_agent_inference_adapter.py: verbatim copy of the shared w8a8_int8_triton kernels plus a native-class SDPA loader that never uses remote code (D4, D5). Wrapper: native Phi3ForCausalLM in fp16 with finite checks (D6), alpha 0.75 from the per-linear error probe (D7). CPU check on the 2-layer slice: smoothing changes logits by 3.9e-7 relative, fake-quant fp32 rel err 0.053, adapter fp16 reload rel err 0.053, top-1 95%. D8 (down_proj smoothing via the up rows) deliberately not addressed.",
+  "evidence_files": [
+    "out/analysis/smoothquant-phi35-mini-vastrtx3090/differences.json",
+    "out/analysis/smoothquant-phi35-mini-vastrtx3090/method.md",
+    "out/analysis/smoothquant-phi35-mini-vastrtx3090/act_probe.json"
+  ],
+  "target_modules": [
+    "self_attn.qkv_proj",
+    "self_attn.o_proj",
+    "mlp.gate_up_proj",
+    "mlp.down_proj",
+    "input_layernorm",
+    "post_attention_layernorm"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6",
+    "D7"
+  ]
+}

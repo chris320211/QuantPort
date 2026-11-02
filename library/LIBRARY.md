@@ -90,3 +90,21 @@ GPU: NVIDIA A10G
 
 **Best:** FlatQuant (`flatquant-phi3-mini-4k-g52xlarge`).
 
+## microsoft/Phi-3.5-mini-instruct on vast-rtx3090
+GPU: NVIDIA GeForce RTX 3090
+
+| Model | GPU | Method | Paper | Repo | Port | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |
+| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| microsoft/Phi-3.5-mini-instruct | vast-rtx3090 | SmoothQuant | [paper](https://arxiv.org/abs/2211.10438) | [repo](https://github.com/mit-han-lab/smoothquant) | [port](ports/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__SmoothQuant) | [hub](https://huggingface.co/chris320211/smoothquant-phi35-mini-vastrtx3090) | [vLLM](https://huggingface.co/chris320211/smoothquant-phi35-mini-vastrtx3090-vllm) | 1.0297 | 12268.5 | 5.908 |
+
+**Best:** SmoothQuant (`smoothquant-phi35-mini-vastrtx3090`).
+
+**vLLM** (GPU: NVIDIA GeForce RTX 3090)
+
+| Method | Runtime | Precision | PPL | PPL ratio | Prefill tok/s | Decode tok/s, batch 1 | Decode tok/s, batch 16 | VRAM GB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SmoothQuant | vLLM | [int8](https://huggingface.co/chris320211/smoothquant-phi35-mini-vastrtx3090-vllm) | 6.8184 | 1.0290 | 17645.9 | 145.4 | 1593.2 | – |
+| SmoothQuant | vLLM | fp16 | 6.6260 | 1.0000 | 8592.2 | 90.0 | 1071.5 | – |
+
+PPL ratio is against the same runtime's 16-bit model. vLLM reserves its KV cache up front, so its VRAM is not shown. SmoothQuant: export drift 0.9993 vs this board (≤ 1.02); vLLM 0.30.0, 2026-11-02.
+

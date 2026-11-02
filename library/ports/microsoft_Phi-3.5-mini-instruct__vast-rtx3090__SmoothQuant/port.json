@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "contribution",
+  "model_id": "microsoft/Phi-3.5-mini-instruct",
+  "model_type": "phi3",
+  "method_name": "SmoothQuant",
+  "gpu_instance": "vast-rtx3090",
+  "slug": "smoothquant-phi35-mini-vastrtx3090",
+  "job_id": "20261102T212454Z-0531e9",
+  "repo_url": "https://github.com/mit-han-lab/smoothquant",
+  "repo_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+  "patch_sha256": "95b0322576b16636f949365717a9bf8475dd612727811db8abd1db0b221e01cc",
+  "files": [
+    "differences.json",
+    "manifest.json",
+    "method.md",
+    "overlay.patch",
+    "quantize.py"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "model_id": "microsoft/Phi-3.5-mini-instruct",
+  "gpu_instance": "vast-rtx3090",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "fp16_baseline": {
+    "perplexity": 6.6256308322884125,
+    "tokens_per_s": 4218.842593593493,
+    "peak_vram_gb": 9.680975437164307
+  },
+  "methods": [
+    {
+      "method_name": "SmoothQuant",
+      "slug": "smoothquant-phi35-mini-vastrtx3090",
+      "job_id": "20261102T212454Z-0531e9",
+      "quality_ok": true,
+      "ppl": 6.822674485553014,
+      "ppl_ratio": 1.0297396064242452,
+      "tokens_per_s": 12268.523654764318,
+      "peak_vram_gb": 5.90758752822876,
+      "improved_throughput": true,
+      "improved_vram": true,
+      "packed": false,
+      "artifact_dir": "quantized/smoothquant-phi35-mini-vastrtx3090",
+      "hub_url": "https://huggingface.co/chris320211/smoothquant-phi35-mini-vastrtx3090",
+      "arxiv_id": "2211.10438",
+      "paper_url": "https://arxiv.org/abs/2211.10438",
+      "repo_url": "https://github.com/mit-han-lab/smoothquant",
+      "repo_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+      "verification_status": "passed",
+      "rank": 1
+    }
+  ],
+  "best": {
+    "method_name": "SmoothQuant",
+    "slug": "smoothquant-phi35-mini-vastrtx3090",
+    "job_id": "20261102T212454Z-0531e9",
+    "rank": 1,
+    "why": "quality_ok, then higher WikiText-2 tok/s, then lower peak VRAM, prefer packed, then lower ppl_ratio",
+    "artifact_dir": "quantized/smoothquant-phi35-mini-vastrtx3090",
+    "hub_url": "https://huggingface.co/chris320211/smoothquant-phi35-mini-vastrtx3090"
+  }
+}
