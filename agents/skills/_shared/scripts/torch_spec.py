@@ -12,6 +12,11 @@ Known toolkit pins (wheels on download.pytorch.org):
 - CUDA 12.4 → torch 2.4.1 cu124 (Hopper default when nvcc is 12.4)
 - CUDA 12.6 → torch 2.7.1 cu126
 - CUDA 12.8 → torch 2.7.1 cu128
+- CUDA 13.0+ → torch 2.9.1 cu130 (first CUDA 13 builds; oldest is the safest
+  for older method repos)
+
+A toolkit newer than every known major uses the newest known pin rather than
+the CUDA 12.1 default.
 
 Override via env var ``QUANT_AGENT_TORCH_SPEC`` (format: ``torch==X.Y.Z|cuZZZ``)
 so users can pin exotic combinations without editing the code.
@@ -52,6 +57,7 @@ _TOOLKIT_SPECS: dict[tuple[int, int], TorchSpec] = {
     (12, 4): TorchSpec(torch_pin="torch==2.4.1", cuda_tag="cu124"),
     (12, 6): TorchSpec(torch_pin="torch==2.7.1", cuda_tag="cu126"),
     (12, 8): TorchSpec(torch_pin="torch==2.7.1", cuda_tag="cu128"),
+    (13, 0): TorchSpec(torch_pin="torch==2.9.1", cuda_tag="cu130"),
 }
 
 _NVCC_RELEASE_RE = re.compile(r"release\s+(\d+)\.(\d+)")
@@ -120,6 +126,9 @@ def spec_for_toolkit(major: int, minor: int) -> TorchSpec | None:
     known = sorted(k for k in _TOOLKIT_SPECS if k[0] == major and k <= (major, minor))
     if known:
         return _TOOLKIT_SPECS[known[-1]]
+    newest = max(_TOOLKIT_SPECS)
+    if (major, minor) > newest:
+        return _TOOLKIT_SPECS[newest]
     return None
 
 

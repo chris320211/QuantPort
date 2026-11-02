@@ -171,6 +171,10 @@ def test_torch_spec_matches_nvcc_toolkit_not_driver(monkeypatch):
     assert spec.cuda_tag == "cu128"
     assert spec.torch_pin == "torch==2.7.1"
 
+    for toolkit in ((13, 0), (13, 3), (14, 1)):
+        monkeypatch.setattr(spec_mod, "_nvcc_release", lambda t=toolkit: t)
+        assert spec_mod.detect_torch_spec() == spec_mod.TorchSpec(torch_pin="torch==2.9.1", cuda_tag="cu130")
+
     monkeypatch.setattr(spec_mod, "_nvcc_release", lambda: None)
     monkeypatch.setattr(spec_mod, "_compute_capability", lambda: 8.6)
     spec = spec_mod.detect_torch_spec()
@@ -180,6 +184,14 @@ def test_torch_spec_matches_nvcc_toolkit_not_driver(monkeypatch):
     monkeypatch.setenv("QUANT_AGENT_TORCH_SPEC", "torch==2.4.1|cu124")
     spec = spec_mod.detect_torch_spec()
     assert spec == spec_mod.TorchSpec(torch_pin="torch==2.4.1", cuda_tag="cu124")
+
+
+def test_install_venv_bootstraps_setuptools(monkeypatch):
+    sys.path.insert(0, str(SCRIPTS))
+    import install_venv as install_mod  # noqa: E402
+
+    bootstrap = install_mod._baseline_packages(Path("/tmp/fake-venv/bin/python"))[0]
+    assert {"pip", "setuptools", "wheel"} <= set(bootstrap)
 
 
 def test_install_venv_treats_requirements_vs_local_install():

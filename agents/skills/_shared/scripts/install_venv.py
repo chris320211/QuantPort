@@ -177,7 +177,9 @@ def _run_argv(
 def _baseline_packages(python: Path) -> list[list[str]]:
     spec = detect_torch_spec()
     return [
-        [str(python), "-m", "pip", "install", "--upgrade", "pip", "wheel"],
+        # Python 3.12+ venvs ship without setuptools; setup.py repos need it
+        # under --no-build-isolation.
+        [str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
         spec.pip_install_argv(str(python)),
         [str(python), "-m", "pip", "install", *RUNTIME_PACKAGES],
     ]
