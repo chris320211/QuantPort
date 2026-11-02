@@ -11,7 +11,8 @@ re-run never replaces the port behind published weights. Linked from the **Port*
 | `overlay.patch` | Git diff against the method repo at `repo_commit` (the overlay's `base_commit`). Stored byte-for-byte. |
 | `manifest.json` | Rationale, target modules, `base_commit`, `patch_sha256`. |
 | `quantize.py` | The wrapper the job ran: calibration data, settings, how the artifact is saved. |
-| `differences.json` | The planner's spec: what this model does that the method repo did not handle (`D1`, `D2`, ... with severity and evidence), and the smoke thresholds. Present when quant-port wrote one. |
+| `method.md` | The algorithm as quant-port understood it, independent of any model: steps, tensor roles, invariants, calibration, save/reload, with paper and repo citations. |
+| `differences.json` | How those roles map onto this model's modules, what the port had to do where they did not map cleanly (`D1`, `D2`, ... with severity and evidence), and the smoke thresholds. |
 | `port.json` | Provenance: job id, method repo and commit, `model_type`, file list. |
 
 For a library row this is the port that produced the published weights. For an

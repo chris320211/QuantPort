@@ -23,7 +23,8 @@ value. It does not search, clone, adapt, or run GPU jobs itself.
 - Wait until a subagent returns before starting the next **stage**.
 - **Port is the exception:** the port coordinator plans from evidence. It
   launches read-only context subagents (method repo, paper) in parallel, writes
-  `out/analysis/<slug>/differences.json`, then launches 1-4 plan workers at
+  `out/analysis/<slug>/method.md` (the algorithm, from paper + repo) and
+  `out/analysis/<slug>/differences.json` (its roles mapped onto the model), then launches 1-4 plan workers at
   once. Workers author an overlay and pass a 2-layer smoke test (serialized on
   the GPU); none launches a job. The parent still runs **one** GPU job, using
   the winner, then the next ranked overlay if verify fails.
@@ -72,8 +73,8 @@ Parent launches **one coordinator**:
 ```text
 Read agents/skills/quant-port/SKILL.md and follow it.
 Request JSON: out/requests/awq-qwen25-05b-g5xlarge.json
-You are the port coordinator. Gather context, write the differences spec,
-pick 1-4 plans, and have workers smoke their overlays. Return a ranked winner.
+You are the port coordinator. Learn the method from the paper and repo, map it onto
+this model, pick 1-4 plans, and have workers smoke their overlays. Return a ranked winner.
 Do not launch a GPU job.
 ```
 
@@ -82,6 +83,7 @@ Each worker:
 ```text
 Read agents/skills/quant-port/SKILL.md and follow it.
 Request JSON: out/requests/awq-qwen25-05b-g5xlarge.json
+Method: out/analysis/awq-qwen25-05b-g5xlarge/method.md
 Spec: out/analysis/awq-qwen25-05b-g5xlarge/differences.json
 plan: bias_rotate (addresses D1, D3)
 Approach: reuse the repo's Llama rotation path and rotate q/k/v biases with

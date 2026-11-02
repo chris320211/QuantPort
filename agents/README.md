@@ -51,7 +51,7 @@ flowchart TD
 | Skill | Does |
 | --- | --- |
 | [quant-gather](skills/quant-gather/SKILL.md) | Find paper + GitHub, clone, snapshot the named model, record GPU facts, install one venv. Writes `out/requests/<slug>.json`. |
-| [quant-port](skills/quant-port/SKILL.md) | Probe the model, read repo/paper/recipes, write a differences spec, run 1-4 planned overlays through a 2-layer smoke test. Return a ranked winner. |
+| [quant-port](skills/quant-port/SKILL.md) | Learn how the method quantizes (paper + repo), map it onto the model's modules, run 1-4 planned overlays through a 2-layer smoke test. Return a ranked winner. |
 | [quant-run](skills/quant-run/SKILL.md) | Launch the winner script on this GPU. One job at a time. No inner overlay patches. |
 | [quant-verify](skills/quant-verify/SKILL.md) | Reload the **saved** artifact (not the original fp16) and require generation. |
 | [quant-benchmark](skills/quant-benchmark/SKILL.md) | Always WikiText-2 vs the fp16 snapshot: PPL, tok/s, VRAM. Does not write the library. |

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Port planning helpers: the differences spec, candidate ranking, and recipes.
 
-``spec-check`` validates ``out/analysis/<slug>/differences.json``: what this
-model does that the method repo's supported path does not, each item with an
-id (``D1``...), a severity, and the evidence it came from, plus the ``smoke``
-thresholds every candidate is judged by.
+``spec-check`` validates the planner's two analysis files. ``method.md`` is
+the algorithm in model-independent terms: its steps, the tensor roles each
+step touches, the equalities that must hold, calibration, save/reload.
+``differences.json`` maps those roles onto this model's modules and lists
+what the port must do (``D1``...) where the mapping is not clean, each with a
+severity and the evidence it came from, plus the ``smoke`` thresholds every
+candidate is judged by.
 
 ``rank`` orders smoked overlays by evidence: smoke passed first, then how many
 ``must`` differences the overlay claims to address, then target-linear
@@ -59,6 +62,27 @@ KNOWN_KINDS = (
 )
 
 
+# method.md must explain the algorithm under these headings (## level, any order).
+METHOD_SECTIONS = ("Steps", "Tensor roles", "Invariants", "Calibration", "Save and reload")
+METHOD_MIN_CHARS = 40
+
+
+class RoleMapping(BaseModel):
+    """One tensor role from method.md and the modules that play it in this model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: str = Field(..., min_length=1, max_length=120)
+    # The method.md step(s) that touch this role.
+    steps: list[str] = Field(default_factory=list, max_length=20)
+    modules: list[str] = Field(default_factory=list, max_length=200)
+    # mapped: the role exists and the algorithm applies as written.
+    # partial / unmapped: the role is missing or differs here.
+    # extra: this model has tensors in that position the method never mentions.
+    status: Literal["mapped", "partial", "unmapped", "extra"]
+    note: str | None = Field(None, max_length=1000)
+
+
 class Difference(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -70,6 +94,8 @@ class Difference(BaseModel):
     evidence: list[str] = Field(default_factory=list, max_length=20)
     # How the method repo's own path handles it, as read from the checkout.
     repo_support: Literal["supported", "partial", "missing", "unknown"] = "unknown"
+    # The mapping role this comes from; required when one is not clean.
+    role: str | None = Field(None, max_length=120)
 
     @field_validator("id")
     @classmethod
@@ -92,6 +118,8 @@ class PortSpec(BaseModel):
     method_name: str = Field(..., min_length=1)
     model_id: str = Field(..., min_length=1)
     model_type: str | None = None
+    # Every tensor role from method.md, mapped onto this model.
+    mapping: list[RoleMapping] = Field(..., min_length=1, max_length=100)
     differences: list[Difference] = Field(default_factory=list, max_length=100)
     smoke: SmokeSettings = Field(default_factory=SmokeSettings)
     # library/ports/... refs the planner read before writing this spec.
@@ -109,6 +137,20 @@ class PortSpec(BaseModel):
         dupes = sorted({d.id for d in self.differences if d.id in seen or seen.add(d.id)})
         if dupes:
             raise ValueError(f"duplicate difference ids: {dupes}")
+        roles = [m.role for m in self.mapping]
+        repeated = sorted({r for r in roles if roles.count(r) > 1})
+        if repeated:
+            raise ValueError(f"duplicate mapping roles: {repeated}")
+        unknown = sorted({d.role for d in self.differences if d.role and d.role not in roles})
+        if unknown:
+            raise ValueError(f"differences name roles missing from mapping: {unknown}")
+        handled = {d.role for d in self.differences}
+        open_roles = [m.role for m in self.mapping if m.status != "mapped" and m.role not in handled]
+        if open_roles:
+            raise ValueError(
+                "mapping roles that are not cleanly mapped need a difference naming them "
+                f"(an info difference if nothing must change): {open_roles}"
+            )
         return self
 
     def must_ids(self) -> list[str]:
@@ -119,11 +161,40 @@ def spec_path_for(slug: str) -> Path:
     return paths.ANALYSIS_ROOT / paths.require_slug(slug) / "differences.json"
 
 
+def method_path_for(spec_path: Path) -> Path:
+    return spec_path.parent / "method.md"
+
+
+def check_method(path: Path) -> dict:
+    """method.md has every required section, each with real content."""
+    if not path.is_file():
+        raise ValueError(f"missing {path}: write the method model before the differences spec")
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in path.read_text().splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip().lower()
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(line)
+    missing = [name for name in METHOD_SECTIONS if name.lower() not in sections]
+    if missing:
+        raise ValueError(f"{path.name} lacks sections: {missing}")
+    thin = [
+        name for name in METHOD_SECTIONS
+        if len("\n".join(sections[name.lower()]).strip()) < METHOD_MIN_CHARS
+    ]
+    if thin:
+        raise ValueError(f"{path.name} sections too thin to plan from: {thin}")
+    return {"path": str(path.resolve()), "sections": list(METHOD_SECTIONS)}
+
+
 def load_spec(path: Path) -> PortSpec:
     return PortSpec.model_validate_json(path.read_text())
 
 
 def check_spec(path: Path, request: dict | None = None) -> dict:
+    method = check_method(method_path_for(path))
     spec = load_spec(path)
     if request is not None:
         for key in ("slug", "model_id"):
@@ -136,6 +207,11 @@ def check_spec(path: Path, request: dict | None = None) -> dict:
     return {
         "status": "ok",
         "path": str(path.resolve()),
+        "method": method["path"],
+        "mapping": {
+            status: [m.role for m in spec.mapping if m.status == status]
+            for status in ("mapped", "partial", "unmapped", "extra")
+        },
         "differences": len(spec.differences),
         "severity": counts,
         "must": spec.must_ids(),
@@ -296,10 +372,18 @@ def _port_summary(ref: str | None) -> dict | None:
     differences = _read_json(folder / "differences.json")
     if differences is not None:
         summary["differences"] = [
-            {key: item.get(key) for key in ("id", "kind", "severity", "detail")}
+            {key: item.get(key) for key in ("id", "kind", "severity", "role", "detail")}
             for item in differences.get("differences") or []
             if isinstance(item, dict)
         ]
+        summary["mapping"] = [
+            {key: item.get(key) for key in ("role", "status", "modules")}
+            for item in differences.get("mapping") or []
+            if isinstance(item, dict)
+        ]
+    if (folder / "method.md").is_file():
+        # Read it: the algorithm as a previous port understood it.
+        summary["method"] = f"{ref}/method.md"
     return summary
 
 

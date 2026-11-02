@@ -27,7 +27,7 @@ Then launch **one subagent per stage**, in order. Do not do stage work yourself.
 ## Order
 
 1. Gather → `out/requests/<slug>.json` (seeds `retry_gpu_jobs_max=14`, `used=0`)
-2. Port → differences spec `out/analysis/<slug>/differences.json`, smoke-passed ranked overlays under `out/overlays/<slug>/<plan>/`
+2. Port → method model + spec under `out/analysis/<slug>/`, smoke-passed ranked overlays under `out/overlays/<slug>/<plan>/`
 3. Run → `job_id` (winner overlay only)
 4. Verify → saved artifact must generate (not Hub fp16)
 5. Benchmark → **always** WikiText-2 vs the fp16 snapshot

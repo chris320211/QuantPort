@@ -128,7 +128,8 @@ def test_skill_docs_have_no_obsolete_codex_paths():
     assert "packed_quality_gap" in port
     for marker in ("arch_probe.py", "port_plan.py spec-check", "port_plan.py rank", "port_plan.py recipes",
                    "port_smoke.py run", "--smoke-hooks", "--addresses", "QUANT_AGENT_SMOKE_MODEL_DIR",
-                   "differences.json"):
+                   "differences.json", "method.md", "Invariants", "Tensor roles", "mapping",
+                   "generic building blocks"):
         assert marker in port, marker
     for stale in ("llama_alias", "adapter_only", "up to three", "strategy: dispatch"):
         assert stale not in port, stale

@@ -174,24 +174,31 @@ def _snapshot_model_type(request: dict) -> str | None:
     return str(value) if value else None
 
 
-def _port_spec(request: dict) -> bytes | str | None:
-    """The planner's differences spec for this slug, or a skip reason, or None."""
+# quant-port's analysis: the algorithm write-up and the spec mapping it onto the model.
+_PORT_ANALYSIS_FILES = ("method.md", "differences.json")
+
+
+def _port_analysis(request: dict) -> dict[str, bytes] | str:
+    """The planner's analysis files for this slug (those that exist), or a skip reason."""
     slug = request.get("slug")
     if not isinstance(slug, str) or not paths.SLUG_RE.fullmatch(slug):
-        return None
-    path = paths.ANALYSIS_ROOT / slug / "differences.json"
-    if not path.is_file():
-        return None
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        return f"unreadable:{type(exc).__name__}"
-    if len(data) > _PORT_FILE_MAX:
-        return "file_too_large:differences.json"
-    text = data.decode("utf-8", errors="replace")
-    if _PORT_SECRET_RE.search(text):
-        return "secret_like_content"
-    return _portable_text(text).encode("utf-8")
+        return {}
+    files: dict[str, bytes] = {}
+    for name in _PORT_ANALYSIS_FILES:
+        path = paths.ANALYSIS_ROOT / slug / name
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            return f"unreadable:{type(exc).__name__}"
+        if len(data) > _PORT_FILE_MAX:
+            return f"file_too_large:{name}"
+        text = data.decode("utf-8", errors="replace")
+        if _PORT_SECRET_RE.search(text):
+            return "secret_like_content"
+        files[name] = _portable_text(text).encode("utf-8")
+    return files
 
 
 def _row_names(request: dict) -> tuple[str, str, str]:
@@ -223,11 +230,10 @@ def build_port(*, job_id: str, request: dict, kind: str) -> dict:
         manifest = None
     if not isinstance(manifest, dict):
         return {"status": "skipped", "reason": "invalid_manifest"}
-    spec = _port_spec(request)
-    if isinstance(spec, str):
-        return {"status": "skipped", "reason": spec}
-    if spec is not None:
-        sources["differences.json"] = spec
+    analysis = _port_analysis(request)
+    if isinstance(analysis, str):
+        return {"status": "skipped", "reason": analysis}
+    sources.update(analysis)
     links = source_links(request)
     record = {
         "schema_version": 1,

@@ -308,24 +308,58 @@ def _spec(**kwargs) -> dict:
         "method_name": "QuaRot",
         "model_id": MODEL_ID,
         "model_type": "qwen2",
+        "mapping": [
+            {"role": "attention input projections", "steps": ["rotate", "quantize"],
+             "modules": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], "status": "mapped"},
+            {"role": "linear biases", "steps": ["rotate"], "modules": ["self_attn.q_proj.bias"], "status": "extra"},
+            {"role": "embeddings", "steps": ["rotate"], "modules": ["model.embed_tokens", "lm_head"], "status": "partial"},
+            {"role": "value/output pair", "steps": ["rotate"], "modules": ["self_attn.v_proj", "self_attn.o_proj"],
+             "status": "partial", "note": "2 kv heads"},
+        ],
         "differences": [
-            {"id": "D1", "kind": "attention_bias", "severity": "must",
+            {"id": "D1", "kind": "attention_bias", "role": "linear biases", "severity": "must",
              "detail": "q/k/v bias not rotated", "evidence": ["arch.json flags attention_bias"],
              "repo_support": "missing"},
-            {"id": "D2", "kind": "tied_embeddings", "severity": "must",
+            {"id": "D2", "kind": "tied_embeddings", "role": "embeddings", "severity": "must",
              "detail": "embedding tied to lm_head", "evidence": ["arch.json tied_embeddings"],
              "repo_support": "partial"},
-            {"id": "D3", "kind": "gqa", "severity": "should", "detail": "2 kv heads"},
+            {"id": "D3", "kind": "gqa", "role": "value/output pair", "severity": "should", "detail": "2 kv heads"},
         ],
         "smoke": {"weight_bits": 4},
     }
     return {**base, **kwargs}
 
 
-def _write_spec(tmp_path, data=None) -> Path:
+METHOD_MD = """# QuaRot
+
+## Steps
+1. Fuse RMSNorm scales into the next linears (paper 4.1, quarot/rotation.py:40).
+2. Rotate the residual stream with a random Hadamard Q on every reader and writer.
+3. Quantize weights with GPTQ and activations per token to 4 bits.
+
+## Tensor roles
+Residual stream readers (q/k/v, gate/up) rotate on the input side; writers
+(o_proj, down_proj, embeddings) rotate on the output side. LM head reads it.
+
+## Invariants
+Q is orthogonal, so Q Q^T = I keeps the function unchanged before quantization,
+provided every reader and writer of the residual stream sees the same Q.
+
+## Calibration
+128 WikiText-2 samples of 2048 tokens for GPTQ; no training iterations.
+
+## Save and reload
+Packed int4 weights with fp16 scales in Linear4bit; reload rebuilds the
+Hadamard online rotation before down_proj.
+"""
+
+
+def _write_spec(tmp_path, data=None, method: str | None = METHOD_MD) -> Path:
     path = tmp_path / "out" / "analysis" / SLUG / "differences.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data or _spec()))
+    if method is not None:
+        (path.parent / "method.md").write_text(method)
     return path
 
 
@@ -337,6 +371,9 @@ def test_spec_check_counts_and_matches_the_request(tmp_path):
     assert result["severity"] == {"must": 2, "should": 1, "info": 0}
     assert result["missing_in_repo"] == ["D1", "D2"]
     assert result["smoke"]["weight_bits"] == 4
+    assert result["method"].endswith("method.md")
+    assert result["mapping"]["extra"] == ["linear biases"]
+    assert result["mapping"]["partial"] == ["embeddings", "value/output pair"]
     with pytest.raises(ValueError):
         port_plan.check_spec(path, {"slug": SLUG, "model_id": "other/model"})
 
@@ -351,6 +388,11 @@ def test_spec_check_counts_and_matches_the_request(tmp_path):
         lambda s: s.update(unexpected=True),
         lambda s: s.update(slug="Bad Slug"),
         lambda s: s["smoke"].update(max_rel_error=0),
+        lambda s: s.update(mapping=[]),
+        lambda s: s["mapping"].append(dict(s["mapping"][0])),  # duplicate role
+        lambda s: s["mapping"][0].update(status="fine"),
+        lambda s: s["differences"][0].update(role="not a mapped role"),
+        lambda s: s["differences"].pop(),  # partial role left without a difference
     ],
 )
 def test_spec_rejects_bad_input(tmp_path, mutate):
@@ -358,6 +400,19 @@ def test_spec_rejects_bad_input(tmp_path, mutate):
     mutate(data)
     with pytest.raises(ValidationError):
         port_plan.load_spec(_write_spec(tmp_path, data))
+
+
+def test_spec_check_requires_a_real_method_model(tmp_path):
+    with pytest.raises(ValueError, match="write the method model"):
+        port_plan.check_spec(_write_spec(tmp_path, method=None))
+    without_invariants = METHOD_MD.replace("## Invariants", "## Thoughts")
+    with pytest.raises(ValueError, match="lacks sections.*Invariants"):
+        port_plan.check_spec(_write_spec(tmp_path, method=without_invariants))
+    thin = METHOD_MD.replace("128 WikiText-2 samples of 2048 tokens for GPTQ; no training iterations.", "TBD")
+    with pytest.raises(ValueError, match="too thin.*Calibration"):
+        port_plan.check_spec(_write_spec(tmp_path, method=thin))
+    lower = METHOD_MD.replace("## Save and reload", "## save and reload")
+    assert port_plan.check_spec(_write_spec(tmp_path, method=lower))["status"] == "ok"
 
 
 # --- rank -------------------------------------------------------------------------
@@ -492,6 +547,7 @@ def _write_row(root: Path, folder: str, stem: str, row: dict, port: dict | None 
         (port_dir / "port.json").write_text(json.dumps(port))
         (port_dir / "manifest.json").write_text(json.dumps({"rationale": "rotate bias", "addresses": ["D1"]}))
         (port_dir / "differences.json").write_text(json.dumps(_spec()))
+        (port_dir / "method.md").write_text(METHOD_MD)
     (rows / f"{stem}.json").write_text(json.dumps(row))
 
 
@@ -519,6 +575,9 @@ def test_recipes_find_positive_and_negative_rows_by_model_or_family(workspace):
     positive = result["recipes"][0]
     assert positive["port"]["addresses"] == ["D1"]
     assert positive["port"]["differences"][0]["id"] == "D1"
+    assert positive["port"]["differences"][0]["role"] == "linear biases"
+    assert positive["port"]["mapping"][1] == {"role": "linear biases", "status": "extra", "modules": ["self_attn.q_proj.bias"]}
+    assert positive["port"]["method"].endswith("/method.md")
 
     same_model = port_plan.recipes(method="QuaRot", model_type="qwen2", model_id=MODEL_ID)["recipes"]
     assert [r["outcome"] for r in same_model] == ["negative", "positive"]
@@ -555,7 +614,8 @@ def test_library_port_carries_model_type_and_the_spec(workspace):
     assert port["status"] == "ready", port
     record = json.loads(port["files"]["port.json"])
     assert record["model_type"] == "qwen2"
-    assert "differences.json" in record["files"]
+    assert {"differences.json", "method.md"} <= set(record["files"])
+    assert port["files"]["method.md"].decode() == METHOD_MD
     stored_spec = port["files"]["differences.json"].decode()
     assert str(workspace) not in stored_spec and "<repo>/out/analysis" in stored_spec
 
@@ -564,5 +624,6 @@ def test_library_port_carries_model_type_and_the_spec(workspace):
         "status": "skipped", "reason": "secret_like_content",
     }
     spec_path.unlink()
+    (spec_path.parent / "method.md").unlink()
     port = library_mod.build_port(job_id=job_id, request=request, kind="attempt")
-    assert "differences.json" not in json.loads(port["files"]["port.json"])["files"]
+    assert not {"differences.json", "method.md"} & set(json.loads(port["files"]["port.json"])["files"])
