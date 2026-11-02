@@ -1,0 +1,64 @@
+{
+  "schema_version": 2,
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "gpu_instance": "vast-rtx3090",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "fp16_baseline": {
+    "perplexity": 9.579097742215955,
+    "tokens_per_s": 12682.526317573896,
+    "peak_vram_gb": 5.263543605804443
+  },
+  "methods": [
+    {
+      "method_name": "SmoothQuant",
+      "slug": "smoothquant-qwen25-15b-vastrtx3090",
+      "job_id": "20261102T032732Z-138c85",
+      "quality_ok": true,
+      "ppl": 9.724797517605321,
+      "ppl_ratio": 1.0152101773371884,
+      "tokens_per_s": 18435.812190255052,
+      "peak_vram_gb": 4.682347774505615,
+      "improved_throughput": true,
+      "improved_vram": true,
+      "packed": false,
+      "artifact_dir": "quantized/smoothquant-qwen25-15b-vastrtx3090",
+      "hub_url": "https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090",
+      "arxiv_id": "2211.10438",
+      "paper_url": "https://arxiv.org/abs/2211.10438",
+      "repo_url": "https://github.com/mit-han-lab/smoothquant",
+      "repo_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+      "verification_status": "passed",
+      "rank": 1
+    },
+    {
+      "method_name": "FlatQuant",
+      "slug": "flatquant-qwen25-15b-vastrtx3090",
+      "job_id": "20261102T052711Z-015c0e",
+      "quality_ok": true,
+      "ppl": 10.91668777771565,
+      "ppl_ratio": 1.139636328127733,
+      "tokens_per_s": 11555.293619869573,
+      "peak_vram_gb": 3.405120372772217,
+      "improved_throughput": false,
+      "improved_vram": true,
+      "packed": true,
+      "artifact_dir": "quantized/flatquant-qwen25-15b-vastrtx3090",
+      "hub_url": "https://huggingface.co/chris320211/flatquant-qwen25-15b-vastrtx3090",
+      "arxiv_id": "2410.09426",
+      "paper_url": "https://arxiv.org/abs/2410.09426",
+      "repo_url": "https://github.com/ruikangliu/FlatQuant",
+      "repo_commit": "9d88ffcb7d2c6bda59fb5c44dad36adc101aadb1",
+      "verification_status": "passed",
+      "rank": 2
+    }
+  ],
+  "best": {
+    "method_name": "SmoothQuant",
+    "slug": "smoothquant-qwen25-15b-vastrtx3090",
+    "job_id": "20261102T032732Z-138c85",
+    "rank": 1,
+    "why": "quality_ok, then higher WikiText-2 tok/s, then lower peak VRAM, prefer packed, then lower ppl_ratio",
+    "artifact_dir": "quantized/smoothquant-qwen25-15b-vastrtx3090",
+    "hub_url": "https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090"
+  }
+}

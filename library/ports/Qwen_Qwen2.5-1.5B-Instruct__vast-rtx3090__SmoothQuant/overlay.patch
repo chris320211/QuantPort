@@ -1,0 +1,744 @@
+diff --git a/quant_agent_inference_adapter.py b/quant_agent_inference_adapter.py
+new file mode 100644
+index 0000000..abf861a
+--- /dev/null
++++ b/quant_agent_inference_adapter.py
+@@ -0,0 +1,418 @@
++"""Reload a SmoothQuant W8A8 int8 artifact and run it on a real int8 path.
++
++The artifact (written by smoothquant/int8_export.py) stores, for every quantized
++decoder linear, an int8 ``weight`` [out, in] and an fp16 per-output-channel
++``weight_scale`` [out, 1], plus fp16 biases, smoothed fp16 norms and fp16 (tied)
++embeddings. Smoothing is folded into those weights offline, so no transform runs
++at load or inference time. The saved format is unchanged from the fp16-dequant
++adapter; only the runtime kernel differs.
++
++Each quantized linear keeps its int8 weight exactly as saved ([N, K], K-major,
++which is the "TN" layout the int8 GEMM wants) and the fp16 scale. No fp16 copy
++of a weight is ever kept. On CUDA, per call:
++
++1. ``_act_quant_kernel`` / ``_act_quant_looped_kernel`` (Triton, the latter for
++   K > 4096): per token row, the absmax, the fp32 per-token scale and the int8
++   codes in one kernel. The integer codes and the scale are
++   bit-identical to SmoothQuant's ``quantize_activation_per_token_absmax`` in
++   the activation dtype (fp16): absmax.clamp(1e-5) / 127 and x / scale are
++   rounded to fp16 before round-half-to-even, exactly as torch does.
++2. ``_w8a8_gemm_kernel`` (Triton): int8 x int8 -> int32 tensor-core GEMM with a
++   fused epilogue, acc * act_scale[m] * weight_scale[n] (+ bias[n]) -> fp16.
++   It handles any M, so decode (M = 1) and prefill share one kernel; the
++   activation never round-trips through fp16 dequantized form.
++
++On CPU, or if ``QUANT_AGENT_W8A8_REFERENCE=1`` is set, the module falls back to
++the fp16 dequant reference (the previous adapter's math).
++
++Attention is SDPA. Self-contained: torch, triton (bundled with torch on CUDA),
++transformers, accelerate and safetensors.
++"""
++import glob
++import json
++import os
++
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++from torch import nn
++
++QUANT_AGENT_ADAPTER_API = 1
++QUANT_CONFIG_NAME = "quantization_config.json"
++EXPECTED_FORMAT = "w8a8_int8"
++SCALE_SUFFIX = ".weight_scale"
++REFERENCE_ENV = "QUANT_AGENT_W8A8_REFERENCE"
++
++
++@triton.jit
++def _act_quant_kernel(
++    x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm,
++    BLOCK_K: tl.constexpr,
++):
++    """Per-token absmax int8 quantization of one row of x (fp16/bf16)."""
++    row = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < K
++    x_raw = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0)
++    act_ty = x_raw.dtype
++    x = x_raw.to(tl.float32)
++    amax = tl.max(tl.abs(x), axis=0)
++    # Mirror torch on the activation dtype: clamp, cast, divide, cast.
++    amax = tl.maximum(amax, 1e-5).to(act_ty).to(tl.float32)
++    scale = tl.math.div_rn(amax, 127.0).to(act_ty).to(tl.float32)
++    v = tl.math.div_rn(x, scale).to(act_ty).to(tl.float32)
++    # Round half to even, like torch.round; |v| <= ~127.5 so v + 0.5 is exact.
++    r = tl.floor(v + 0.5)
++    tie = (r - v) == 0.5
++    odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++    r = tl.where(tie & odd, r - 1.0, r)
++    r = tl.minimum(tl.maximum(r, -127.0), 127.0)
++    tl.store(q_ptr + row * stride_qm + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _act_quant_looped_kernel(
++    x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm,
++    BLOCK_K: tl.constexpr,
++):
++    """Same math as _act_quant_kernel for long rows: absmax pass, then quantize pass."""
++    row = tl.program_id(0).to(tl.int64)
++    x_row = x_ptr + row * stride_xm
++    q_row = q_ptr + row * stride_qm
++    offs = tl.arange(0, BLOCK_K)
++    run_max = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        run_max = tl.maximum(run_max, tl.abs(x))
++    act_ty = x_ptr.dtype.element_ty
++    amax = tl.max(run_max, axis=0)
++    amax = tl.maximum(amax, 1e-5).to(act_ty).to(tl.float32)
++    scale = tl.math.div_rn(amax, 127.0).to(act_ty).to(tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        v = tl.math.div_rn(x, scale).to(act_ty).to(tl.float32)
++        r = tl.floor(v + 0.5)
++        tie = (r - v) == 0.5
++        odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++        r = tl.where(tie & odd, r - 1.0, r)
++        r = tl.minimum(tl.maximum(r, -127.0), 127.0)
++        tl.store(q_row + k0 + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _w8a8_gemm_kernel(
++    a_ptr, b_ptr, c_ptr, as_ptr, bs_ptr, bias_ptr,
++    M, N, K,
++    stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
++    HAS_BIAS: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GROUP_M: tl.constexpr,
++):
++    """C[M, N] = (A_int8[M, K] @ B_int8[N, K]^T) * a_scale[M] * b_scale[N] + bias[N]."""
++    pid = tl.program_id(0)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    num_pid_in_group = GROUP_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    # Wrap out-of-range rows/cols onto valid memory; the store is masked.
++    offs_am = offs_m % M
++    offs_bn = offs_n % N
++    offs_k = tl.arange(0, BLOCK_K)
++    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
++    b_ptrs = b_ptr + offs_bn[None, :].to(tl.int64) * stride_bn + offs_k[:, None] * stride_bk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
++    for k in range(0, tl.cdiv(K, BLOCK_K)):
++        if EVEN_K:
++            a = tl.load(a_ptrs)
++            b = tl.load(b_ptrs)
++        else:
++            k_left = K - k * BLOCK_K
++            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_left, other=0)
++            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_left, other=0)
++        acc = tl.dot(a, b, acc, out_dtype=tl.int32)
++        a_ptrs += BLOCK_K * stride_ak
++        b_ptrs += BLOCK_K * stride_bk
++
++    a_scale = tl.load(as_ptr + offs_am).to(tl.float32)
++    b_scale = tl.load(bs_ptr + offs_bn).to(tl.float32)
++    out = acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]
++    if HAS_BIAS:
++        bias = tl.load(bias_ptr + offs_bn).to(tl.float32)
++        out = out + bias[None, :]
++    c_ptrs = c_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
++    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask)
++
++
++def quantize_activation_int8(x):
++    """x [M, K] fp16/bf16 contiguous -> (int8 codes [M, K], fp32 per-token scale [M])."""
++    m, k = x.shape
++    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
++    scale = torch.empty((m,), dtype=torch.float32, device=x.device)
++    if m == 0:
++        return q, scale
++    block_k = triton.next_power_of_2(int(k))
++    args = (x, q, scale, int(k), int(x.stride(0)), int(q.stride(0)))
++    if block_k <= 4096:
++        # Whole row in registers (K = 1536 here): one read of x.
++        _act_quant_kernel[(int(m),)](*args, BLOCK_K=block_k, num_warps=8)
++    else:
++        # Long rows (K = 8960): absmax pass + quantize pass over 4096-wide chunks;
++        # the second read hits L2. Measured at copy bandwidth on an RTX 3090.
++        _act_quant_looped_kernel[(int(m),)](*args, BLOCK_K=4096, num_warps=8)
++    return q, scale
++
++
++def _gemm_config(m, n, k):
++    """(BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages) for sm_80/sm_86.
++
++    Picked from a sweep on an RTX 3090 at M = 2048 over the Qwen2.5-1.5B shapes
++    (K in {1536, 8960}, N in {256, 1536, 8960}): 128x128x64, 4 warps, 4 stages was
++    fastest or within noise of fastest on every shape (~235 int8 TOPS on 8960-wide).
++    """
++    if m <= 16:
++        return 16, 64, 256, 1, 4, 3
++    if m <= 64:
++        return 64, 64, 128, 8, 4, 4
++    return 128, 128, 64, 8, 4, 4
++
++
++def w8a8_matmul(q, a_scale, weight, weight_scale, bias, out_dtype, config=None):
++    """int8 q [M, K] x int8 weight [N, K] -> out_dtype [M, N] with the dequant epilogue."""
++    m, k = q.shape
++    n = weight.shape[0]
++    out = torch.empty((m, n), dtype=out_dtype, device=q.device)
++    if m == 0:
++        return out
++    block_m, block_n, block_k, group_m, warps, stages = config or _gemm_config(m, n, k)
++    grid = (triton.cdiv(int(m), block_m) * triton.cdiv(int(n), block_n),)
++    _w8a8_gemm_kernel[grid](
++        q, weight, out, a_scale, weight_scale, bias if bias is not None else a_scale,
++        int(m), int(n), int(k),
++        int(q.stride(0)), int(q.stride(1)),
++        int(weight.stride(0)), int(weight.stride(1)),
++        int(out.stride(0)), int(out.stride(1)),
++        HAS_BIAS=bias is not None,
++        EVEN_K=(int(k) % block_k == 0),
++        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=group_m,
++        num_warps=warps, num_stages=stages,
++    )
++    return out
++
++
++def w8a8_linear(x2d, weight, weight_scale, bias):
++    """Real int8 W8A8 linear: Triton per-token quant, then int8 GEMM + epilogue."""
++    q, a_scale = quantize_activation_int8(x2d)
++    return w8a8_matmul(q, a_scale, weight, weight_scale, bias, x2d.dtype)
++
++
++def w8a8_linear_reference(x, weight, weight_scale, bias):
++    """fp16 dequant reference (the previous adapter's math)."""
++    x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / 127
++    x_q = torch.round(x / x_scale).clamp_(-127, 127).mul_(x_scale)
++    w = weight.to(x.dtype).mul_(weight_scale.reshape(-1, 1).to(x.dtype))
++    b = None if bias is None else bias.to(x.dtype)
++    return F.linear(x_q, w, b)
++
++
++def _w8a8_int8_linear_class():
++    class W8A8Int8Linear(nn.Module):
++        """int8 weight + per-channel scale; per-token dynamic int8 activations; int8 GEMM."""
++
++        def __init__(self, in_features, out_features, has_bias, dtype):
++            super().__init__()
++            self.in_features = in_features
++            self.out_features = out_features
++            self.register_buffer(
++                "weight", torch.empty(out_features, in_features, dtype=torch.int8)
++            )
++            self.register_buffer(
++                "weight_scale", torch.empty(out_features, 1, dtype=dtype)
++            )
++            if has_bias:
++                self.register_buffer("bias", torch.empty(out_features, dtype=dtype))
++            else:
++                self.bias = None
++            self.use_reference = os.environ.get(REFERENCE_ENV) == "1"
++
++        @torch.no_grad()
++        def forward(self, x):
++            if (
++                self.use_reference
++                or not x.is_cuda
++                or x.dtype not in (torch.float16, torch.bfloat16)
++            ):
++                return w8a8_linear_reference(x, self.weight, self.weight_scale, self.bias)
++            lead = x.shape[:-1]
++            x2d = x.reshape(-1, self.in_features)
++            if not x2d.is_contiguous():
++                x2d = x2d.contiguous()
++            out = w8a8_linear(x2d, self.weight, self.weight_scale, self.bias)
++            return out.reshape(*lead, self.out_features)
++
++        def extra_repr(self):
++            return (
++                f"in_features={self.in_features}, out_features={self.out_features}, "
++                f"bias={self.bias is not None}, weight=int8 per_channel, "
++                "act=int8 per_token dynamic, kernel=triton int8 gemm"
++            )
++
++    return W8A8Int8Linear
++
++
++def _resolve_dtype(dtype):
++    if dtype in (torch.bfloat16, "bfloat16", "bf16"):
++        return torch.bfloat16
++    if dtype in (None, "auto", torch.float16, "float16", "fp16", "half"):
++        return torch.float16
++    raise ValueError(f"unsupported dtype for the W8A8 int8 artifact: {dtype!r}")
++
++
++def _read_quant_config(model_path):
++    path = os.path.join(model_path, QUANT_CONFIG_NAME)
++    if not os.path.isfile(path):
++        raise FileNotFoundError(f"{QUANT_CONFIG_NAME} is missing in {model_path}")
++    with open(path) as handle:
++        qcfg = json.load(handle)
++    if qcfg.get("format") != EXPECTED_FORMAT:
++        raise ValueError(f"expected format {EXPECTED_FORMAT!r}, got {qcfg.get('format')!r}")
++    if str(qcfg.get("act_quant")) != "per_token" or str(qcfg.get("weight_quant")) != "per_channel":
++        raise ValueError(
++            "this adapter handles per_channel int8 weights with per_token dynamic activations only"
++        )
++    return qcfg
++
++
++def _read_state(model_path):
++    from safetensors.torch import load_file
++
++    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
++    if not files:
++        raise FileNotFoundError(f"no .safetensors weights in {model_path}")
++    state = {}
++    for path in files:
++        part = load_file(path, device="cpu")
++        overlap = set(part) & set(state)
++        if overlap:
++            raise ValueError(f"tensor(s) {sorted(overlap)[:3]} appear in two weight files")
++        state.update(part)
++    return state
++
++
++def _set_submodule(model, name, module):
++    parent_name, _, leaf = name.rpartition(".")
++    parent = model.get_submodule(parent_name) if parent_name else model
++    setattr(parent, leaf, module)
++
++
++def load_model_and_tokenizer(model_path, model_id, dtype, device, trust_remote_code):
++    from accelerate import init_empty_weights
++    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
++
++    del model_id  # the saved artifact is the only source of weights
++    torch_dtype = _resolve_dtype(dtype)
++    qcfg = _read_quant_config(model_path)
++    state = _read_state(model_path)
++
++    config = AutoConfig.from_pretrained(
++        model_path, trust_remote_code=trust_remote_code, local_files_only=True
++    )
++    if getattr(config, "quantization_config", None):
++        raise ValueError("config.json carries a quantization_config; not a SmoothQuant int8 artifact")
++
++    # Parameters on meta (no fp16 copy of the linears is ever allocated); buffers
++    # such as the rotary inv_freq stay real.
++    with init_empty_weights(include_buffers=False):
++        model = AutoModelForCausalLM.from_config(
++            config,
++            torch_dtype=torch_dtype,
++            trust_remote_code=trust_remote_code,
++            attn_implementation="sdpa",
++        )
++
++    linear_cls = _w8a8_int8_linear_class()
++    modules = dict(model.named_modules())
++    quantized = []
++    for key in sorted(state):
++        if not key.endswith(SCALE_SUFFIX):
++            continue
++        name = key[: -len(SCALE_SUFFIX)]
++        weight = state.get(f"{name}.weight")
++        if weight is None or weight.dtype != torch.int8 or weight.dim() != 2:
++            raise ValueError(f"{key} has no int8 [out, in] weight next to it")
++        original = modules.get(name)
++        if not isinstance(original, nn.Linear):
++            raise ValueError(f"{name} is not an nn.Linear in {type(model).__name__}")
++        out_features, in_features = weight.shape
++        if (original.out_features, original.in_features) != (out_features, in_features):
++            raise ValueError(f"{name}: saved shape {tuple(weight.shape)} does not match the config")
++        if tuple(state[key].shape) not in ((out_features, 1), (out_features,)):
++            raise ValueError(f"{key}: expected [{out_features}, 1], got {tuple(state[key].shape)}")
++        state[key] = state[key].reshape(out_features, 1)
++        # The GEMM reads B as [N, K] with K contiguous; make sure that holds.
++        state[f"{name}.weight"] = weight.contiguous()
++        has_bias = f"{name}.bias" in state
++        if has_bias != (original.bias is not None):
++            raise ValueError(f"{name}: bias presence differs between artifact and config")
++        _set_submodule(model, name, linear_cls(in_features, out_features, has_bias, torch_dtype))
++        quantized.append(name)
++    if not quantized:
++        raise ValueError("no int8 weight + weight_scale pairs in the artifact")
++    expected = qcfg.get("num_quantized_linears")
++    if isinstance(expected, int) and expected != len(quantized):
++        raise ValueError(
++            f"{QUANT_CONFIG_NAME} lists {expected} quantized linears, artifact has {len(quantized)}"
++        )
++
++    for key, tensor in list(state.items()):
++        if tensor.is_floating_point() and tensor.dtype != torch_dtype:
++            state[key] = tensor.to(torch_dtype)
++
++    tied = bool(getattr(config, "tie_word_embeddings", False))
++    result = model.load_state_dict(state, strict=False, assign=True)
++    missing = set(result.missing_keys)
++    if tied:
++        missing.discard("lm_head.weight")
++    if missing or result.unexpected_keys:
++        raise ValueError(
++            f"artifact does not match the model: missing={sorted(missing)[:8]} "
++            f"unexpected={sorted(result.unexpected_keys)[:8]}"
++        )
++    if tied:
++        model.tie_weights()
++    leftover = [n for n, t in list(model.named_parameters()) + list(model.named_buffers()) if t.is_meta]
++    if leftover:
++        raise ValueError(f"tensors left uninitialised after load: {leftover[:8]}")
++
++    try:
++        model.generation_config = GenerationConfig.from_pretrained(
++            model_path, local_files_only=True
++        )
++    except OSError:
++        pass
++    model.to(device)
++    model.eval()
++    attn_impl = getattr(model.config, "_attn_implementation", None)
++    if attn_impl != "sdpa":
++        raise RuntimeError(f"expected SDPA attention for prefill, got {attn_impl!r}")
++
++    tokenizer = AutoTokenizer.from_pretrained(
++        model_path, trust_remote_code=trust_remote_code, local_files_only=True
++    )
++    return model, tokenizer
+diff --git a/smoothquant/fake_quant.py b/smoothquant/fake_quant.py
+index 24b62b5..a057c0d 100644
+--- a/smoothquant/fake_quant.py
++++ b/smoothquant/fake_quant.py
+@@ -13,6 +13,23 @@ def quantize_weight_per_channel_absmax(w, n_bits=8):
+     return w
+ 
+ 
++@torch.no_grad()
++def quantize_weight_per_channel_absmax_int8(w, n_bits=8):
++    """Same math as quantize_weight_per_channel_absmax, but also returns the integers.
++
++    Returns (q, scales, w_dq): q is int8 [out, in], scales is [out, 1] in w.dtype, and
++    w_dq = q * scales is bit-identical to what quantize_weight_per_channel_absmax
++    computes. w itself is not modified.
++    """
++    assert n_bits == 8, "int8 storage only"
++    scales = w.abs().max(dim=-1, keepdim=True)[0]
++    q_max = 2 ** (n_bits - 1) - 1
++    scales.clamp_(min=1e-5).div_(q_max)
++    q = w.div(scales).round_().clamp_(-q_max, q_max)
++    w_dq = q.mul(scales)
++    return q.to(torch.int8), scales, w_dq
++
++
+ @torch.no_grad()
+ def quantize_weight_per_tensor_absmax(w, n_bits=8):
+     # w: (out_features, in_features)
+@@ -109,8 +126,15 @@ class W8A8Linear(nn.Module):
+ 
+     @staticmethod
+     def from_float(
+-        module, weight_quant="per_channel", act_quant="per_token", quantize_output=False
++        module,
++        weight_quant="per_channel",
++        act_quant="per_token",
++        quantize_output=False,
++        keep_int8=False,
+     ):
++        """keep_int8=True also keeps the int8 weight and its per-channel scale as
++        buffers (weight_int8 [out, in], weight_scale [out, 1]) so the model can be
++        saved as real int8. The fp16 weight used in forward is unchanged."""
+         assert isinstance(module, torch.nn.Linear)
+         new_module = W8A8Linear(
+             module.in_features,
+@@ -119,7 +143,16 @@ class W8A8Linear(nn.Module):
+             act_quant=act_quant,
+             quantize_output=quantize_output,
+         )
+-        if weight_quant == "per_channel":
++        if weight_quant == "per_channel" and keep_int8:
++            q, scales, w_dq = quantize_weight_per_channel_absmax_int8(
++                module.weight, n_bits=8
++            )
++            new_module.weight = w_dq
++            new_module.register_buffer("weight_int8", q)
++            new_module.register_buffer("weight_scale", scales)
++        elif keep_int8:
++            raise ValueError("keep_int8 is only supported with per_channel weights")
++        elif weight_quant == "per_channel":
+             new_module.weight = quantize_weight_per_channel_absmax(
+                 module.weight, n_bits=8
+             )  # use 8-bit integer for weight
+@@ -181,7 +214,11 @@ def quantize_opt(
+ 
+ 
+ def quantize_llama_like(
+-    model, weight_quant="per_channel", act_quant="per_token", quantize_bmm_input=False
++    model,
++    weight_quant="per_channel",
++    act_quant="per_token",
++    quantize_bmm_input=False,
++    keep_int8=False,
+ ):
+     from transformers.models.llama.modeling_llama import (
+         LlamaAttention,
+@@ -193,38 +230,46 @@ def quantize_llama_like(
+         MistralMLP,
+     )
+ 
++    # Qwen2SdpaAttention / Qwen2FlashAttention2 subclass Qwen2Attention.
++    from transformers.models.qwen2.modeling_qwen2 import (
++        Qwen2Attention,
++        Qwen2MLP,
++    )
++
++    from_float = partial(W8A8Linear.from_float, keep_int8=keep_int8)
++
+     for name, m in model.model.named_modules():
+-        if isinstance(m, (LlamaMLP, MistralMLP)):
+-            m.gate_proj = W8A8Linear.from_float(
++        if isinstance(m, (LlamaMLP, MistralMLP, Qwen2MLP)):
++            m.gate_proj = from_float(
+                 m.gate_proj, weight_quant=weight_quant, act_quant=act_quant
+             )
+-            m.up_proj = W8A8Linear.from_float(
++            m.up_proj = from_float(
+                 m.up_proj, weight_quant=weight_quant, act_quant=act_quant
+             )
+-            m.down_proj = W8A8Linear.from_float(
++            m.down_proj = from_float(
+                 m.down_proj, weight_quant=weight_quant, act_quant=act_quant
+             )
+-        elif isinstance(m, (LlamaAttention, MistralAttention)):
++        elif isinstance(m, (LlamaAttention, MistralAttention, Qwen2Attention)):
+             # Her we simulate quantizing BMM inputs by quantizing the output of q_proj, k_proj, v_proj
+-            m.q_proj = W8A8Linear.from_float(
++            m.q_proj = from_float(
+                 m.q_proj,
+                 weight_quant=weight_quant,
+                 act_quant=act_quant,
+                 quantize_output=quantize_bmm_input,
+             )
+-            m.k_proj = W8A8Linear.from_float(
++            m.k_proj = from_float(
+                 m.k_proj,
+                 weight_quant=weight_quant,
+                 act_quant=act_quant,
+                 quantize_output=quantize_bmm_input,
+             )
+-            m.v_proj = W8A8Linear.from_float(
++            m.v_proj = from_float(
+                 m.v_proj,
+                 weight_quant=weight_quant,
+                 act_quant=act_quant,
+                 quantize_output=quantize_bmm_input,
+             )
+-            m.o_proj = W8A8Linear.from_float(
++            m.o_proj = from_float(
+                 m.o_proj, weight_quant=weight_quant, act_quant=act_quant
+             )
+     return model
+@@ -311,14 +356,23 @@ def quantize_falcon(
+ 
+ 
+ def quantize_model(
+-    model, weight_quant="per_channel", act_quant="per_token", quantize_bmm_input=False
++    model,
++    weight_quant="per_channel",
++    act_quant="per_token",
++    quantize_bmm_input=False,
++    keep_int8=False,
+ ):
+     from transformers.models.opt.modeling_opt import OPTPreTrainedModel
+     from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
+     from transformers.models.mistral.modeling_mistral import MistralPreTrainedModel
+     from transformers.models.mixtral.modeling_mixtral import MixtralPreTrainedModel
+     from transformers.models.falcon.modeling_falcon import FalconPreTrainedModel
++    from transformers.models.qwen2.modeling_qwen2 import Qwen2PreTrainedModel
+ 
++    if keep_int8 and not isinstance(
++        model, (LlamaPreTrainedModel, MistralPreTrainedModel, Qwen2PreTrainedModel)
++    ):
++        raise ValueError("keep_int8 is only implemented for the Llama-like path")
+     if isinstance(model, OPTPreTrainedModel):
+         return quantize_opt(
+             model,
+@@ -326,12 +380,15 @@ def quantize_model(
+             act_quant=act_quant,
+             quantize_bmm_input=quantize_bmm_input,
+         )
+-    elif isinstance(model, (LlamaPreTrainedModel, MistralPreTrainedModel)):
++    elif isinstance(
++        model, (LlamaPreTrainedModel, MistralPreTrainedModel, Qwen2PreTrainedModel)
++    ):
+         return quantize_llama_like(
+             model,
+             weight_quant=weight_quant,
+             act_quant=act_quant,
+             quantize_bmm_input=quantize_bmm_input,
++            keep_int8=keep_int8,
+         )
+     elif isinstance(model, MixtralPreTrainedModel):
+         return quantize_mixtral(
+diff --git a/smoothquant/int8_export.py b/smoothquant/int8_export.py
+new file mode 100644
+index 0000000..2184981
+--- /dev/null
++++ b/smoothquant/int8_export.py
+@@ -0,0 +1,108 @@
++"""Save a smoothed, W8A8-quantized Llama-like model as real int8.
++
++quantize_model(..., keep_int8=True) leaves W8A8Linear modules that carry the
++int8 weight and its per-output-channel scale next to the fp16 weight they use in
++forward. This writes:
++
++- ``<linear>.weight``        int8  [out, in]
++- ``<linear>.weight_scale``  fp16  [out, 1]   (w_fp16 = weight * weight_scale)
++- ``<linear>.bias``          fp16  [out]      (unchanged by smoothing)
++- every other tensor (smoothed norms, embeddings, final norm) in fp16
++- no ``lm_head.weight`` when it is tied to the input embeddings
++
++plus config.json (no ``quantization_config`` key), generation_config.json, the
++tokenizer, and ``quantization_config.json`` describing the scheme. Activations
++are quantized per token, dynamically, at runtime; nothing about them is stored.
++"""
++import json
++import os
++
++import torch
++
++from smoothquant.fake_quant import W8A8Linear
++
++QUANT_CONFIG_NAME = "quantization_config.json"
++WEIGHTS_NAME = "model.safetensors"
++
++
++@torch.no_grad()
++def w8a8_int8_state_dict(model, dtype=torch.float16):
++    """Return (state_dict, quantized module names) for the int8 artifact."""
++    int8_modules = {}
++    for name, module in model.named_modules():
++        if isinstance(module, W8A8Linear):
++            if getattr(module, "weight_int8", None) is None:
++                raise ValueError(
++                    f"{name} was quantized without keep_int8=True; cannot save int8"
++                )
++            int8_modules[name] = module
++
++    state = {}
++    for key, tensor in model.state_dict().items():
++        owner = key.rpartition(".")[0]
++        if owner in int8_modules:
++            continue
++        tensor = tensor.detach()
++        if tensor.is_floating_point():
++            tensor = tensor.to(dtype)
++        state[key] = tensor.to("cpu", copy=True).contiguous()
++
++    for name, module in int8_modules.items():
++        weight = module.weight_int8.detach()
++        scale = module.weight_scale.detach()
++        out_features, in_features = module.out_features, module.in_features
++        if weight.dtype != torch.int8 or tuple(weight.shape) != (out_features, in_features):
++            raise ValueError(f"{name}: bad int8 weight {weight.dtype} {tuple(weight.shape)}")
++        if tuple(scale.shape) != (out_features, 1):
++            raise ValueError(f"{name}: bad weight_scale shape {tuple(scale.shape)}")
++        state[f"{name}.weight"] = weight.to("cpu", copy=True).contiguous()
++        state[f"{name}.weight_scale"] = scale.to("cpu", dtype=dtype, copy=True).contiguous()
++        if module.bias is not None:
++            bias = module.bias.detach().reshape(-1)
++            state[f"{name}.bias"] = bias.to("cpu", dtype=dtype, copy=True).contiguous()
++
++    if getattr(model.config, "tie_word_embeddings", False):
++        head = model.get_output_embeddings()
++        embed = model.get_input_embeddings()
++        if head is not None and head.weight is not embed.weight:
++            raise ValueError("config ties lm_head to embed_tokens but the weights differ")
++        for key in [k for k in state if k.endswith("lm_head.weight")]:
++            del state[key]
++    return state, sorted(int8_modules)
++
++
++@torch.no_grad()
++def save_w8a8_int8(model, tokenizer, output_dir, quant_config, dtype=torch.float16):
++    """Write the int8 artifact to output_dir. Returns a short summary dict."""
++    from safetensors.torch import save_file
++
++    os.makedirs(output_dir, exist_ok=True)
++    state, modules = w8a8_int8_state_dict(model, dtype=dtype)
++    if not modules:
++        raise ValueError("no W8A8Linear modules found; nothing was quantized")
++    save_file(state, os.path.join(output_dir, WEIGHTS_NAME), metadata={"format": "pt"})
++
++    config = model.config
++    if getattr(config, "quantization_config", None) is not None:
++        raise ValueError("model config already carries a quantization_config")
++    config.torch_dtype = dtype
++    config.save_pretrained(output_dir)
++    generation_config = getattr(model, "generation_config", None)
++    if generation_config is not None:
++        generation_config.save_pretrained(output_dir)
++    if tokenizer is not None:
++        tokenizer.save_pretrained(output_dir)
++
++    record = dict(quant_config)
++    record["quantized_modules"] = modules
++    record["num_quantized_linears"] = len(modules)
++    with open(os.path.join(output_dir, QUANT_CONFIG_NAME), "w") as handle:
++        json.dump(record, handle, indent=2)
++        handle.write("\n")
++    int8_bytes = sum(t.numel() for k, t in state.items() if t.dtype == torch.int8)
++    return {
++        "output_dir": output_dir,
++        "num_quantized_linears": len(modules),
++        "int8_params": int8_bytes,
++        "tensors": len(state),
++    }
+diff --git a/smoothquant/smooth.py b/smoothquant/smooth.py
+index c2a70e7..51054dc 100644
+--- a/smoothquant/smooth.py
++++ b/smoothquant/smooth.py
+@@ -13,6 +13,7 @@ from transformers.models.mixtral.modeling_mixtral import (
+     MixtralRMSNorm,
+ )
+ from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
++from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RMSNorm
+ 
+ 
+ @torch.no_grad()
+@@ -49,7 +50,7 @@ def smooth_ln_fcs(ln, fcs, act_scales, alpha=0.5):
+ def smooth_ln_fcs_llama_like(ln, fcs, act_scales, alpha=0.5):
+     if not isinstance(fcs, list):
+         fcs = [fcs]
+-    assert isinstance(ln, (LlamaRMSNorm, MistralRMSNorm, MixtralRMSNorm))
++    assert isinstance(ln, (LlamaRMSNorm, MistralRMSNorm, MixtralRMSNorm, Qwen2RMSNorm))
+     for fc in fcs:
+         assert isinstance(fc, nn.Linear)
+         assert ln.weight.numel() == fc.in_features == act_scales.numel()
+@@ -123,7 +124,9 @@ def smooth_lm(model, scales, alpha=0.5):
+                 )
+                 smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha)
+                 smooth_ln_fcs(ffn_ln, fc1, fc1_input_scales, alpha)
+-        elif isinstance(module, (LlamaDecoderLayer, MistralDecoderLayer)):
++        elif isinstance(module, (LlamaDecoderLayer, MistralDecoderLayer, Qwen2DecoderLayer)):
++            # Qwen2 is Llama-like: RMSNorm -> q/k/v and RMSNorm -> gate/up. Its q/k/v
++            # biases are added after X @ W^T, so smoothing W's input columns leaves them unchanged.
+             attn_ln = module.input_layernorm  # attention forward norm
+             qkv = [
+                 module.self_attn.q_proj,

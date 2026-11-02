@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "contribution",
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "model_type": "qwen2",
+  "method_name": "SmoothQuant",
+  "gpu_instance": "vast-rtx3090",
+  "slug": "smoothquant-qwen25-15b-vastrtx3090",
+  "job_id": "20261102T032732Z-138c85",
+  "repo_url": "https://github.com/mit-han-lab/smoothquant",
+  "repo_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+  "patch_sha256": "85cf0dd72a378530abca651f592d5192b23d8972788e1a9007a30aab4507d8bd",
+  "files": [
+    "differences.json",
+    "manifest.json",
+    "method.md",
+    "overlay.patch",
+    "quantize.py"
+  ]
+}

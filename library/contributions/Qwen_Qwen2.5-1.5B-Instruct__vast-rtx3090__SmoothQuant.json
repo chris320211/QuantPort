@@ -1,0 +1,108 @@
+{
+  "schema_version": 2,
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "method_name": "SmoothQuant",
+  "gpu_instance": "vast-rtx3090",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "quality_ok": true,
+  "ppl": 9.724797517605321,
+  "ppl_ratio": 1.0152101773371884,
+  "tokens_per_s": 18435.812190255052,
+  "peak_vram_gb": 4.682347774505615,
+  "fp16_ppl": 9.579097742215955,
+  "fp16_tokens_per_s": 12248.238362552387,
+  "fp16_peak_vram_gb": 5.843621730804443,
+  "packed": false,
+  "hub_url": "https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090",
+  "hub_repo_id": "chris320211/smoothquant-qwen25-15b-vastrtx3090",
+  "arxiv_id": "2211.10438",
+  "paper_url": "https://arxiv.org/abs/2211.10438",
+  "repo_url": "https://github.com/mit-han-lab/smoothquant",
+  "repo_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+  "dataset": "wikitext-2-raw-v1",
+  "max_seq_len": 2048,
+  "job_id": "20261102T032732Z-138c85",
+  "slug": "smoothquant-qwen25-15b-vastrtx3090",
+  "artifact_dir": "quantized/smoothquant-qwen25-15b-vastrtx3090",
+  "verification_status": "passed",
+  "port": "library/ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__SmoothQuant",
+  "vllm": {
+    "status": "passed",
+    "profile": "w8a8_int8",
+    "vllm_version": "0.30.0",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "dtype": "float16",
+    "ppl_ratio": 1.0151278999309246,
+    "hf_ppl_ratio": 1.0152101773371884,
+    "ppl_ratio_drift": 0.9999189552980254,
+    "prefill_speedup": 1.8099426485979226,
+    "decode_speedup": {
+      "1": 1.2689643530338257,
+      "16": 1.4419318254441258
+    },
+    "hf_runtime": {
+      "transformers_version": "4.46.3",
+      "dtype": "float16",
+      "ppl_ratio": 1.0152101773371884,
+      "int8_prefill_speedup": 1.8238614249376157,
+      "int8_decode_speedup": {
+        "1": 0.4987597611611983,
+        "16": 0.4669702544323808
+      },
+      "vllm_prefill_speedup": 1.9675984434019944,
+      "vllm_decode_speedup": {
+        "1": 5.0550317886158425,
+        "16": 4.975545739752252
+      },
+      "peak_vram_gb": 4.682347297668457,
+      "baseline_peak_vram_gb": 5.843621253967285
+    },
+    "runtimes": [
+      {
+        "runtime": "vLLM",
+        "precision": "int8",
+        "ppl": 9.724394446866444,
+        "prefill_tokens_per_s": 41093.63748841521,
+        "decode_tokens_per_s": {
+          "1": 257.37657678828174,
+          "16": 3673.7316548376816
+        }
+      },
+      {
+        "runtime": "vLLM",
+        "precision": "fp16",
+        "ppl": 9.579477076266105,
+        "prefill_tokens_per_s": 22704.386528627587,
+        "decode_tokens_per_s": {
+          "1": 202.82411887532436,
+          "16": 2547.784569292064
+        }
+      },
+      {
+        "runtime": "Transformers",
+        "precision": "int8",
+        "ppl": 9.724797517605321,
+        "prefill_tokens_per_s": 38091.66472804439,
+        "decode_tokens_per_s": {
+          "1": 25.39431705583002,
+          "16": 344.79100289836043
+        },
+        "peak_vram_gb": 4.682347297668457
+      },
+      {
+        "runtime": "Transformers",
+        "precision": "fp16",
+        "ppl": 9.579097742215955,
+        "prefill_tokens_per_s": 20885.174831386816,
+        "decode_tokens_per_s": {
+          "1": 50.914927452663164,
+          "16": 738.357528398605
+        },
+        "peak_vram_gb": 5.843621253967285
+      }
+    ],
+    "checked_at": "2026-11-02",
+    "hub_repo_id": "chris320211/smoothquant-qwen25-15b-vastrtx3090-vllm",
+    "hub_url": "https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090-vllm"
+  }
+}

@@ -1,0 +1,1001 @@
+diff --git a/deploy/transformers/modeling_qwen2.py b/deploy/transformers/modeling_qwen2.py
+new file mode 100644
+index 0000000..d581b4b
+--- /dev/null
++++ b/deploy/transformers/modeling_qwen2.py
+@@ -0,0 +1,576 @@
++"""Packed int4 FlatQuant Qwen2 (W4A4KV4), the Qwen2 counterpart of modeling_llama.py.
++
++Reloads the artifact written by ``flat_utils.save_quantized_weights_with_safetensors``
++for a Qwen2 model that went through ``apply_flatquant_to_qwen`` ->
++``reparameterize_model`` -> RTN. Everything the fake-quant model folds offline is
++already in the saved weights (diag scales in the norms / up_proj rows, P^-T and LWC
++in the linears, P_v in v_proj weight *and bias*, (P_o kron P_v)^-T in o_proj), so the
++loader never re-fuses anything. What stays online, as in the paper (Fig. 3b):
++
++* ``qkv_trans``: Kronecker ``P1^T X P2`` on the shared q/k/v input, fused with the
++  per-token int4 quantization (Triton ``kron_matmul``), once per projection because
++  each projection learned its own activation clip (LAC);
++* ``P_h``: after RoPE, ``q <- q P_h^-T`` and ``k <- k P_h``;
++* KV4: asymmetric 4-bit per (token, head) with the learned KV clip, stored packed;
++* ``P_o^T`` over the 12-head axis of the attention output, then int4 quantization.
++  A torch matmul does this: deploy's Triton ``block_matmul`` needs a power-of-two
++  head count (``tl.arange(0, num_heads)``) and does not compile for 12 heads;
++* ``up_gate_trans`` and ``down_trans`` Kronecker transforms + int4 quantization.
++
++The q/k/v/o and MLP linears are ``deploy.nn.Linear4bit`` subclasses: CUTLASS int4 GEMM,
++then the int32 accumulator is scaled in fp32 (``deploy.sym_dequant`` truncates it to a
++multiple of 10, see ``Linear4bitFQ``). The model runs in float16, which those kernels
++require.
++"""
++import json
++import math
++import os
++from typing import Optional, Tuple
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from transformers import Qwen2Config
++from transformers.cache_utils import Cache, DynamicCache
++from transformers.generation import GenerationMixin
++from transformers.models.qwen2.modeling_qwen2 import (
++    Qwen2ForCausalLM,
++    Qwen2RotaryEmbedding,
++    apply_rotary_pos_emb,
++    repeat_kv,
++)
++
++import deploy
++from deploy.functional import unpack_i4
++from deploy.transformers.kv_cache import asym_quantize_and_pack_i4, unpack_i4_and_asym_dequantize
++
++KERNEL_SCALE_DTYPE = torch.float16
++QUANT_CONFIG_NAME = "quantization_config.json"
++PACKED_FORMAT = "flatquant_qwen2_packed_int4"
++KRON_BACKENDS = ("auto", "triton", "torch")
++DEQUANT_BACKENDS = ("torch", "cuda")
++
++
++def _sigmoid(value: float) -> float:
++    return 1.0 / (1.0 + math.exp(-value))
++
++
++def lac_sym_quant(x: torch.Tensor, clip_max: float, clip_min: float) -> "deploy.PackedQuantizedTensor":
++    """Per-token symmetric int4 with learned clipping, as ActivationQuantizer(sym, lac)."""
++    rows = x.reshape(-1, x.shape[-1]).float()
++    xmax = rows.amax(1, keepdim=True).clamp(min=0) * _sigmoid(clip_max)
++    xmin = rows.amin(1, keepdim=True).clamp(max=0) * _sigmoid(clip_min)
++    peak = torch.maximum(xmin.abs(), xmax)
++    scale = torch.where(peak == 0, torch.ones_like(peak), peak / 7).to(KERNEL_SCALE_DTYPE)
++    x = x.to(torch.float16).contiguous()
++    return deploy.PackedQuantizedTensor(deploy.sym_quant(x, scale), scale)
++
++
++def torch_kron(x: torch.Tensor, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
++    """``P1^T X P2`` per token (same product order as deploy's kron_matmul)."""
++    shape = x.shape
++    x = x.reshape(-1, left.shape[0], right.shape[0])
++    x = torch.matmul(torch.matmul(left.T, x), right)
++    return x.reshape(shape)
++
++
++class Linear4bitFQ(deploy.nn.Linear4bit):
++    """``deploy.nn.Linear4bit`` (CUTLASS int4 GEMM) with an exact int32 -> fp16 dequant.
++
++    The repo's ``deploy.sym_dequant`` kernel computes ``int_to_half(acc / 10.0f) * 10``
++    where ``int_to_half`` does ``static_cast<int>`` (deploy/kernels/quant.cu:5-10, 83-84):
++    the int32 accumulator is truncated to a multiple of 10 before scaling, an error of up
++    to 9 / |acc| per output (about 3 % relative on Qwen2-sized projections). The default
++    ``dequant_backend = "torch"`` scales the exact accumulator in fp32 instead; "cuda"
++    keeps the repo kernel for comparison. The weights and the GEMM are unchanged.
++    """
++
++    dequant_backend = "torch"
++
++    def forward(self, x):
++        if not isinstance(x, deploy.PackedQuantizedTensor):
++            raise TypeError("Linear4bitFQ expects a PackedQuantizedTensor (int4 activations)")
++        acc = deploy.matmul(x.quantized_x, self.weight)
++        if self.dequant_backend == "cuda":
++            out = deploy.sym_dequant(acc, x.scales_x, self.weight_scales)
++        else:
++            scale_x = x.scales_x.reshape(*acc.shape[:-1], 1).float()
++            out = (acc.float() * scale_x * self.weight_scales.float().reshape(-1)).to(torch.float16)
++        if self.bias is not None:
++            out = out + self.bias
++        return out
++
++
++class ActClip(nn.Module):
++    """Learned activation clip logits of one quantizer (LAC). Floats at runtime."""
++
++    def __init__(self):
++        super().__init__()
++        self.register_buffer("clip_factor_a_max", torch.full((1,), 4.0))
++        self.register_buffer("clip_factor_a_min", torch.full((1,), 4.0))
++        self.clip_max = 4.0
++        self.clip_min = 4.0
++
++    def freeze(self):
++        self.clip_max = float(self.clip_factor_a_max.float().reshape(-1)[0])
++        self.clip_min = float(self.clip_factor_a_min.float().reshape(-1)[0])
++
++
++class OnlineKronQuant(nn.Module):
++    """Online ``P1^T X P2`` followed by int4 quantization for each consumer clip.
++
++    The diag scale of this transform is fused into the preceding norm (or up_proj
++    rows) by ``reparameterize_model``; ``use_diag`` must therefore be False at run
++    time, and ``_eval_mode`` True (restored by ``restore_packed_eval_runtime``).
++    """
++
++    def __init__(self, dim: int, consumers: Tuple[str, ...]):
++        super().__init__()
++        left, right = deploy.functional.get_decompose_dim(dim)
++        self.dim = dim
++        self.register_buffer("left_matrix", torch.zeros(left, left, dtype=torch.float16))
++        self.register_buffer("right_matrix", torch.zeros(right, right, dtype=torch.float16))
++        self.consumers = tuple(consumers)
++        self.clips = nn.ModuleDict({name: ActClip() for name in self.consumers})
++        self.backend = "torch"
++        self.use_diag = True
++        self._eval_mode = False
++
++    def _check_runtime(self):
++        if not self._eval_mode or self.use_diag:
++            raise RuntimeError(
++                "OnlineKronQuant used before restore_packed_eval_runtime(): the diag scale is "
++                "already fused into the norm, so use_diag must be False and _eval_mode True"
++            )
++
++    def forward(self, x: torch.Tensor):
++        self._check_runtime()
++        x = x.to(torch.float16).contiguous()
++        out = []
++        if self.backend == "triton" and x.dim() == 3:
++            from deploy.functional.online_trans import kronecker_matmul
++            for name in self.consumers:
++                clip = self.clips[name]
++                out.append(kronecker_matmul(x, [self.left_matrix, self.right_matrix], clip.clip_max, clip.clip_min))
++        else:
++            y = torch_kron(x, self.left_matrix, self.right_matrix)
++            for name in self.consumers:
++                clip = self.clips[name]
++                out.append(lac_sym_quant(y, clip.clip_max, clip.clip_min))
++        return out
++
++
++class HeadTransQuant(nn.Module):
++    """``P_o^T`` over the head axis of the attention output, then int4 quantization."""
++
++    def __init__(self, num_heads: int, head_dim: int):
++        super().__init__()
++        self.num_heads = num_heads
++        self.head_dim = head_dim
++        self.register_buffer("matrix", torch.zeros(num_heads, num_heads, dtype=torch.float16))
++        self.clip = ActClip()
++        self._eval_mode = False
++
++    def forward(self, attn: torch.Tensor):
++        if not self._eval_mode:
++            raise RuntimeError("HeadTransQuant used before restore_packed_eval_runtime()")
++        bsz, q_len = attn.shape[0], attn.shape[1]
++        x = attn.reshape(-1, self.num_heads, self.head_dim).to(torch.float16)
++        x = torch.matmul(self.matrix.T, x).reshape(bsz, q_len, self.num_heads * self.head_dim)
++        return lac_sym_quant(x, self.clip.clip_max, self.clip.clip_min)
++
++
++class QuantizedKV4Cache(Cache):
++    """KV cache that stores packed int4 K/V plus fp16 scale/zero per (token, head).
++
++    Values are quantized with the learned KV clip (the repo's packed FlashInfer cache
++    drops it, ``kv_cache.py:288``), so prefill attention and later decode steps see the
++    same int4 values the fake-quant model was calibrated with.
++    """
++
++    def __init__(self):
++        super().__init__()
++        self._key = []
++        self._value = []
++        self._seen_tokens = 0
++
++    def __len__(self):
++        return len(self._key)
++
++    @property
++    def seen_tokens(self):
++        return self._seen_tokens
++
++    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
++        kmax, kmin, vmax, vmin = cache_kwargs["kv_clips"]
++        kq = asym_quantize_and_pack_i4(key_states, kmax, kmin, lac=True)
++        vq = asym_quantize_and_pack_i4(value_states, vmax, vmin, lac=True)
++        if layer_idx == 0:
++            self._seen_tokens += key_states.shape[-2]
++        if len(self._key) <= layer_idx:
++            self._key.append(list(kq))
++            self._value.append(list(vq))
++        else:
++            for store, new in ((self._key[layer_idx], kq), (self._value[layer_idx], vq)):
++                for idx in range(3):
++                    store[idx] = torch.cat([store[idx], new[idx]], dim=-2)
++        k = unpack_i4_and_asym_dequantize(*self._key[layer_idx], lac=True).to(key_states.dtype)
++        v = unpack_i4_and_asym_dequantize(*self._value[layer_idx], lac=True).to(value_states.dtype)
++        return k, v
++
++    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
++        if len(self._key) <= layer_idx:
++            return 0
++        return self._key[layer_idx][0].shape[-2]
++
++    def get_max_length(self) -> Optional[int]:
++        return None
++
++    def get_max_cache_shape(self) -> Optional[int]:
++        return None
++
++    def reorder_cache(self, beam_idx: torch.LongTensor):
++        for store in self._key + self._value:
++            for idx in range(3):
++                store[idx] = store[idx].index_select(0, beam_idx.to(store[idx].device))
++
++
++class FlatQuantQwen2DeployAttention(nn.Module):
++    def __init__(self, config: Qwen2Config, layer_idx: int):
++        super().__init__()
++        self.config = config
++        self.layer_idx = layer_idx
++        self.hidden_size = config.hidden_size
++        self.num_heads = config.num_attention_heads
++        # Same head_dim formula as flatquant/model_tools/qwen_utils.py.
++        self.head_dim = config.hidden_size // config.num_attention_heads
++        self.num_key_value_heads = config.num_key_value_heads
++        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
++        q_out = self.num_heads * self.head_dim
++        kv_out = self.num_key_value_heads * self.head_dim
++        self.q_proj = Linear4bitFQ(self.hidden_size, q_out, bias=True)
++        self.k_proj = Linear4bitFQ(self.hidden_size, kv_out, bias=True)
++        self.v_proj = Linear4bitFQ(self.hidden_size, kv_out, bias=True)
++        self.o_proj = Linear4bitFQ(q_out, self.hidden_size, bias=False)
++        self.qkv_trans = OnlineKronQuant(self.hidden_size, ("q_proj", "k_proj", "v_proj"))
++        self.o_trans = HeadTransQuant(self.num_heads, self.head_dim)
++        self.register_buffer("trans_matrix_k", torch.zeros(self.head_dim, self.head_dim, dtype=torch.float16))
++        self.register_buffer("trans_matrix_k_inv_t", torch.zeros(self.head_dim, self.head_dim, dtype=torch.float16))
++        self.k_cache_quant = ActClip()
++        self.v_cache_quant = ActClip()
++        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
++        self._kv_clips = None
++        self._eval_mode = False
++
++    def freeze_kv_clips(self):
++        dev = self.trans_matrix_k.device
++        sig = lambda t: torch.sigmoid(t.float().reshape(())).to(device=dev, dtype=torch.float16)
++        self._kv_clips = (
++            sig(self.k_cache_quant.clip_factor_a_max), sig(self.k_cache_quant.clip_factor_a_min),
++            sig(self.v_cache_quant.clip_factor_a_max), sig(self.v_cache_quant.clip_factor_a_min),
++        )
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_value: Optional[Cache] = None,
++        output_attentions: bool = False,
++        use_cache: bool = False,
++        cache_position: Optional[torch.LongTensor] = None,
++        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
++        **kwargs,
++    ):
++        if not self._eval_mode or self._kv_clips is None:
++            raise RuntimeError("attention used before restore_packed_eval_runtime()")
++        bsz, q_len, _ = hidden_states.size()
++        xq, xk, xv = self.qkv_trans(hidden_states)
++        query_states = self.q_proj(xq)
++        key_states = self.k_proj(xk)
++        value_states = self.v_proj(xv)  # already in P_v space (folded into weight and bias)
++
++        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
++        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
++        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
++
++        if position_embeddings is None:
++            cos, sin = self.rotary_emb(value_states, position_ids)
++        else:
++            cos, sin = position_embeddings
++        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++        # P_h after RoPE: q P_h^-T, k P_h (qk^T unchanged); k is then quantized.
++        query_states = torch.matmul(query_states, self.trans_matrix_k_inv_t)
++        key_states = torch.matmul(key_states, self.trans_matrix_k)
++
++        if isinstance(past_key_value, QuantizedKV4Cache):
++            key_states, value_states = past_key_value.update(
++                key_states, value_states, self.layer_idx, {"kv_clips": self._kv_clips}
++            )
++        else:
++            if past_key_value is not None:
++                raise TypeError(f"expected QuantizedKV4Cache, got {type(past_key_value).__name__}")
++            kmax, kmin, vmax, vmin = self._kv_clips
++            key_states = unpack_i4_and_asym_dequantize(
++                *asym_quantize_and_pack_i4(key_states, kmax, kmin, lac=True), lac=True
++            ).to(query_states.dtype)
++            value_states = unpack_i4_and_asym_dequantize(
++                *asym_quantize_and_pack_i4(value_states, vmax, vmin, lac=True), lac=True
++            ).to(query_states.dtype)
++
++        key_states = repeat_kv(key_states, self.num_key_value_groups)
++        value_states = repeat_kv(value_states, self.num_key_value_groups)
++        causal_mask = attention_mask
++        if attention_mask is not None:
++            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
++            query_states = query_states.contiguous()
++            key_states = key_states.contiguous()
++            value_states = value_states.contiguous()
++        is_causal = causal_mask is None and q_len > 1
++        attn_output = F.scaled_dot_product_attention(
++            query_states, key_states, value_states, attn_mask=causal_mask, dropout_p=0.0, is_causal=is_causal,
++        )
++        attn_output = attn_output.transpose(1, 2).contiguous()  # (bsz, q_len, heads, head_dim)
++        attn_output = self.o_proj(self.o_trans(attn_output))
++        return attn_output, None, past_key_value
++
++
++class FlatQuantQwen2DeployMLP(nn.Module):
++    def __init__(self, config: Qwen2Config):
++        super().__init__()
++        self.hidden_size = config.hidden_size
++        self.intermediate_size = config.intermediate_size
++        from transformers.activations import ACT2FN
++        self.act_fn = ACT2FN[config.hidden_act]
++        self.up_gate_trans = OnlineKronQuant(self.hidden_size, ("up_proj", "gate_proj"))
++        self.down_trans = OnlineKronQuant(self.intermediate_size, ("down_proj",))
++        self.up_proj = Linear4bitFQ(self.hidden_size, self.intermediate_size, bias=False)
++        self.gate_proj = Linear4bitFQ(self.hidden_size, self.intermediate_size, bias=False)
++        self.down_proj = Linear4bitFQ(self.intermediate_size, self.hidden_size, bias=False)
++
++    def forward(self, x):
++        x_up, x_gate = self.up_gate_trans(x)
++        hidden = self.act_fn(self.gate_proj(x_gate)) * self.up_proj(x_up)
++        (x_down,) = self.down_trans(hidden)
++        return self.down_proj(x_down)
++
++
++# Saved (fake-quant module) names -> deploy module names.
++_RENAMES = (
++    ("self_attn.ln_trans.matrix_left", "self_attn.qkv_trans.left_matrix"),
++    ("self_attn.ln_trans.matrix_right", "self_attn.qkv_trans.right_matrix"),
++    ("self_attn.q_proj.act_quantizer.", "self_attn.qkv_trans.clips.q_proj."),
++    ("self_attn.k_proj.act_quantizer.", "self_attn.qkv_trans.clips.k_proj."),
++    ("self_attn.v_proj.act_quantizer.", "self_attn.qkv_trans.clips.v_proj."),
++    ("self_attn.o_proj.act_quantizer.", "self_attn.o_trans.clip."),
++    ("self_attn.o_trans.matrix", "self_attn.o_trans.matrix"),
++    ("self_attn.kcache_trans.matrix_inv_t", "self_attn.trans_matrix_k_inv_t"),
++    ("self_attn.kcache_trans.matrix", "self_attn.trans_matrix_k"),
++    ("self_attn.k_cache_quantizer.", "self_attn.k_cache_quant."),
++    ("self_attn.v_cache_quantizer.", "self_attn.v_cache_quant."),
++    ("mlp.up_gate_trans.matrix_left", "mlp.up_gate_trans.left_matrix"),
++    ("mlp.up_gate_trans.matrix_right", "mlp.up_gate_trans.right_matrix"),
++    ("mlp.up_proj.act_quantizer.", "mlp.up_gate_trans.clips.up_proj."),
++    ("mlp.gate_proj.act_quantizer.", "mlp.up_gate_trans.clips.gate_proj."),
++    ("mlp.down_trans.matrix_left", "mlp.down_trans.left_matrix"),
++    ("mlp.down_trans.matrix_right", "mlp.down_trans.right_matrix"),
++    ("mlp.down_proj.act_quantizer.", "mlp.down_trans.clips.down_proj."),
++    (".linear.weight", ".weight"),
++    (".linear.bias", ".bias"),
++)
++
++
++def rename_saved_key(key: str) -> Optional[str]:
++    """Map one saved tensor name to this module tree; None for tensors the runtime ignores."""
++    if key.startswith("quantizer."):
++        layer, _, field = key[len("quantizer."):].rpartition(".")
++        if field != "scale":
++            return None  # zero / maxq: symmetric RTN, scale is all the kernel needs
++        return layer[: -len(".linear")] + ".weight_scales" if layer.endswith(".linear") else None
++    for old, new in _RENAMES:
++        if old in key:
++            return key.replace(old, new)
++    return key
++
++
++def cast_linear4bit_kernel_dtypes(model: nn.Module) -> int:
++    """CUTLASS int4 GEMM / sym_dequant assert float16 scales: cast after pack and after load."""
++    count = 0
++    for module in model.modules():
++        if isinstance(module, deploy.nn.Linear4bit):
++            if module.weight.dtype != torch.uint8:
++                raise TypeError(f"Linear4bit weight must be packed uint8, got {module.weight.dtype}")
++            module.weight_scales.data = module.weight_scales.data.to(KERNEL_SCALE_DTYPE).contiguous()
++            if module.bias is not None:
++                module.bias.data = module.bias.data.to(torch.float16)
++            count += 1
++    return count
++
++
++def _probe_kron_backend(left, right, tokens=64):
++    """Compare the Triton kron+quant kernel with the torch path on this transform's shape."""
++    from deploy.functional.online_trans import kronecker_matmul
++    gen = torch.Generator(device="cpu").manual_seed(1234)
++    x = (torch.randn(1, tokens, left.shape[0] * right.shape[0], generator=gen) * 2).to(left.device, torch.float16)
++    report = {"shape": [int(left.shape[0]), int(right.shape[0])]}
++    try:
++        ker = kronecker_matmul(x, [left, right], 4.0, 4.0)
++        ref = lac_sym_quant(torch_kron(x, left, right), 4.0, 4.0)
++        torch.cuda.synchronize()
++        qk = unpack_i4(ker.quantized_x.reshape(tokens, -1)).float()
++        qr = unpack_i4(ref.quantized_x.reshape(tokens, -1)).float()
++        dk = qk * ker.scales_x.reshape(-1, 1).float()
++        dr = qr * ref.scales_x.reshape(-1, 1).float()
++        report["code_mismatch"] = float((qk != qr).float().mean())
++        report["rel_diff"] = float((dk - dr).norm() / dr.norm().clamp(min=1e-12))
++        report["ok"] = bool(report["code_mismatch"] < 0.01 and report["rel_diff"] < 0.05)
++    except Exception as exc:  # compile errors, shape asserts
++        report["ok"] = False
++        report["error"] = repr(exc)[:300]
++    return report
++
++
++def restore_packed_eval_runtime(model: nn.Module, kron_backend: str = "auto", dequant_backend: str = "torch") -> dict:
++    """Set the eval-only runtime state that state_dict does not carry.
++
++    * ``_eval_mode = True`` / ``use_diag = False`` on every transform (the diag scales
++      are fused into the norms and up_proj rows, never applied again);
++    * clip logits -> Python floats (the Triton kernels take scalars), KV clips -> sigmoid;
++    * picks the Kronecker backend per factor shape: the Triton kron_matmul kernel where a
++      probe agrees with the torch reference, torch elsewhere.
++    Never re-fuses or re-quantizes packed weights.
++    """
++    if kron_backend not in KRON_BACKENDS:
++        raise ValueError(f"kron_backend must be one of {KRON_BACKENDS}")
++    if dequant_backend not in DEQUANT_BACKENDS:
++        raise ValueError(f"dequant_backend must be one of {DEQUANT_BACKENDS}")
++    probes = {}
++    for module in model.modules():
++        if isinstance(module, ActClip):
++            module.freeze()
++        if isinstance(module, Linear4bitFQ):
++            module.dequant_backend = dequant_backend
++        if isinstance(module, (OnlineKronQuant, HeadTransQuant, FlatQuantQwen2DeployAttention)):
++            module._eval_mode = True
++        if isinstance(module, OnlineKronQuant):
++            module.use_diag = False
++            shape = (module.left_matrix.shape[0], module.right_matrix.shape[0])
++            if kron_backend == "torch" or not module.left_matrix.is_cuda:
++                module.backend = "torch"
++                continue
++            if shape not in probes:
++                probes[shape] = _probe_kron_backend(module.left_matrix, module.right_matrix)
++            if kron_backend == "triton" or probes[shape]["ok"]:
++                module.backend = "triton"
++            else:
++                module.backend = "torch"
++        if isinstance(module, FlatQuantQwen2DeployAttention):
++            module.freeze_kv_clips()
++    backends = sorted({m.backend for m in model.modules() if isinstance(m, OnlineKronQuant)})
++    report = {
++        "kron_backend_requested": kron_backend,
++        "kron_backends_used": backends,
++        "kron_probes": {f"{a}x{b}": p for (a, b), p in probes.items()},
++        "o_proj_head_transform": "torch matmul (block_matmul needs a power-of-two head count)",
++        "linear_kernel": "deploy._CUDA CUTLASS int4 GEMM (Linear4bit)",
++        "dequant": ("fp32 torch scale of the exact int32 accumulator" if dequant_backend == "torch"
++                    else "deploy.sym_dequant (truncates the accumulator to a multiple of 10)"),
++        "attention": "torch scaled_dot_product_attention over int4-dequantized K/V",
++    }
++    model.flatquant_runtime = report
++    return report
++
++
++class FlatQuantQwen2ForCausalLM(Qwen2ForCausalLM, GenerationMixin):
++    """Qwen2ForCausalLM with packed int4 FlatQuant decoder layers (fp16 everywhere else)."""
++
++    def __init__(self, config: Qwen2Config):
++        config._attn_implementation = "sdpa"
++        super().__init__(config)
++        for layer_idx, layer in enumerate(self.model.layers):
++            layer.self_attn = FlatQuantQwen2DeployAttention(config, layer_idx)
++            layer.mlp = FlatQuantQwen2DeployMLP(config)
++        self.flatquant_runtime = {}
++
++    def reparameterize(self, *args, **kwargs):
++        raise RuntimeError("weights are already folded and packed; reparameterizing again would apply the transforms twice")
++
++    def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
++                inputs_embeds=None, labels=None, use_cache=None, **kwargs):
++        use_cache = self.config.use_cache if use_cache is None else use_cache
++        if use_cache:
++            if past_key_values is None or (
++                isinstance(past_key_values, DynamicCache) and past_key_values.get_seq_length() == 0
++            ):
++                past_key_values = QuantizedKV4Cache()
++            elif not isinstance(past_key_values, QuantizedKV4Cache):
++                raise TypeError("FlatQuantQwen2ForCausalLM keeps its own int4 KV cache (QuantizedKV4Cache)")
++        else:
++            past_key_values = None
++        return super().forward(
++            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
++            past_key_values=past_key_values, inputs_embeds=inputs_embeds, labels=labels,
++            use_cache=use_cache, **kwargs,
++        )
++
++    @classmethod
++    def from_pretrained(cls, pretrained_model_name, device="cuda", kron_backend=None, dequant_backend=None, **kwargs):
++        """Load a local packed artifact directory (never the Hub)."""
++        from safetensors import safe_open
++        from transformers.modeling_utils import no_init_weights
++
++        path = str(pretrained_model_name)
++        if not os.path.isdir(path):
++            raise FileNotFoundError(f"packed FlatQuant artifact directory not found: {path}")
++        qcfg_path = os.path.join(path, QUANT_CONFIG_NAME)
++        with open(qcfg_path) as handle:
++            qcfg = json.load(handle)
++        if qcfg.get("deploy_format") != PACKED_FORMAT:
++            raise ValueError(f"{qcfg_path} is not a {PACKED_FORMAT} artifact")
++        if kron_backend is None:
++            kron_backend = os.environ.get("FLATQUANT_KRON_BACKEND", "auto")
++        if dequant_backend is None:
++            dequant_backend = os.environ.get("FLATQUANT_DEQUANT_BACKEND", "torch")
++
++        config = Qwen2Config.from_pretrained(path, local_files_only=True)
++        dtype_old = torch.get_default_dtype()
++        torch.set_default_dtype(torch.float16)
++        try:
++            with no_init_weights():
++                model = cls(config)
++        finally:
++            torch.set_default_dtype(dtype_old)
++
++        index_path = os.path.join(path, "model.safetensors.index.json")
++        if os.path.isfile(index_path):
++            with open(index_path) as handle:
++                files = sorted(set(json.load(handle)["weight_map"].values()))
++        else:
++            files = ["model.safetensors"]
++        state = {}
++        for name in files:
++            with safe_open(os.path.join(path, name), framework="pt", device="cpu") as handle:
++                for key in handle.keys():
++                    new_key = rename_saved_key(key)
++                    if new_key is not None:
++                        state[new_key] = handle.get_tensor(key)
++        missing, unexpected = model.load_state_dict(state, strict=False)
++        allowed_missing = {"lm_head.weight"} if config.tie_word_embeddings else set()
++        missing = [k for k in missing if k not in allowed_missing]
++        if missing or unexpected:
++            raise RuntimeError(f"packed artifact does not match the Qwen2 deploy model: missing={missing[:10]} unexpected={unexpected[:10]}")
++        if config.tie_word_embeddings:
++            # named_parameters() drops the tied head on save; tie it back to the embedding.
++            model.tie_weights()
++            if model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr():
++                raise RuntimeError("lm_head is not tied to embed_tokens after load")
++        model = model.to(device=device, dtype=torch.float16)
++        n_packed = cast_linear4bit_kernel_dtypes(model)
++        expected = 7 * config.num_hidden_layers
++        if n_packed != expected:
++            raise RuntimeError(f"expected {expected} Linear4bit modules, found {n_packed}")
++        restore_packed_eval_runtime(model, kron_backend=kron_backend, dequant_backend=dequant_backend)
++        if hasattr(model, "generation_config") and model.generation_config is not None:
++            model.generation_config.cache_implementation = None
++        model.eval()
++        return model
+diff --git a/flatquant/data_utils.py b/flatquant/data_utils.py
+index 5ddc680..c67ba37 100644
+--- a/flatquant/data_utils.py
++++ b/flatquant/data_utils.py
+@@ -9,7 +9,38 @@ class TokenizerWrapper:
+         self.input_ids = input_ids
+ 
+ 
++def _wikitext2_parquet_texts(split):
++    """Rows of a local wikitext-2-raw-v1 parquet split (column ``text``), or None.
++
++    Set ``FLATQUANT_WIKITEXT2_DIR`` to a directory holding ``{train,test,validation}.parquet``
++    so calibration never touches the Hub (jobs may run with HF_HUB_OFFLINE=1).
++    """
++    root = os.environ.get("FLATQUANT_WIKITEXT2_DIR")
++    if not root:
++        return None
++    path = os.path.join(root, f"{split}.parquet")
++    if not os.path.isfile(path):
++        raise FileNotFoundError(f"FLATQUANT_WIKITEXT2_DIR is set but {path} is missing")
++    import pyarrow.parquet as pq
++    return pq.read_table(path, columns=["text"]).column("text").to_pylist()
++
++
+ def get_wikitext2(nsamples, seqlen, tokenizer, eval_mode=False):
++    local_split = _wikitext2_parquet_texts('test' if eval_mode else 'train')
++    if local_split is not None:
++        if eval_mode:
++            return tokenizer("\n\n".join(local_split), return_tensors='pt')
++        # Same as the datasets path below: the row filter keeps every row, then strip.
++        trainenc = tokenizer("\n\n".join(text.strip() for text in local_split), return_tensors='pt')
++        trainloader = []
++        for _ in range(nsamples):
++            i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
++            j = i + seqlen
++            inp = trainenc.input_ids[:, i:j]
++            tar = inp.clone()
++            tar[:, :-1] = -100
++            trainloader.append((inp, tar))
++        return trainloader
+     if eval_mode:
+         testdata = datasets.load_dataset('./datasets/wikitext', 'wikitext-2-raw-v1', split='test')
+         testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+diff --git a/flatquant/flat_utils.py b/flatquant/flat_utils.py
+index a5cb973..167db0f 100644
+--- a/flatquant/flat_utils.py
++++ b/flatquant/flat_utils.py
+@@ -94,7 +94,18 @@ def load_flat_matrices(args, model, path=None):
+ 
+ 
+ ## save weight in uint8 with safetensors
+-def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True):
++def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True,
++                                            save_dir=None, exclude=None, scale_dtype=None,
++                                            config_extra=None):
++    """Pack every quantized linear to int4 and write safetensors.
++
++    Optional (defaults keep the original behaviour):
++      save_dir: write here instead of args.exp_dir.
++      exclude: callable(name) -> bool; matching parameters are not written (folded or
++               stale tensors such as InvSingleTransMatrix.linear under --direct_inv).
++      scale_dtype: dtype of the saved quantizer scales (the int4 CUDA kernels want fp16).
++      config_extra: dict merged into quantization_config.json.
++    """
+ 
+     from deploy.functional import pack_i4
+     import json
+@@ -106,6 +117,8 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
+     max_shard_size = "5GB"
+     
+     for name, param in model.named_parameters():
++        if exclude is not None and exclude(name):
++            continue
+         if name.endswith('.weight') or name.endswith('.bias'):
+             layer_name = name.rsplit('.', 1)[0]
+         else:
+@@ -135,7 +148,8 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
+             state_dict[name] = param.to(torch.half).contiguous()
+     
+     for layer_name, quantizer in quantizers.items():
+-        state_dict[f"quantizer.{layer_name}.scale"] = quantizer.scale.contiguous()
++        scale = quantizer.scale if scale_dtype is None else quantizer.scale.to(scale_dtype)
++        state_dict[f"quantizer.{layer_name}.scale"] = scale.contiguous()
+ 
+         if hasattr(quantizer, 'zero') and quantizer.zero is not None:
+             state_dict[f"quantizer.{layer_name}.zero"] = quantizer.zero.contiguous()
+@@ -149,7 +163,7 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
+         filename_pattern = "model{suffix}.safetensors"
+     )
+ 
+-    save_dir = args.exp_dir
++    save_dir = args.exp_dir if save_dir is None else save_dir
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     metadata['quantization_config'] = json.dumps({
+@@ -193,12 +207,15 @@ def save_quantized_weights_with_safetensors(args, model, quantizers, sym = True)
+     # Save config
+     config_path = os.path.join(save_dir, "quantization_config.json")
+     with open(config_path, 'w') as f:
+-        json.dump({
++        quant_config = {
+             'w_bits': args.w_bits,
+             'model_name': args.model,
+             'symmetric': sym,
+             'format': 'packed_int4',
+             'sharded': state_dict_split.is_sharded
+-        }, f, indent=2)
++        }
++        if config_extra:
++            quant_config.update(config_extra)
++        json.dump(quant_config, f, indent=2)
+ 
+     logging.info("saved weights at {}".format(save_dir))
+diff --git a/flatquant/qwen2_packed.py b/flatquant/qwen2_packed.py
+new file mode 100644
+index 0000000..6f4e585
+--- /dev/null
++++ b/flatquant/qwen2_packed.py
+@@ -0,0 +1,202 @@
++"""Qwen2 glue for the packed int4 export (``--quantized_save``) and its deploy reload.
++
++The calibration itself is the repo's own Qwen2 path (``model_utils.get_qwen2`` ->
++``qwen_utils.apply_flatquant_to_qwen`` -> ``train_utils.cali_flat_quant`` ->
++``flat_utils.reparameterize_model`` -> ``gptq_utils.rtn_fwrd``). This module only
++holds the Qwen2.5 script settings, the RTN/export filters, and the packed export
++that ``deploy/transformers/modeling_qwen2.py`` reloads.
++"""
++import argparse
++import json
++import os
++import re
++
++import torch
++
++PACKED_FORMAT = "flatquant_qwen2_packed_int4"
++
++# The 7 decoder projections, as named inside a decoder layer by find_qlayers.
++PROJECTION_RE = re.compile(r"^(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)\.linear$")
++
++# Tensors the packed runtime never reads: folded inverses / diag scales / LWC logits,
++# P_v (folded into v_proj and o_proj), and the stale InvSingleTransMatrix.linear
++# weights that --direct_inv keeps next to the frozen matrices.
++EXPORT_EXCLUDE_RE = re.compile(
++    r"(trans\.linear(_left|_right)?\.weight$"
++    r"|trans\.matrix_(left|right)_inv$"
++    r"|o_trans\.matrix_inv_t$"
++    r"|vcache_trans\."
++    r"|trans\.diag_scale$"
++    r"|clip_factor_w_(max|min)$)"
++)
++
++
++def qwen25_w4a4kv4_args(exp_dir, nsamples=128, epochs=15, cali_bsz=4, model_name="", seed=0):
++    """Flags of scripts/qwen-2.5-instruct/*/w4a4kv4.sh (D8), as parser_gen would set them."""
++    return argparse.Namespace(
++        model=model_name, seed=seed, hf_token=None,
++        a_bits=4, a_groupsize=-1, a_asym=False,
++        w_bits=4, w_groupsize=-1, w_asym=False, gptq=False, gptq_mse=False, percdamp=.01, act_order=False,
++        epochs=epochs, cali_dataset="wikitext2", nsamples=nsamples, cali_bsz=cali_bsz, flat_lr=5e-3,
++        cali_trans=True, add_diag=True, lwc=True, lac=True,
++        resume=False, save_matrix=True, reload_matrix=False, matrix_path=None,
++        diag_init="sq_style", diag_alpha=0.3, warmup=False, deactive_amp=True, direct_inv=True,
++        separate_vtrans=False,
++        q_bits=16, q_asym=False, q_groupsize=-1,
++        k_bits=4, k_asym=True, k_groupsize=128,
++        v_bits=4, v_asym=True, v_groupsize=128,
++        output_dir=exp_dir, exp_name="exp", exp_dir=exp_dir, model_name=os.path.basename(str(model_name)),
++        quantize=True, quantized_save=True, distribute_model=False, lm_eval=False,
++    )
++
++
++def epochs_for_steps(target_steps, nsamples, cali_bsz=4):
++    """Epochs giving at least ``target_steps`` optimizer steps per layer (cali_flat_quant does
++    ``nsamples // cali_bsz`` steps per epoch). Smoke only: on Qwen2.5 the k_proj bias (absmax
++    ~316 in layer 0) dominates the per-token KV4 key range, and the learned P_h / K clip need
++    ~200+ optimizer steps to tame it (spec D10). Steps matter, not data volume."""
++    per_epoch = max(1, nsamples // max(1, min(cali_bsz, nsamples)))
++    return max(1, -(-int(target_steps) // per_epoch))
++
++
++def is_packed_projection(name):
++    return PROJECTION_RE.match(name) is not None
++
++
++def export_exclude(name):
++    return EXPORT_EXCLUDE_RE.search(name) is not None
++
++
++def check_quantizers(quantizers, num_layers):
++    names = sorted(quantizers)
++    bad = [n for n in names if "trans" in n]
++    if bad:
++        raise RuntimeError(f"transform linears were RTN-quantized: {bad[:5]}")
++    if len(names) != 7 * num_layers:
++        raise RuntimeError(f"expected {7 * num_layers} quantized projections, got {len(names)}")
++
++
++def quant_config_for(args, model, extra=None):
++    cfg = model.config
++    head_dim = cfg.hidden_size // cfg.num_attention_heads
++    from flatquant.function_utils import get_decompose_dim
++    out = {
++        "quant_method": "flatquant",
++        "method_name": "FlatQuant",
++        "deploy_format": PACKED_FORMAT,
++        "format": "packed_int4",
++        "w_bits": args.w_bits,
++        "a_bits": args.a_bits,
++        "k_bits": args.k_bits,
++        "v_bits": args.v_bits,
++        "q_bits": args.q_bits,
++        "weight_quant": "per_channel",
++        "w_sym": not args.w_asym,
++        "weight_rounding": "rtn",
++        "weight_dtype": "uint8 (two signed int4 per byte, pack_i4)",
++        "weight_scale_dtype": "float16",
++        "act_quant": "per_token",
++        "a_sym": not args.a_asym,
++        "act_dynamic": True,
++        "learned_act_clipping": bool(args.lac),
++        "learned_weight_clipping": bool(args.lwc),
++        "kv_quant": "per_token_per_head",
++        "kv_asym": bool(args.k_asym and args.v_asym),
++        "kv_group_size": head_dim,
++        "kv_learned_clipping": bool(args.lac),
++        "online_transforms": True,
++        "trans": "matmul",
++        "fuseLN": False,
++        "online_trans": ["qkv_proj", "qk", "o_proj", "up_gate_proj", "down_proj"],
++        "kronecker_factors": {
++            "hidden": list(get_decompose_dim(cfg.hidden_size)),
++            "intermediate": list(get_decompose_dim(cfg.intermediate_size)),
++        },
++        "o_proj_head_transform": [cfg.num_attention_heads, cfg.num_attention_heads],
++        "folded_offline": [
++            "diag scales -> input_layernorm / post_attention_layernorm / up_proj rows",
++            "(P1 kron P2)^-T and LWC -> q/k/v/gate/up/down weights",
++            "P_v -> v_proj weight and bias",
++            "(P_o kron P_v)^-T -> o_proj weight",
++        ],
++        "kept_float16": ["embed_tokens (lm_head tied, not stored)", "norms", "q/k/v biases", "transform matrices"],
++        "calibration": {
++            "dataset": "wikitext2 train (local parquet)",
++            "nsamples": args.nsamples,
++            "seqlen": None,
++            "epochs": args.epochs,
++            "cali_bsz": args.cali_bsz,
++            "flat_lr": args.flat_lr,
++            "flags": ["--lwc", "--lac", "--cali_trans", "--add_diag", "--deactive_amp", "--direct_inv"],
++            "seed": args.seed,
++        },
++        "publish_exclude": ["flat_parameters.pth", "flat_matrices.pth"],
++        "inference_adapter": "quant_agent_inference_adapter.py",
++        "reload_class": "deploy.transformers.modeling_qwen2.FlatQuantQwen2ForCausalLM",
++    }
++    if extra:
++        out.update(extra)
++    return out
++
++
++def export_qwen2_packed(args, model, quantizers, tokenizer, out_dir, quant_config):
++    """--quantized_save for Qwen2: packed int4 safetensors + HF config/tokenizer files."""
++    from flatquant import flat_utils
++    from safetensors import safe_open
++
++    os.makedirs(out_dir, exist_ok=True)
++    check_quantizers(quantizers, model.config.num_hidden_layers)
++    flat_utils.save_quantized_weights_with_safetensors(
++        args, model, quantizers, sym=not args.w_asym,
++        save_dir=out_dir, exclude=export_exclude, scale_dtype=torch.float16,
++        config_extra=quant_config,
++    )
++    config = model.config.__class__.from_dict(model.config.to_dict())
++    config.torch_dtype = torch.float16
++    config.architectures = ["Qwen2ForCausalLM"]
++    if hasattr(config, "quantization_config"):
++        delattr(config, "quantization_config")
++    config.save_pretrained(out_dir)
++    if getattr(model, "generation_config", None) is not None:
++        model.generation_config.save_pretrained(out_dir)
++    tokenizer.save_pretrained(out_dir)
++
++    # Sanity: only the 7 projections are int4; no transform linears were exported.
++    files = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
++    packed, keys = [], []
++    for name in files:
++        with safe_open(os.path.join(out_dir, name), framework="pt") as handle:
++            for key in handle.keys():
++                keys.append(key)
++                if handle.get_slice(key).get_dtype() in ("U8", "I8"):
++                    packed.append(key)
++    stale = [k for k in keys if export_exclude(k)]
++    if stale:
++        raise RuntimeError(f"export kept tensors the runtime never reads: {stale[:5]}")
++    expected = 7 * model.config.num_hidden_layers
++    if len(packed) != expected or any(".linear.weight" not in k for k in packed):
++        raise RuntimeError(f"expected {expected} packed projection weights, got {len(packed)}: {packed[:5]}")
++    return {"files": sorted(files), "tensors": len(keys), "packed_int4": len(packed)}
++
++
++def update_quant_config(out_dir, updates):
++    path = os.path.join(out_dir, "quantization_config.json")
++    with open(path) as handle:
++        cfg = json.load(handle)
++    cfg.update(updates)
++    with open(path, "w") as handle:
++        json.dump(cfg, handle, indent=2)
++
++
++@torch.no_grad()
++def logits_of(model, input_ids):
++    device = model.get_input_embeddings().weight.device
++    out = model(input_ids=input_ids.to(device), use_cache=False)
++    return out.logits.float().cpu()
++
++
++def compare_logits(ref, test):
++    finite = bool(torch.isfinite(test).all())
++    rel = float((test - ref).norm() / ref.norm().clamp(min=1e-12)) if finite else None
++    top1 = float((test.argmax(-1) == ref.argmax(-1)).float().mean()) if finite else None
++    return {"finite": finite, "rel_logit_error": rel, "top1_agreement": top1}
+diff --git a/gptq_utils.py b/gptq_utils.py
+index 714849f..bd97cc2 100644
+--- a/gptq_utils.py
++++ b/gptq_utils.py
+@@ -270,10 +270,15 @@ def gptq_fwrd(model, dataloader, dev, args):
+ 
+ 
+ @torch.no_grad()
+-def rtn_fwrd(model, dev, args):
++def rtn_fwrd(model, dev, args, name_filter=None):
+     '''
+-    From GPTQ repo 
++    From GPTQ repo
+     TODO: Make this function general to support both OPT and LLaMA models
++
++    name_filter: optional callable(name) -> bool on the layer-relative linear name
++    (e.g. "self_attn.q_proj.linear"). Linears it rejects are left untouched and get no
++    quantizer. With --direct_inv the InvSingleTransMatrix.linear modules are nn.Linear
++    too; they are not used at runtime and must not be quantized or exported as int4.
+     '''
+     assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
+     layers = model.model.layers
+@@ -292,6 +297,8 @@ def rtn_fwrd(model, dev, args):
+             if 'lm_head' in name:
+                 layer_weight_bits = 16
+                 continue
++            if name_filter is not None and not name_filter(name):
++                continue
+ 
+             quantizer = WeightQuantizer()
+             quantizer.configure(
+diff --git a/quant_agent_inference_adapter.py b/quant_agent_inference_adapter.py
+new file mode 100644
+index 0000000..84293da
+--- /dev/null
++++ b/quant_agent_inference_adapter.py
+@@ -0,0 +1,61 @@
++"""Reload a packed int4 FlatQuant Qwen2 artifact (W4A4KV4) from its saved directory.
++
++The artifact (flat_utils.save_quantized_weights_with_safetensors via
++flatquant/qwen2_packed.py) holds uint8-packed int4 weights for the 7 decoder
++projections, fp16 per-channel scales, fp16 norms (diag scales fused), q/k/v biases
++(v bias already in P_v space), the online transform matrices and the learned
++activation / KV clip logits. lm_head is tied to embed_tokens and not stored.
++
++deploy.transformers.modeling_qwen2.FlatQuantQwen2ForCausalLM rebuilds the model with
++deploy.nn.Linear4bit (CUTLASS int4 GEMM; the int32 accumulator is scaled in fp32
++torch because deploy.sym_dequant truncates it to a multiple of 10), online Kronecker transforms (Triton
++kron_matmul where a load-time probe agrees with torch, torch otherwise), P_h after
++RoPE, a torch P_o^T head transform, and an int4 KV cache. The loader casts kernel
++scales to float16, restores the eval-only runtime flags (_eval_mode, use_diag=False),
++re-ties lm_head, and never re-fuses the packed weights.
++"""
++import os
++import sys
++
++QUANT_AGENT_ADAPTER_API = 1
++
++
++def _ensure_method_repo_on_path():
++    here = os.path.dirname(os.path.abspath(__file__))
++    for root in (os.environ.get("QUANT_AGENT_METHOD_REPO"), here):
++        if root and os.path.isdir(os.path.join(root, "deploy")) and root not in sys.path:
++            sys.path.insert(0, root)
++
++
++def load_model_and_tokenizer(model_path, model_id=None, dtype="float16", device="cuda", trust_remote_code=False):
++    _ensure_method_repo_on_path()
++    import torch
++    from transformers import AutoTokenizer
++
++    from deploy.transformers.modeling_qwen2 import (
++        FlatQuantQwen2ForCausalLM,
++        cast_linear4bit_kernel_dtypes,
++        restore_packed_eval_runtime,
++    )
++
++    if device != "cuda" or not torch.cuda.is_available():
++        raise RuntimeError("the packed int4 FlatQuant model needs CUDA (deploy._CUDA int4 GEMM)")
++    if dtype not in ("float16", "auto"):
++        print(f"[flatquant adapter] dtype={dtype!r} requested; the int4 kernels run in float16", file=sys.stderr)
++
++    model = FlatQuantQwen2ForCausalLM.from_pretrained(model_path, device=device)
++    # from_pretrained already does both; repeating them is idempotent and keeps the
++    # contract visible: fp16 kernel scales after load, eval-only flags restored.
++    cast_linear4bit_kernel_dtypes(model)
++    report = restore_packed_eval_runtime(
++        model,
++        kron_backend=os.environ.get("FLATQUANT_KRON_BACKEND", "auto"),
++        dequant_backend=os.environ.get("FLATQUANT_DEQUANT_BACKEND", "torch"),
++    )
++    print(f"[flatquant adapter] runtime: {report}", file=sys.stderr)
++
++    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
++    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
++        tokenizer.pad_token = tokenizer.eos_token
++    model.eval()
++    return model, tokenizer

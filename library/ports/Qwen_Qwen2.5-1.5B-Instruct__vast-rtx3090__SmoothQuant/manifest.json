@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "method_id": "smoothquant-qwen25-15b-vastrtx3090",
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "base_commit": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
+  "patch_sha256": "85cf0dd72a378530abca651f592d5192b23d8972788e1a9007a30aab4507d8bd",
+  "rationale": "kernel_triton on top of the qwen2_llama_path winner (c47f3e78ceb1fa88, job 20261102T023700Z-61f441: PPL ratio 1.015, VRAM 4.68 vs 5.84 GB, but 10,077 vs 12,904 tok/s because the adapter dequantized int8 weights to fp16 and ran an fp16 matmul). Repo-side hunks (smooth.py, fake_quant.py, int8_export.py; D1, D4) are byte-identical to the winner, so calibration, alpha 0.85, int8 weights, fp16 per-channel weight_scale and the saved layout are unchanged and the artifact stays w8a8_int8-exportable. Only quant_agent_inference_adapter.py changes: each of the 196 W8A8 linears keeps its saved int8 [N,K] weight (K-major, the TN layout the GEMM reads; no fp16 copy) and runs (1) a Triton per-token absmax int8 activation quant kernel whose codes and scales are bit-identical to the repo quantize_activation_per_token_absmax in fp16 (looped two-pass variant for K=8960), then (2) a Triton int8 x int8 -> int32 tensor-core GEMM with a fused epilogue acc*act_scale[m]*weight_scale[n]+bias[n] -> fp16. The same kernel handles any M (decode M=1 uses a 16-row tile), so torch._int_mm M>16 limits do not apply; CPU or QUANT_AGENT_W8A8_REFERENCE=1 falls back to the fp16 dequant reference. SDPA attention is enforced. Triton scalars are passed as Python ints. Standalone RTX 3090 test at M=2048: per-layer linear time 1.18 ms vs 2.99 ms fp16 dense and 4.90 ms old adapter; output closer to exact W8A8 math than the old adapter.",
+  "evidence_files": [
+    "jobs/20261102T023700Z-61f441/benchmark.json",
+    "jobs/20261102T023700Z-61f441/diagnose.json",
+    "out/analysis/smoothquant-qwen25-15b-vastrtx3090/differences.json"
+  ],
+  "target_modules": [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+    "input_layernorm",
+    "post_attention_layernorm"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D4"
+  ]
+}

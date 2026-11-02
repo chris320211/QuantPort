@@ -31,6 +31,27 @@ GPU: NVIDIA A10G
 
 PPL ratio is against the same runtime's 16-bit model. vLLM reserves its KV cache up front, so its VRAM is not shown. SmoothQuant: export drift 0.9656 vs this board (≤ 1.02); vLLM 0.30.0, Transformers 4.46.3, 2026-10-28.
 
+## Qwen/Qwen2.5-1.5B-Instruct on vast-rtx3090
+GPU: NVIDIA GeForce RTX 3090
+
+| Model | GPU | Method | Paper | Repo | Port | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |
+| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| Qwen/Qwen2.5-1.5B-Instruct | vast-rtx3090 | SmoothQuant | [paper](https://arxiv.org/abs/2211.10438) | [repo](https://github.com/mit-han-lab/smoothquant) | [port](ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__SmoothQuant) | [hub](https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090) | [vLLM](https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090-vllm) | 1.0152 | 18435.8 | 4.682 |
+| Qwen/Qwen2.5-1.5B-Instruct | vast-rtx3090 | FlatQuant | [paper](https://arxiv.org/abs/2410.09426) | [repo](https://github.com/ruikangliu/FlatQuant) | [port](ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__FlatQuant) | [hub](https://huggingface.co/chris320211/flatquant-qwen25-15b-vastrtx3090) | no (`activation_bits_unsupported`) | 1.1396 | 11555.3 | 3.405 |
+
+**Best:** SmoothQuant (`smoothquant-qwen25-15b-vastrtx3090`).
+
+**vLLM** (GPU: NVIDIA GeForce RTX 3090)
+
+| Method | Runtime | Precision | PPL | PPL ratio | Prefill tok/s | Decode tok/s, batch 1 | Decode tok/s, batch 16 | VRAM GB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SmoothQuant | vLLM | [int8](https://huggingface.co/chris320211/smoothquant-qwen25-15b-vastrtx3090-vllm) | 9.7244 | 1.0151 | 41093.6 | 257.4 | 3673.7 | – |
+| SmoothQuant | vLLM | fp16 | 9.5795 | 1.0000 | 22704.4 | 202.8 | 2547.8 | – |
+| SmoothQuant | Transformers | int8 | 9.7248 | 1.0152 | 38091.7 | 25.4 | 344.8 | 4.68 |
+| SmoothQuant | Transformers | fp16 | 9.5791 | 1.0000 | 20885.2 | 50.9 | 738.4 | 5.84 |
+
+PPL ratio is against the same runtime's 16-bit model. vLLM reserves its KV cache up front, so its VRAM is not shown. SmoothQuant: export drift 0.9999 vs this board (≤ 1.02); vLLM 0.30.0, Transformers 4.46.3, 2026-11-02.
+
 ## google/gemma-2-2b-it on g5.2xlarge
 GPU: NVIDIA A10G
 

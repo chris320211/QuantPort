@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "method_id": "flatquant-qwen25-15b-vastrtx3090",
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "base_commit": "9d88ffcb7d2c6bda59fb5c44dad36adc101aadb1",
+  "patch_sha256": "546e0da5b220748c304e5b4be502744eaa645124c580f30b1188a7f9fd9e4c0e",
+  "rationale": "Repo Qwen2 pipeline entered directly (D1: get_qwen2/apply_flatquant_to_qwen), Qwen-2.5 script flags (D8), calibration from local wikitext2 parquet (data_utils FLATQUANT_WIKITEXT2_DIR). Smoke calibrates to 240 optimizer steps per layer (qwen2_packed.epochs_for_steps; D10: Qwen2.5 k_proj bias swamps per-token KV4 keys until P_h and the K clip train); full run keeps 15 epochs x 128 x 2048. After reparameterize_model (fold in fp32) RTN quantizes only the 7 decoder projections (rtn_fwrd name_filter), so InvSingleTransMatrix.linear gets no int4 copy. Packed export extends --quantized_save (save_quantized_weights_with_safetensors: save_dir, exclude of folded/stale tensors, fp16 scales) (D2). New deploy/transformers/modeling_qwen2.py mirrors modeling_llama.py for Qwen2: Linear4bit int4 GEMM for q/k/v (with biases, v bias in P_v space)/o/gate/up/down, online Kronecker transform + int4 quant (Triton kron_matmul where a load-time probe matches torch, else torch), P_h after RoPE, torch P_o^T over 12 heads instead of block_matmul (D3), int4 KV cache with the learned KV clip (D6), re-tied lm_head (D5), fp16 kernel scales cast after pack and load, eval flags restored, no re-fuse. The int32 accumulator is scaled in fp32 because deploy.sym_dequant truncates it to a multiple of 10 (quant.cu:83).",
+  "evidence_files": [
+    "out/analysis/flatquant-qwen25-15b-vastrtx3090/method.md",
+    "out/analysis/flatquant-qwen25-15b-vastrtx3090/differences.json",
+    "out/analysis/flatquant-qwen25-15b-vastrtx3090/repo_notes.md"
+  ],
+  "target_modules": [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D5"
+  ]
+}

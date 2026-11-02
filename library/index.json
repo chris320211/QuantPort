@@ -9,6 +9,13 @@
       "best_method": "SmoothQuant"
     },
     {
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "gpu_instance": "vast-rtx3090",
+      "gpu_name": "NVIDIA GeForce RTX 3090",
+      "n_methods": 2,
+      "best_method": "SmoothQuant"
+    },
+    {
       "model_id": "google/gemma-2-2b-it",
       "gpu_instance": "g5.2xlarge",
       "gpu_name": "NVIDIA A10G",

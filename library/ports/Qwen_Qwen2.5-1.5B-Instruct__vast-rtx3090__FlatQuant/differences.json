@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "slug": "flatquant-qwen25-15b-vastrtx3090",
+  "method_name": "FlatQuant",
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "model_type": "qwen2",
+  "mapping": [
+    {
+      "role": "norm weights (RMSNorm)",
+      "steps": [
+        "fuse per-channel scale"
+      ],
+      "modules": [
+        "input_layernorm",
+        "post_attention_layernorm"
+      ],
+      "status": "mapped",
+      "note": "Qwen2RMSNorm; qwen_utils fuses the qkv and up/gate scales into these"
+    },
+    {
+      "role": "attention input projections",
+      "steps": [
+        "Kronecker input transform",
+        "LWC",
+        "quantize W4",
+        "quantize A4"
+      ],
+      "modules": [
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj"
+      ],
+      "status": "mapped",
+      "note": "GQA: k/v 256 outputs; the shared ln_trans works on the 1536 input side only"
+    },
+    {
+      "role": "value/output pair",
+      "steps": [
+        "per-head P_v on v output",
+        "P_o kron P_v on o_proj input"
+      ],
+      "modules": [
+        "self_attn.v_proj",
+        "self_attn.o_proj"
+      ],
+      "status": "mapped",
+      "note": "2 KV heads x head_dim 128 for P_v; P_o over 12 query heads"
+    },
+    {
+      "role": "query/key head transform",
+      "steps": [
+        "online P_h after RoPE"
+      ],
+      "modules": [
+        "self_attn (q, k after RoPE)"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "MLP input projections",
+      "steps": [
+        "Kronecker input transform",
+        "LWC",
+        "quantize W4",
+        "quantize A4"
+      ],
+      "modules": [
+        "mlp.gate_proj",
+        "mlp.up_proj"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "MLP output projection",
+      "steps": [
+        "Kronecker input transform",
+        "LWC",
+        "quantize W4",
+        "quantize A4"
+      ],
+      "modules": [
+        "mlp.down_proj"
+      ],
+      "status": "mapped",
+      "note": "8960 inputs; Kronecker factors 80x112 are not powers of two"
+    },
+    {
+      "role": "linear biases",
+      "steps": [
+        "P_v on v bias"
+      ],
+      "modules": [
+        "self_attn.q_proj.bias",
+        "self_attn.k_proj.bias",
+        "self_attn.v_proj.bias"
+      ],
+      "status": "extra",
+      "note": "The paper's models have no q/k/v biases. The repo's Qwen path transforms the v bias with P_v and leaves q/k biases alone (input-side transform only); that keeps the function"
+    },
+    {
+      "role": "KV cache",
+      "steps": [
+        "KV4 asymmetric fake quant",
+        "learnable KV clipping"
+      ],
+      "modules": [
+        "self_attn (k, v states)"
+      ],
+      "status": "partial",
+      "note": "The packed KV cache ignores the learned KV clipping"
+    },
+    {
+      "role": "embeddings and LM head",
+      "steps": [],
+      "modules": [
+        "model.embed_tokens",
+        "lm_head"
+      ],
+      "status": "partial",
+      "note": "Tied. FlatQuant never rotates the residual stream, so the tie is harmless in fake quant; a packed save via named_parameters() drops the tied head"
+    }
+  ],
+  "differences": [
+    {
+      "id": "D1",
+      "kind": "module_names",
+      "severity": "must",
+      "detail": "The repo's dispatch rejects this model id: argparse choices do not include it and get_model only matches 'qwen-2.5' (case-sensitive, hyphenated) before raising ValueError. Its Qwen2 code (qwen_utils.get_qwen2 / apply_flatquant_to_qwen, written for the transformers 4.45 class names) fits this model; call it directly instead of the name check.",
+      "evidence": [
+        "flatquant/args_utils.py:9",
+        "flatquant/model_utils.py:81",
+        "flatquant/model_tools/qwen_utils.py",
+        "arch.json model_class=Qwen2ForCausalLM",
+        "repo_notes.md 1"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D2",
+      "kind": "save_load",
+      "severity": "must",
+      "detail": "The packed int4 path (--quantized_save, pack_i4, deploy/ kernels, FlatQuantLlamaForCausalLM) exists only for Llama. A Qwen2 port needs: a packed save of all 7 decoder linears (int4 weights with fp16 scales) plus the online transforms (qkv/up-gate/down Kronecker, P_h, P_o^T) and the fused norms; an inference adapter that rebuilds Qwen2 with those packed linears, restores eval-only flags (_eval_mode, use_diag) after load, does not re-fuse packed weights, casts kernel-facing scales to fp16 after load, and re-ties lm_head.",
+      "evidence": [
+        "deploy/transformers/modeling_llama.py:363",
+        "REALQUANT.md",
+        "method.md Save and reload",
+        "repo_notes.md 5"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D3",
+      "kind": "kernel_dtype",
+      "severity": "should",
+      "detail": "The packed path's Triton block_matmul uses tl.arange over num_heads; Qwen2.5-1.5B has 12 query heads (not a power of two), so the o_proj input transform kernel likely fails to compile. Use the torch kron path or pad for that transform. Kronecker factors (32,48) and (80,112) are not powers of two either; check the kron kernel handles them.",
+      "evidence": [
+        "deploy/functional/block_matmul.py:58",
+        "deploy/functional/block_matmul.py:249",
+        "arch.json config.num_attention_heads=12",
+        "repo_notes.md 5"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D4",
+      "kind": "attention_bias",
+      "severity": "info",
+      "role": "linear biases",
+      "detail": "q/k/v have biases. The input-side transform leaves all three biases valid; the output-side per-head P_v is applied to the v bias as well as the v weight in training and fold; P_h is applied online after RoPE and never folded, so q/k biases stay as they are. No patch needed; the packed save must carry the transformed v bias.",
+      "evidence": [
+        "arch.json layer0.linears self_attn.q_proj bias=true",
+        "flatquant/flat_linear.py:53",
+        "flatquant/flat_linear.py:91",
+        "flatquant/trans_utils.py:21",
+        "method.md Invariants"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D5",
+      "kind": "tied_embeddings",
+      "severity": "should",
+      "role": "embeddings and LM head",
+      "detail": "Nothing is fused into embed_tokens or lm_head, so the tie holds. A packed save built from named_parameters() drops the tied lm_head; the reload must re-tie it (vllm_custom/qwen2_flatquant.py does).",
+      "evidence": [
+        "arch.json config.tie_word_embeddings=true",
+        "vllm_custom/qwen2_flatquant.py:584",
+        "repo_notes.md 3"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D6",
+      "kind": "other",
+      "severity": "should",
+      "role": "KV cache",
+      "detail": "KV4 asymmetric quant with learned clipping (LAC) in fake quant; the packed KV cache ignores the learned clipping. Keep the learned KV clipping in the reload path, or note the gap in the overlay.",
+      "evidence": [
+        "deploy/nn/kv_cache.py:288",
+        "repo_notes.md 5"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D7",
+      "kind": "gqa",
+      "severity": "info",
+      "detail": "No num_kv_heads == num_heads assumption; P_h/P_v are head_dim x head_dim (128), P_o spans the 12 query heads.",
+      "evidence": [
+        "flatquant/model_tools/qwen_utils.py:212",
+        "flatquant/model_tools/qwen_utils.py:237"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D8",
+      "kind": "other",
+      "severity": "should",
+      "detail": "Calibration and training as the repo's Qwen-2.5 scripts: W4 per-channel sym, A4 per-token sym, KV4 asym, wikitext2 128 x 2048, 15 epochs, flat_lr 5e-3, --lwc --lac --cali_trans --add_diag --deactive_amp --direct_inv, transformers 4.45.0. Calibration data must be provided locally (no Hub downloads during jobs). --direct_inv leaves InvSingleTransMatrix.linear modules that RTN quantizes spuriously; keep them out of the saved artifact.",
+      "evidence": [
+        "scripts/qwen-2.5-instruct/qwen-2.5-instruct-7b/w4a4kv4.sh",
+        "flatquant/args_utils.py",
+        "repo_notes.md 6",
+        "repo_notes.md 7"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D9",
+      "kind": "kernel_dtype",
+      "severity": "should",
+      "detail": "deploy.sym_dequant computes int_to_half(acc/10.0f)*10 with a static_cast<int>, truncating the int32 GEMM accumulator to a multiple of 10 (acc 29 -> 20): about 3% error per projection on the packed path, Llama included. Dequantize the exact int32 accumulator (scale in fp32) instead of calling that kernel, or fix the kernel in the overlay.",
+      "evidence": [
+        "deploy/kernels/quant.cu:5",
+        "deploy/kernels/quant.cu:83",
+        "qwen2_packed_deploy worker same-input test: 0.032 vs 3e-4"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D10",
+      "kind": "attention_bias",
+      "severity": "should",
+      "role": "linear biases",
+      "detail": "D4 holds for the function, but the k_proj bias dominates the per-token KV4 key range: up to 316 (layer 0) and 101 (layer 1) against a token-dependent std of about 1.5 after RoPE, so a 4-bit asymmetric step (~37) erases the key signal until the learned P_h and K clip have trained for about 200+ optimizer steps per layer. Smoke must calibrate with enough steps; at the full recipe KV4 still costs (2-layer W4A4 0.129 vs W4A4KV4 0.165). Bias-aware K quantization (quantize only the token-dependent part, add RoPE(b_k) back in full precision) would change the method's quantizer and is not applied.",
+      "evidence": [
+        "arch.json layer0.linears self_attn.k_proj bias=true",
+        "flatquant/model_tools/qwen_utils.py:190",
+        "flatquant/quant_utils.py:85",
+        "qwen2_packed_torch worker probe: k bias absmax 316/101, K4-only attention error 1.03/0.56"
+      ],
+      "repo_support": "partial"
+    }
+  ],
+  "smoke": {
+    "weight_bits": 4,
+    "group_size": null,
+    "target_regex": "\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+    "max_rel_error": 0.5,
+    "min_coverage": 1.0
+  },
+  "recipes": [],
+  "notes": "Recipe lookup returned nothing: the only FlatQuant row is microsoft/Phi-3-mini-4k-instruct (model_type phi3, packed, PPL ratio 1.168 on A10G, same repo commit) and its port was not stored. target_regex limits coverage to the 7 decoder projections because FlatQuant's transform matrices (InvSingleTransMatrix.linear and friends) stay in fp16 by design and must not count as unquantized targets."
+}
