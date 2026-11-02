@@ -82,6 +82,17 @@ A row recorded before ports existed: on the host that still has `jobs/<job_id>/`
 
 Docs: `library/LIBRARY.md`, `library/ATTEMPTS.md`.
 
+## Shared kernels
+
+When the cataloged job ran a `kernel_triton` overlay that beat the run it
+replaced, add the kernel to `agents/skills/_shared/kernels/` so the next
+`quant-kernel` reuses it (see its README): a self-contained file as a `module`
+entry, or a `port` entry that points at this row's `library/ports/...` folder.
+Key it by the saved format in `quantization_config.json`, record the GPU in
+`tuned_on` and the job in `results`. If the job reused an existing entry on a
+new GPU, add that GPU to the entry's `tuned_on` instead. Then
+`$S/kernels.py check`. `quant-sync` pushes `agents/` with the library.
+
 ## Return
 
 Beneficial:

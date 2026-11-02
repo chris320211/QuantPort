@@ -134,6 +134,10 @@ for every new slug.
   `manifest.json`, `quantize.py`, `port.json`, and `method.md` + `differences.json` when
   quant-port wrote one); for an attempt, the best job's port under
   `library/ports/attempts/`. `port_plan.py recipes` reads them back.
+- Shared kernels: `agents/skills/_shared/kernels/<name>/kernel.json` (plus the
+  kernel file for a `module` entry), keyed by saved format. `quant-kernel`
+  checks them with `kernels.py match` before writing a new kernel;
+  `quant-catalog` adds a kernel that made a published run faster.
 
 ## Invariants
 

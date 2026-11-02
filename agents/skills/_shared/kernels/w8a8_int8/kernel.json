@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "w8a8_int8_triton",
+  "kind": "module",
+  "module": "triton_w8a8.py",
+  "entry_points": [
+    "quantize_activation_int8",
+    "w8a8_matmul",
+    "w8a8_linear",
+    "w8a8_linear_reference",
+    "tune_config"
+  ],
+  "match": {
+    "format": ["w8a8_int8"],
+    "w_bits": [8],
+    "a_bits": [8],
+    "weight_quant": ["per_channel"],
+    "act_quant": ["per_token"],
+    "w_sym": [true],
+    "a_sym": [true]
+  },
+  "requires": ["torch", "triton"],
+  "min_compute_capability": "8.0",
+  "tuned_on": [
+    {
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "compute_capability": "8.6",
+      "torch": "2.7.1+cu128",
+      "triton": "3.3.1"
+    }
+  ],
+  "results": [
+    {
+      "method_name": "SmoothQuant",
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "gpu_instance": "vast-rtx3090",
+      "job_id": "20261102T032732Z-138c85",
+      "ppl_ratio": 1.0152,
+      "prefill_tokens_per_s": 18435.8,
+      "fp16_prefill_tokens_per_s": 12248.2,
+      "previous_prefill_tokens_per_s": 10077.2,
+      "port": "library/ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__SmoothQuant"
+    }
+  ],
+  "notes": "Replaces a dequantize-to-fp16-then-matmul adapter: 2048-token prefill went from 0.78x to 1.51x fp16 with the same weights and quality. Decode (M=1) is launch-bound and not faster than fp16; serve with vLLM for decode."
+}
