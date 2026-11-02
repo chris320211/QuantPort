@@ -68,7 +68,7 @@ request JSON / error.
    ```
 
    Add extra `--step` values from the repo README (python/pip only; no shell
-   operators). Torch pins match this host's **nvcc/toolkit** (not nvidia-smi
+   operators, and `<`/`>` count as operators, so pin with `==`). Torch pins match this host's **nvcc/toolkit** (not nvidia-smi
    driver CUDA) and are re-applied after `pip install -r` and before local
    `pip install -e .`, so method requirements cannot replace them with a
    CUDA-mismatched wheel. Local editable installs get `--no-build-isolation`

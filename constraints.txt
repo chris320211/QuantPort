@@ -1,6 +1,8 @@
 # Reproducible direct-dependency set verified by the project test suite.
 # Method-specific CUDA environments have separate pins chosen at runtime.
 huggingface-hub==1.5.0
+numpy==2.2.6; python_version < "3.12"
+numpy==2.5.4; python_version >= "3.12"
 pypdf==6.10.2
 PyYAML==6.0.3
 requests==2.33.1

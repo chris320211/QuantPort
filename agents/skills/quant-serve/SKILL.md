@@ -65,14 +65,17 @@ Do not ask the parent mid-stage. Never read `.env`; this stage needs no tokens.
    ```
 
    vLLM pins its own torch; `.venvs/vllm-serve` is never a method venv. The
-   install ends by importing vLLM and checking CUDA, so it reports `failed` on
-   a host without a GPU. If the host driver is older than the pinned wheel's
+   install ends by importing vLLM's `LLM` entrypoint and checking CUDA, so it
+   reports `failed` on a host without a GPU. If the host driver is older than the pinned wheel's
    CUDA runtime (import error such as `libcudart.so.13`, or `torch.cuda` false
    on a CUDA 12.x driver), reinstall with `--vllm-cuda cu129`: the same vLLM
    version from its CUDA 12.9 release wheel, with torch from the matching
    PyTorch index. The venv must be the real `.venvs/vllm-serve` directory (a
    symlink is refused). Keep `datasets<5`: 5.x pulls in `torchcodec`, which
-   breaks the vLLM import on CUDA 12 builds.
+   breaks the vLLM import on CUDA 12 builds. vLLM may install `torchcodec`
+   itself for audio; when the import probe fails on it, the install
+   uninstalls it (text checks never use it), probes again, and lists it under
+   `removed_optional`.
 
    ```bash
    $S/serve_check.py --job-id <job_id> --request out/requests/<slug>.json \
