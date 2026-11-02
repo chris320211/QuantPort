@@ -22,19 +22,8 @@ from adapter import adapter_loads_hub_id, validate_adapter_file, validate_adapte
 from paths import venv_python
 from request import load_request
 
-SMOKE_SCRIPT = r'''#!/usr/bin/env python
-"""Smoke-load a persisted quantized artifact and require alphanumeric generation."""
-from __future__ import annotations
-
-import importlib.util
-import json
-import os
-import sys
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-
+# Shared with port_smoke.py: load a saved artifact through its adapter, if any.
+LOADER_SOURCE = r'''
 def _load_model_and_tokenizer(model_path, model_id, adapter_path, dtype_name, trust_remote_code):
     dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16, "auto": "auto"}
     if dtype_name not in dtypes:
@@ -82,7 +71,21 @@ def _load_model_and_tokenizer(model_path, model_id, adapter_path, dtype_name, tr
         raise RuntimeError("loaded adapter model does not implement the causal-LM interface")
     model.eval()
     return model, tokenizer
+'''
 
+SMOKE_SCRIPT = r'''#!/usr/bin/env python
+"""Smoke-load a persisted quantized artifact and require alphanumeric generation."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+''' + LOADER_SOURCE + r'''
 
 def _input_device(model):
     return model.get_input_embeddings().weight.device

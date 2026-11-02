@@ -34,6 +34,7 @@ _DIFF_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
 _OVERLAY_HEADER_RE = re.compile(r"^# QUANT_AGENT_OVERLAY_DIR=(.+)$", re.MULTILINE)
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+DIFFERENCE_ID_RE = re.compile(r"^D[0-9]{1,3}$")
 
 
 class PortOverlayManifest(BaseModel):
@@ -46,6 +47,15 @@ class PortOverlayManifest(BaseModel):
     evidence_files: list[str] = Field(default_factory=list, max_length=20)
     target_modules: list[str] = Field(default_factory=list, max_length=200)
     inference_adapter_path: str | None = None
+    # Difference ids from out/analysis/<slug>/differences.json this patch handles.
+    addresses: list[str] = Field(default_factory=list, max_length=100)
+
+
+def require_difference_ids(ids: list[str]) -> list[str]:
+    bad = [item for item in ids if not DIFFERENCE_ID_RE.fullmatch(str(item))]
+    if bad:
+        raise ValueError(f"difference ids must look like D1, D12: {bad}")
+    return sorted(set(ids), key=lambda item: int(item[1:]))
 
 
 def require_base_commit(commit: str) -> str:
@@ -174,6 +184,7 @@ def validate_overlay_bundle(path: Path) -> PortOverlayManifest:
         raise ValueError(f"invalid port overlay bundle: {resolved}")
     manifest = PortOverlayManifest.model_validate_json(manifest_path.read_text())
     require_base_commit(manifest.base_commit)
+    require_difference_ids(manifest.addresses)
     patch = patch_path.read_text()
     patched_paths = validate_unified_patch(patch)
     actual = hashlib.sha256(patch.encode("utf-8")).hexdigest()
@@ -243,11 +254,13 @@ class PortOverlaySession:
         evidence_files: list[str] | None = None,
         target_modules: list[str] | None = None,
         inference_adapter_path: str | None = None,
+        addresses: list[str] | None = None,
     ) -> dict:
         if self.overlay_dir is not None:
             return {"status": "error", "message": "port overlay is already finalized"}
         try:
             _assert_not_venv_write(self.root)
+            addresses = require_difference_ids(addresses or [])
             patched_paths = validate_unified_patch(patch)
             if inference_adapter_path is not None:
                 if not _safe_patch_path(inference_adapter_path):
@@ -267,17 +280,22 @@ class PortOverlaySession:
                 evidence_files=evidence_files or [],
                 target_modules=target_modules or [],
                 inference_adapter_path=inference_adapter_path,
+                addresses=addresses,
             )
         except Exception as exc:
             return {"status": "error", "message": str(exc)}
 
-        bundle_identity = "\0".join([
+        identity_parts = [
             self.method_id,
             self.model_id,
             self.base_commit,
             patch_sha,
             inference_adapter_path or "",
-        ])
+        ]
+        if addresses:
+            # Only when set, so bundles written before `addresses` keep their hash.
+            identity_parts.append(",".join(addresses))
+        bundle_identity = "\0".join(identity_parts)
         bundle_sha = hashlib.sha256(bundle_identity.encode("utf-8")).hexdigest()
         final_dir = self.root / bundle_sha[:16]
         if not final_dir.exists():
@@ -517,6 +535,7 @@ def _cmd_write(args: argparse.Namespace) -> dict:
         evidence_files=args.evidence_file,
         target_modules=args.target_module,
         inference_adapter_path=args.inference_adapter_path,
+        addresses=args.addresses,
     )
 
 
@@ -542,6 +561,10 @@ def main() -> int:
     write_p.add_argument("--inference-adapter-path")
     write_p.add_argument("--evidence-file", action="append", default=[])
     write_p.add_argument("--target-module", action="append", default=[])
+    write_p.add_argument(
+        "--addresses", action="append", default=[],
+        help="Difference id (D1, D2, ...) from the port spec this patch handles",
+    )
 
     check_p = sub.add_parser("check", help="Validate an overlay bundle without applying it")
     check_p.add_argument("--overlay-dir", type=Path, required=True)

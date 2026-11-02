@@ -12,11 +12,14 @@ REPO_ROOT = Path(os.environ.get("QUANT_AGENT_WORKSPACE", _REPO_CANDIDATE)).expan
 OUT_ROOT = REPO_ROOT / "out"
 REQUESTS_ROOT = OUT_ROOT / "requests"
 OVERLAYS_ROOT = OUT_ROOT / "overlays"
+ANALYSIS_ROOT = OUT_ROOT / "analysis"
+SMOKE_ROOT = OUT_ROOT / "smoke"
 VENV_ROOT = REPO_ROOT / ".venvs"
 JOBS_ROOT = REPO_ROOT / "jobs"
 PAPER_CACHE = REPO_ROOT / ".cache" / "papers"
 HF_SNAP_ROOT = REPO_ROOT / ".cache" / "hf-snapshots"
 EVAL_CACHE = REPO_ROOT / ".cache" / "eval"
+SMOKE_SLICES = REPO_ROOT / ".cache" / "smoke-slices"
 LIBRARY_ROOT = REPO_ROOT / "library"
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
