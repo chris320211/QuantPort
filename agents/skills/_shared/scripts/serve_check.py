@@ -75,12 +75,19 @@ SERVE_CHILD_ENV = {
     "DO_NOT_TRACK": "1",
 }
 # Import check run after install and before a check, so a broken venv or a
-# CUDA runtime mismatch is not reported as a bad export.
+# CUDA runtime mismatch is not reported as a bad export. vLLM resolves `LLM`
+# lazily, so a bare `import vllm` misses the entrypoint the check loads.
 RUNTIME_PROBE = (
-    "import torch, vllm\n"
+    "import vllm\n"
+    "from vllm import LLM\n"
+    "import torch\n"
     "assert torch.cuda.is_available(), 'torch sees no CUDA device'\n"
     "print(vllm.__version__)\n"
 )
+# Optional vLLM dependencies a text-only check never uses. vLLM skips them on
+# ImportError, but a wheel built for another CUDA runtime fails with OSError
+# instead (torchcodec for CUDA 13 on a 12.x driver) and takes the import down.
+OPTIONAL_MEDIA_PACKAGES = ("torchcodec",)
 
 SERVE_SCRIPT = r'''#!/usr/bin/env python
 """vLLM smoke + WikiText-2 perplexity + prefill/decode throughput for one checkpoint."""
@@ -310,7 +317,14 @@ def install_serve_venv(python: str, vllm_spec: str | None = None, vllm_cuda: str
         results.append({"argv": argv[1:], **result})
         if not result["ok"]:
             return {"status": "failed", "venv": str(venv_dir), "steps": results}
-    error = probe_runtime(venv_dir / "bin" / "python", scratch)
+    venv_py = venv_dir / "bin" / "python"
+    error = probe_runtime(venv_py, scratch)
+    removed = [pkg for pkg in OPTIONAL_MEDIA_PACKAGES if error and pkg in error]
+    if removed:
+        argv = [str(venv_py), "-m", "pip", "uninstall", "-y", *removed]
+        result = _run_argv(argv, None, _INSTALL_TIMEOUT_S, scratch_home=scratch)
+        results.append({"argv": argv[1:], **result})
+        error = probe_runtime(venv_py, scratch) if result["ok"] else error
     if error:
         return {
             "status": "failed",
@@ -322,7 +336,10 @@ def install_serve_venv(python: str, vllm_spec: str | None = None, vllm_cuda: str
                 "(CUDA 12.x driver) or --vllm-spec vllm==X.Y.Z"
             ),
         }
-    return {"status": "installed", "venv": str(venv_dir), "packages": packages}
+    installed = {"status": "installed", "venv": str(venv_dir), "packages": packages}
+    if removed:
+        installed["removed_optional"] = removed
+    return installed
 
 
 def probe_runtime(venv_py: Path, scratch: Path) -> str | None:

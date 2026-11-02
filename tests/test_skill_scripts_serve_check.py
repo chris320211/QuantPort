@@ -332,3 +332,42 @@ def test_install_can_take_the_cuda_12_release_wheel(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="cu129"):
         with env_mod.host_execution_policy(True):
             serve_mod.install_serve_venv(sys.executable, vllm_cuda="12.9")
+
+
+def test_probe_imports_the_llm_entrypoint_before_torch():
+    probe = serve_mod.RUNTIME_PROBE
+    assert "from vllm import LLM" in probe
+    assert probe.index("import vllm") < probe.index("import torch")
+
+
+def _install_with_probes(tmp_path, monkeypatch, probes):
+    import install_venv
+    import paths as paths_mod
+
+    calls = []
+    monkeypatch.setattr(paths_mod, "VENV_ROOT", tmp_path / ".venvs")
+    monkeypatch.setattr(install_venv, "_run_argv", lambda argv, *a, **k: calls.append(argv) or {"ok": True})
+    queue = list(probes)
+    monkeypatch.setattr(serve_mod, "probe_runtime", lambda *a: queue.pop(0))
+    with env_mod.host_execution_policy(True):
+        result = serve_mod.install_serve_venv(sys.executable)
+    return result, calls
+
+
+def test_install_drops_a_media_package_that_breaks_the_vllm_import(tmp_path, monkeypatch):
+    broken = (
+        "OSError: Could not load this library: "
+        ".venvs/vllm-serve/lib/python3.12/site-packages/torchcodec/libtorchcodec_image.so"
+    )
+    result, calls = _install_with_probes(tmp_path, monkeypatch, [broken, None])
+    assert result["status"] == "installed"
+    assert result["removed_optional"] == ["torchcodec"]
+    assert calls[-1][-4:] == ["pip", "uninstall", "-y", "torchcodec"]
+
+
+def test_install_leaves_other_import_failures_alone(tmp_path, monkeypatch):
+    error = "ImportError: libcudart.so.13: cannot open shared object file"
+    result, calls = _install_with_probes(tmp_path, monkeypatch, [error])
+    assert result["status"] == "failed"
+    assert result["error"] == error
+    assert not any("uninstall" in argv for argv in calls)

@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "huggingface_hub>=0.25",
+    "numpy>=1.26",
     "pypdf>=4.0",
     "pyyaml>=6",
     "requests>=2.31",
