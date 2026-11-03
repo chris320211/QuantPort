@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "method_id": "omniquant-phi35-mini-vastrtx3090",
+  "model_id": "microsoft/Phi-3.5-mini-instruct",
+  "base_commit": "feffe8ea87d80f7bb57b6e25e7cff9dc950fcc14",
+  "patch_sha256": "f0379127c7a2d0bc85e56107cc9ff8b50962f068dabb32ba3a4c6218a9cc7717",
+  "rationale": "diagnose_fix for job 20261102T224718Z-e79ead (process_failed: non-finite OmniQuant loss, layer 5 epoch 4 step 16), starting from the phi3_layer_down_let winner (same algorithm, DOWN_LET True). Root cause, replayed on the real model: under fp16 AMP the per-token-per-head V quantizer (and other dynamic activation quantizers) overflow in backward for near-constant rows (scale clamped at 1e-5, scale^2 underflows in fp16) whatever the loss scale; the GradScaler fell to 2.9e-39 and wrote NaN into the LET/LWC parameters. Fix: models/int_phi3_layer.py FP32ActQuantizer evaluates the dynamic activation and Q/K/V quantizers in fp32 and casts back (fp16 AMP and the method math unchanged); the adapter uses the same arithmetic (reload == in-memory 0.0). omniquant(): non-finite losses skip the step, an epoch with non-finite parameters or >50% non-finite losses rolls the layer back to its best epoch (keep_best_epoch). Real-model checks: layer 5 0 overflowed steps (was 44/88 per epoch), layers 2/4/13/29 stable, 6-layer real-model wrapper run clean (D15).",
+  "evidence_files": [
+    "out/analysis/omniquant-phi35-mini-vastrtx3090/method.md",
+    "out/analysis/omniquant-phi35-mini-vastrtx3090/differences.json",
+    "jobs/20261102T224718Z-e79ead/diagnose.json"
+  ],
+  "target_modules": [
+    "self_attn.qkv_proj",
+    "self_attn.o_proj",
+    "mlp.gate_up_proj",
+    "mlp.down_proj",
+    "input_layernorm",
+    "post_attention_layernorm"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6",
+    "D7",
+    "D8",
+    "D9",
+    "D10",
+    "D15"
+  ]
+}

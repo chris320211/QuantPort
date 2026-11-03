@@ -1,0 +1,365 @@
+{
+  "schema_version": 1,
+  "slug": "omniquant-phi35-mini-vastrtx3090",
+  "method_name": "OmniQuant",
+  "model_id": "microsoft/Phi-3.5-mini-instruct",
+  "model_type": "phi3",
+  "mapping": [
+    {
+      "role": "residual stream",
+      "steps": [],
+      "modules": [
+        "model.layers.*"
+      ],
+      "status": "mapped",
+      "note": "Never transformed; LET only touches norm outputs and linear pairs."
+    },
+    {
+      "role": "norm weights (RMSNorm)",
+      "steps": [
+        "fold LET scale"
+      ],
+      "modules": [
+        "input_layernorm",
+        "post_attention_layernorm"
+      ],
+      "status": "mapped",
+      "note": "Phi3RMSNorm: weight-only, no bias. Each is the sole producer of its reader's input, so it absorbs 1/s. model.norm untouched."
+    },
+    {
+      "role": "attention input projections",
+      "steps": [
+        "LET [norm1 -> qkv]",
+        "LWC",
+        "quantize W4",
+        "quantize A4 input"
+      ],
+      "modules": [
+        "self_attn.qkv_proj"
+      ],
+      "status": "partial",
+      "note": "q, k, v fused in one linear [9216, 3072] (rows 0:3072 q, 3072:6144 k, 6144:9216 v); the only reader of input_layernorm."
+    },
+    {
+      "role": "query/key pair",
+      "steps": [
+        "LET [Q, K]",
+        "quantize A4 Q/K after RoPE"
+      ],
+      "modules": [
+        "self_attn.qkv_proj rows 0:6144",
+        "self_attn.rotary_emb"
+      ],
+      "status": "partial",
+      "note": "The scale sits on q rows / k rows of the fused weight and must survive the LongRoPE rotary embedding (rotate_half pairs j, j+48 of head_dim 96)."
+    },
+    {
+      "role": "value/output pair",
+      "steps": [
+        "LET [v -> out]",
+        "quantize A4 V"
+      ],
+      "modules": [
+        "self_attn.qkv_proj rows 6144:9216",
+        "self_attn.o_proj"
+      ],
+      "status": "partial",
+      "note": "Only the v slice of the fused weight carries 1/s; 32 KV heads = 32 query heads, so o_proj columns take s one to one."
+    },
+    {
+      "role": "attention output projection",
+      "steps": [
+        "LWC",
+        "quantize W4",
+        "quantize A4 input"
+      ],
+      "modules": [
+        "self_attn.o_proj"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "attention probabilities",
+      "steps": [],
+      "modules": [
+        "self_attn (softmax output)"
+      ],
+      "status": "mapped",
+      "note": "Kept 16-bit as in the paper."
+    },
+    {
+      "role": "MLP input projections",
+      "steps": [
+        "LET [norm2 -> fc1]",
+        "LWC",
+        "quantize W4",
+        "quantize A4 input"
+      ],
+      "modules": [
+        "mlp.gate_up_proj"
+      ],
+      "status": "partial",
+      "note": "gate and up fused [16384, 3072] (rows 0:8192 gate, 8192:16384 up); the only reader of post_attention_layernorm. Phi3MLP chunks after the matmul."
+    },
+    {
+      "role": "MLP output projection",
+      "steps": [
+        "LWC",
+        "quantize W4",
+        "quantize A4 input"
+      ],
+      "modules": [
+        "mlp.down_proj"
+      ],
+      "status": "partial",
+      "note": "No LET in the paper. Its A4 input (silu(gate)*up) is the largest error source on Phi-3.5 (D8)."
+    },
+    {
+      "role": "linear biases and LET shifts",
+      "steps": [],
+      "modules": [],
+      "status": "unmapped",
+      "note": "No linear has a bias and RMSNorm has none; channel shifting is off, as the repo does for RMSNorm models."
+    },
+    {
+      "role": "KV cache",
+      "steps": [
+        "quantize A4 K/V per token per head"
+      ],
+      "modules": [
+        "self_attn (k, v states)"
+      ],
+      "status": "partial",
+      "note": "Fake-quantized before entering the cache in the reload; per-token quantization commutes with caching."
+    },
+    {
+      "role": "embeddings and LM head",
+      "steps": [],
+      "modules": [
+        "model.embed_tokens",
+        "lm_head"
+      ],
+      "status": "mapped",
+      "note": "Untied (tie_word_embeddings=false); both fp16 and untouched."
+    }
+  ],
+  "differences": [
+    {
+      "id": "D1",
+      "kind": "module_names",
+      "severity": "must",
+      "role": "attention input projections",
+      "detail": "The repo cannot run Phi-3: omniquant() dispatches on the net name (llama/opt/falcon/mixtral) and raises ValueError otherwise; its layer classes read q_proj/k_proj/v_proj/gate_proj/up_proj; its LET init reads layer.self_attn.q_proj; and the Llama layer calls rotary_emb(value_states, seq_len=...), the pre-4.38 API that transformers 4.46.3 no longer accepts, so even the Llama path needs a new layer here. Add models/int_phi3_layer.py (QuantPhi3DecoderLayer: QuantLinear on qkv_proj/o_proj/gate_up_proj/down_proj, QuantMatMul on QK^T and PV, OmniLlamaRMSNorm, the Phi-3 rotary module, its own LET init / temporary / in-place smoothing) and a model_type == 'phi3' branch in omniquant() (catch position_ids, shifts off, delegate smoothing to the layer). The generic pieces (QuantLinear, QuantMatMul, UniformAffineQuantizer with LWC, truncation, AdamW + NativeScaler loop, get_act_scales) are used unchanged.",
+      "evidence": [
+        "quantize/omniquant.py:57-99",
+        "quantize/omniquant.py:224",
+        "models/int_llama_layer.py:72-89,124",
+        "quantize/utils.py:68-77",
+        "arch.json model_class=Phi3ForCausalLM transformers 4.46.3",
+        "arch.json layer0.linears self_attn.qkv_proj, mlp.gate_up_proj"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D2",
+      "kind": "qkv_layout",
+      "severity": "must",
+      "role": "attention input projections",
+      "detail": "[norm1 -> qkv] LET: the fused qkv_proj is the only reader of input_layernorm, so one scale over its 3072 inputs, initialised from act_scales['<layer>.self_attn.qkv_proj'] and the column max of the fused weight (the repo's key '.self_attn.q_proj' does not exist). Per-row W4 quantization and per-row LWC on the fused weight equal per-part quantization; the input quantizer is one per-token A4 on the shared input, as the three Llama quantizers are on the same tensor.",
+      "evidence": [
+        "arch.json layer0.linears self_attn.qkv_proj in=3072 out=9216",
+        "arch.json flags fused_qkv",
+        "models/int_llama_layer.py:285-286",
+        "quantize/omniquant.py:225-237",
+        "method.md Invariants"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D3",
+      "kind": "qkv_layout",
+      "severity": "must",
+      "role": "value/output pair",
+      "detail": "[v -> out] LET acts on a slice: divide only rows 6144:9216 (v) of qkv_proj by s and multiply o_proj's input columns by s (repeated over query heads under GQA; identity here, 32 KV heads). Pointing smooth_fc_fc at the whole qkv_proj would rescale q and k too. Init from act_scales of o_proj's input and o_proj's column max (reduced over the query heads of a KV head under GQA). Checked on the slice: LET folded at random scales changes layer outputs by 2.9e-7 / 7.6e-7 (layers 0 / 1, fp32).",
+      "evidence": [
+        "models/transformation.py:44-60",
+        "models/int_llama_layer.py:289-290",
+        "arch.json config.num_key_value_heads=32",
+        "method.md Invariants"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D4",
+      "kind": "rope",
+      "severity": "should",
+      "role": "query/key pair",
+      "detail": "The repo's QK LET is one free value per q_proj output channel, applied to the projection rows before RoPE (qkt_smooth_scale = ones(q_proj.out_features); smooth_q_k_*). RoPE rotates channel pairs (j, j+d/2), so Q/s . K*s equals Q . K only if both channels of a pair share s; otherwise the 'equivalent' transform changes the function and training has to absorb it. Measured on Phi-3.5 layers 0/1 with scales in [0.5, 2]: untied changes the layer update by 3.2% / 13.1% relative, tied by 3e-7 / 8e-7. The port parametrises the QK scale as [num_kv_heads, head_dim/2] and expands it to both halves of each head (k rows directly, q rows repeated over the query heads of a KV head), which commutes exactly with rotate_half RoPE including LongRoPE (it only changes frequencies and a uniform cos/sin factor). Per-head per-token A4 on Q and K stays after RoPE as in the repo.",
+      "evidence": [
+        "paper section 3.3 Eq. 5",
+        "models/transformation.py:63-69,108-114",
+        "quantize/omniquant.py:224",
+        "models/int_llama_layer.py:124-143",
+        "arch.json config.rope_scaling longrope, head_dim 96",
+        "method.md Invariants"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D5",
+      "kind": "layer_pattern",
+      "severity": "must",
+      "role": "MLP input projections",
+      "detail": "[norm2 -> fc1] LET: gate_up_proj is the only reader of post_attention_layernorm; one scale over its 3072 inputs from act_scales['<layer>.mlp.gate_up_proj'] (the repo keys '.mlp.up_proj'/'.mlp.gate_proj' do not exist). Phi3MLP splits gate/up after the matmul, so the row layout is untouched.",
+      "evidence": [
+        "arch.json layer0.linears mlp.gate_up_proj in=3072 out=16384",
+        "arch.json flags fused_gate_up",
+        "models/int_llama_layer.py:287-288",
+        "method.md Invariants"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D6",
+      "kind": "save_load",
+      "severity": "must",
+      "role": "KV cache",
+      "detail": "The repo saves fake-quant fp16 weights with save_pretrained and drops the activation quantizers, so a plain reload is W4A16; its only packed path (AutoGPTQ, not installed) asserts abits >= 16. There is no W4A4 kernel. Save the repo's format as a native Phi3ForCausalLM checkpoint (LETs folded, weights holding 4-bit levels, fp16, untied lm_head, auto_map stripped) plus quantization_config.json (a_bits 4, qkv_bits 4, format fake_quant_fp16, publish_exclude omni_parameters.pth), and ship quant_agent_inference_adapter.py that re-attaches per-token A4 on the four linear inputs and per-token-per-head A4 on Q/K (after RoPE) and V (quantized before the KV cache), with the calibration layer's arithmetic: quantizer in the repo's op order, evaluated in fp32 and cast back to fp16 exactly as the calibration layer's FP32ActQuantizer (D15), OmniLlamaRMSNorm product order, eager fp16 QK^T + fp32 softmax. An SDPA / fp32-quantizer reload of the same weights differed from the calibrated model by 0.31 relative logits on 2 layers (W4A4 amplifies one-level rounding flips); the matched reload differs by 0.0. Expect no VRAM or speed gain versus fp16 (fakequant_saved_as_dense) until a W4A4 kernel exists.",
+      "evidence": [
+        "main.py:354-369",
+        "quantize/omniquant.py:294-311",
+        "quantize/quantizer.py:94-159",
+        "quantize/omni_norm.py:52-63",
+        "models/int_llama_layer.py:141-163",
+        "method.md Save and reload"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D7",
+      "kind": "remote_code",
+      "severity": "must",
+      "detail": "config.json carries auto_map, so the pipeline passes trust_remote_code=True; the saved artifact has no modeling code. Load natively (Phi3ForCausalLM, never remote code) in the wrapper, strip auto_map and the copied modeling files from the artifact, and load natively in the adapter whatever trust_remote_code says (same as the positive SmoothQuant x Phi-3.5 port).",
+      "evidence": [
+        "arch.json config.auto_map",
+        "arch.json flags remote_code",
+        "library/ports/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__SmoothQuant/differences.json D5"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D8",
+      "kind": "activation",
+      "severity": "should",
+      "role": "MLP output projection",
+      "detail": "Phi-3.5's down_proj input (silu(gate)*up) carries massive channel outliers (SmoothQuant port probe: max/median up to 4531). On the 2-layer slice at SmoothQuant-init LET (no training) the relative logit error is 0.400 with all inputs A4, 0.238 with only down_proj's input left 16-bit (qkv_proj 0.388, o_proj 0.388, gate_up 0.395, Q/K/V 0.398), W4A16 0.162, no LET 0.590: down_proj's A4 input is the largest single error source. The paper drops the fc2 LET because ReLU features are sparse; with SwiGLU, up enters the product linearly, so an [up rows of gate_up_proj -> down_proj] LET is exact (folded check 3.6e-7 / 8.3e-7). At SmoothQuant init it is worse (0.49), but trained (320 steps, 16 x 256) it lowers the block losses by 49% / 27% (layers 0 / 1) versus 5% / 10% for the paper's four sites, and the 2-layer logit error 0.389 -> 0.379. Addressed only by plan phi3_layer_down_let (args.down_let); plan phi3_layer keeps the paper's four LET pairs.",
+      "evidence": [
+        "paper section 3.3 and Table A5 (no fc2 LET)",
+        "library/ports/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__SmoothQuant/differences.json D8",
+        "port worker probe_variants on .cache/smoke-slices/omniquant-phi35-mini-vastrtx3090-L2",
+        "method.md Invariants"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D9",
+      "kind": "other",
+      "severity": "should",
+      "detail": "Training instability on Phi-3.5: layer 0's block loss rises during training at the repo's settings (8 x 512, 160 steps: +39%; 640 steps: +24% at let_lr 1e-3, +33% at 5e-4, +43% at 2e-4; also +33% without AMP), while layer 1 falls 10-16%. Freezing only the [norm2 -> gate_up] LET removes the rise (-2%); freezing the QK, v->o or qkv LET or LWC does not. At the smoke budget (16 x 256, 20 epochs) layer 0 goes 3.4e-4 -> 3.2e-4 (epoch 2) -> 4.8e-4 (epoch 19). Safeguard added to omniquant() behind args.keep_best_epoch (default off; the wrapper turns it on): keep the LET/LWC parameters from the end of the epoch with the lowest mean block loss. It never changes a block whose loss keeps falling and bounds a regressing one by its best epoch.",
+      "evidence": [
+        "quantize/omniquant.py:251-276",
+        "port worker probe_train on the 2-layer slice",
+        "scripts/Llama-2/Llama-2-7b/w4a4.sh (let_lr 1e-3)"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D10",
+      "kind": "other",
+      "severity": "should",
+      "detail": "Calibration as the repo: WikiText-2 train, 128 random 2048-token windows, seed 2, but read from the local parquet (.cache/eval/hf/.../wikitext-2-raw-v1/train-*.parquet) instead of load_dataset so jobs never reach the Hub, tokenised with the fast tokenizer (the repo's use_fast=False sentencepiece path on 2.9M tokens is slow; same vocabulary). The repo ships act_scales only for its own models, so act scales come from get_act_scales on the same 128 windows (generate_act_scale_shift.py default). Shifts are not collected (shifting is off for RMSNorm models).",
+      "evidence": [
+        "datautils.py:35-54",
+        "generate_act_scale_shift.py:25-57,113-118",
+        "main.py:316-344"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D11",
+      "kind": "other",
+      "severity": "info",
+      "detail": "Hyperparameters: W4 asymmetric per output channel (group_size None) with LWC, A4 asymmetric dynamic per token on all four linear inputs and per token-head on Q/K/V, softmax 16-bit, alpha 0.75, let_lr 1e-3, lwc_lr 1e-2, wd 0, batch 1, 20 epochs x 128 x 2048 = 2560 optimizer steps per layer, AMP. Measured on the RTX 3090: 98 ms per optimizer step at 2048 tokens (2-layer slice, 8 x 2048), so ~260 s per layer, ~2.3 h for 32 layers plus ~5 min of act scales, export and reload check (~2.4 h; the down LET adds a few %). Fits the 3 h budget, so the paper's epochs and samples are kept. After the D15 fix (fp32 activation-quantizer arithmetic) an epoch of 128 x 2048 takes 14.4 s instead of 13.4 s on the real model (layers 3-5), so ~2.6-2.7 h for the full run.",
+      "evidence": [
+        "paper section 4.1 Training",
+        "scripts/Llama-2/Llama-2-7b/w4a4.sh",
+        "main.py:202-215,273-309",
+        "port worker timing run 8 x 2048 x 40 epochs"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D12",
+      "kind": "kernel_dtype",
+      "severity": "info",
+      "detail": "The checkpoint is bf16; the repo loads fp16 (LMClass.py:29) and trains in fp16 AMP. Phi-3.5's activations fit fp16 (SmoothQuant port probe: max |residual| 3984, max down_proj input 971). The wrapper loads fp16, checks finite weights, act scales and logits; the artifact is fp16 and the adapter loads fp16 even if bfloat16 is requested, since the 4-bit levels were computed in fp16.",
+      "evidence": [
+        "arch.json config.torch_dtype=bfloat16",
+        "models/LMClass.py:29",
+        "library/ports/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__SmoothQuant/differences.json D6"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D13",
+      "kind": "attention_bias",
+      "severity": "info",
+      "role": "linear biases and LET shifts",
+      "detail": "No linear biases and no norm bias: shifting is off (the repo turns it off for Llama, quantize/omniquant.py:219-221), so no bias is ever created and the folded layer reloads as a native Phi3DecoderLayer (export refuses a QuantLinear with a bias).",
+      "evidence": [
+        "arch.json config.attention_bias=false",
+        "arch.json layer0.linears bias=false",
+        "quantize/omniquant.py:219-221"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D14",
+      "kind": "rope",
+      "severity": "info",
+      "detail": "LongRoPE switches to long factors above 4096 tokens and sliding_window=262144 is inert at these lengths. Calibration (2048) and smoke (256) use the short factors, as inference at <= 4096 tokens does; the calibration layer and the adapter call the model's own rotary module with position_ids and the kv length.",
+      "evidence": [
+        "arch.json config.original_max_position_embeddings=4096, sliding_window=262144",
+        "transformers modeling_phi3.py Phi3LongRoPEScaledRotaryEmbedding"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D15",
+      "kind": "kernel_dtype",
+      "severity": "must",
+      "detail": "Job 20261102T224718Z-e79ead died with a non-finite loss in layer 5, epoch 4, step 16. Replayed on the real 32-layer model (job's omni_parameters.pth for layers 0-4, same 128 windows): from epoch 2 the V quantizer of the PV matmul (per-token-per-head A4) turned finite output-gradients into inf on 44 then 88 of 128 steps per epoch whatever the loss scale; the GradScaler fell 65536 -> 3.7e-9 -> 1.2e-35 -> 2.9e-39 and the update at epoch 4 step 15 wrote NaN into every LET/LWC parameter (the job's failure point). Cause: UniformAffineQuantizer runs in fp16 under AMP; for a near-constant row (Phi-3.5 attention-sink tokens; residual max 2222 at layer 2, 3700 at 4, 8712 at 19) the scale clamps at 1e-5 and the backward of x/scale needs scale^2 = 1e-10, which underflows in fp16. Forward values all fit fp16. Fix, keeping fp16 AMP and the method's math: the Phi-3 layer evaluates its dynamic activation and Q/K/V quantizers in fp32 and casts back (FP32ActQuantizer); the adapter does the same, so reload == in-memory stays 0.0. Checked on the real model: layer 5 has 0 overflowed steps in 4 epochs at scale 65536; layers 2/4/13/29 only the usual 4-8 first-epoch loss-scale calibration skips, losses falling; the fixed wrapper on a real 6-layer model (3 epochs, 128 x 2048) has no non-finite loss, layer-5 loss 0.516 -> 0.508 (job 0.725). bf16 autocast was stable but worse (layer 2 0.72 -> 0.60 vs 0.49 -> 0.35; layer 5 1.02). Also in omniquant(): a non-finite loss skips the step; an epoch with non-finite parameters or >50% non-finite losses rolls the layer back to its best epoch, aborting only if there is none.",
+      "evidence": [
+        "jobs/20261102T224718Z-e79ead/stderr.log (omniquant.py:282 non-finite loss layer 5 epoch 4 step 16)",
+        "jobs/20261102T224718Z-e79ead/stdout.log (norm:nan from layer 2)",
+        "quantize/quantizer.py:10,149-159 (CLIPMIN 1e-5, scale clamp)",
+        "quantize/omniquant.py:103-108 (fp16 AMP)",
+        "port worker replay on the real model: /tmp/omni_port/rD.log, rE.log, rF.log, fix6b.log on vast3090"
+      ],
+      "repo_support": "missing"
+    }
+  ],
+  "smoke": {
+    "weight_bits": 4,
+    "group_size": null,
+    "max_rel_error": 0.5,
+    "min_coverage": 1.0,
+    "calib_samples": 16,
+    "seq_len": 256
+  },
+  "recipes": [
+    "library/ports/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__SmoothQuant",
+    "library/ports/Qwen_Qwen2.5-1.5B-Instruct__vast-rtx3090__FlatQuant"
+  ],
+  "notes": "port_plan.py recipes returned nothing for OmniQuant. Reused from the SmoothQuant x Phi-3.5 port: native class load, auto_map stripping, fused qkv/gate_up as single LET readers, local snapshot path, finite checks, down_proj outlier evidence. From the FlatQuant x Qwen2.5 port: the smoke budget is set in optimizer steps per layer (320 = 20 epochs over 16 smoke windows of 256 tokens; ~55 s for 2 layers), not epochs, so the learned parameters actually train. Smoke gate kept at defaults (W4, per channel, rel 0.5, coverage 1.0): every decoder linear is W4 and no layer is kept in high precision. The 2-layer W4A4 error is inherently high on Phi-3.5 (0.39 / 0.38 measured by the port's own sanity run against the native fp16 slice), leaving ~0.1 margin. Two plans: phi3_layer (the paper's four LET sites, D1-D7, D9-D10) and phi3_layer_down_let (same patch with the extra exact [up -> down_proj] LET of D8). diagnose_fix (D15): the down_let winner's full job hit fp16 overflow in the backward of the V quantizer from layer 5; fixed by fp32 activation-quantizer arithmetic plus skip/rollback of non-finite steps."
+}

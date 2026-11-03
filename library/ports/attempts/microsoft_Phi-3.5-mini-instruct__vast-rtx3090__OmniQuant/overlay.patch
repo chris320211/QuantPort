@@ -1,0 +1,768 @@
+diff --git a/models/int_phi3_layer.py b/models/int_phi3_layer.py
+new file mode 100644
+index 0000000..9eb1041
+--- /dev/null
++++ b/models/int_phi3_layer.py
+@@ -0,0 +1,341 @@
++"""OmniQuant decoder layer for Phi-3 (transformers Phi3DecoderLayer: fused qkv_proj and gate_up_proj).
++
++Same algorithm as models/int_llama_layer.py + quantize/utils.py (LWC on every linear, LET pairs
++[ln1, qkv], [v, o_proj], [Q, K], [ln2, fc1]; per-token activation quantization of every linear
++input and of Q/K/V; softmax output kept at 16 bit), mapped onto Phi-3's fused tensors:
++
++* [ln1, qkv]: one scale over the 3072 inputs of the fused qkv_proj (its only reader).
++* [v, o_proj]: a scale on the v rows of qkv_proj only (rows q_dim+k_dim:), and on o_proj's
++  input columns (repeated over query heads under GQA).
++* [Q, K]: a scale on the q rows / k rows of qkv_proj. It is tied across each RoPE pair
++  (channel j and j + head_dim/2 of a head share one value) so that it commutes exactly with the
++  rotary embedding applied after the projection (rotate_half pairs; LongRoPE only changes the
++  frequencies and a uniform cos/sin factor). An untied scale is not an equivalent transformation
++  for a RoPE model.
++* [ln2, fc1]: one scale over the inputs of the fused gate_up_proj (its only reader).
++* down_proj: no LET (paper section 3.3), unless args.down_let: then a scale on the up rows of
++  gate_up_proj (rows intermediate_size:) and down_proj's input columns. up enters the product
++  act(gate) * up linearly, so this is exact.
++
++Phi-3 has no linear biases and RMSNorm has no bias, so channel-wise shifting is not used
++(as for Llama in quantize/omniquant.py): no bias is created anywhere and the result reloads
++as a native Phi3ForCausalLM.
++"""
++import copy
++import math
++from collections import OrderedDict
++from typing import Optional, Tuple
++
++import torch
++from torch import nn
++from transformers.activations import ACT2FN
++from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, repeat_kv
++
++from models.transformation import truncate_number
++from quantize.int_linear import QuantLinear
++from quantize.int_matmul import QuantMatMul
++from quantize.omni_norm import OmniLlamaRMSNorm
++from quantize.quantizer import UniformAffineQuantizer
++
++
++class FP32ActQuantizer(UniformAffineQuantizer):
++    """The repo's dynamic per-token activation quantizer, evaluated in fp32 and cast back.
++
++    Same math as UniformAffineQuantizer. Under fp16 AMP its backward overflows for rows with a
++    near-zero range (scale clamped at 1e-5, d(x/scale)/d(scale) = -x/scale^2 and 1e-10 underflows
++    in fp16): on Phi-3.5 layer 5 the V quantizer of the PV matmul produced inf gradients on 44 then
++    88 of 128 steps per epoch whatever the loss scale, the GradScaler scale fell from 65536 to
++    2.9e-39 and the next update wrote NaN into every LET/LWC parameter. In fp32 the same steps
++    have finite gradients and the scale stays at 65536.
++    """
++
++    def forward(self, x):
++        if self.lwc or self.n_bits >= 16 or x.dtype == torch.float32:
++            return super().forward(x)
++        return super().forward(x.float()).to(x.dtype)
++
++
++class QuantPhi3MLP(nn.Module):
++    def __init__(self, org_module: nn.Module, config, args=None):
++        super().__init__()
++        self.gate_up_proj = QuantLinear(org_module.gate_up_proj, args.weight_quant_params, args.act_quant_params)
++        self.down_proj = QuantLinear(org_module.down_proj, args.weight_quant_params, args.act_quant_params)
++        self.act_fn = ACT2FN[config.hidden_act]
++
++    def forward(self, x):
++        up_states = self.gate_up_proj(x)
++        gate, up_states = up_states.chunk(2, dim=-1)
++        return self.down_proj(up_states * self.act_fn(gate))
++
++
++class QuantPhi3Attention(nn.Module):
++    def __init__(self, org_module: nn.Module, config, args=None):
++        super().__init__()
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.num_heads = config.num_attention_heads
++        self.head_dim = self.hidden_size // self.num_heads
++        self.num_key_value_heads = config.num_key_value_heads
++        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
++        if self.head_dim % 2:
++            raise ValueError(f"head_dim {self.head_dim} must be even for RoPE pairs")
++        self.q_dim = self.num_heads * self.head_dim
++        self.kv_dim = self.num_key_value_heads * self.head_dim
++        if org_module.qkv_proj.out_features != self.q_dim + 2 * self.kv_dim:
++            raise ValueError("qkv_proj rows are not [q | k | v]")
++        self.rotary_emb = copy.deepcopy(org_module.rotary_emb)
++        self.qkv_proj = QuantLinear(org_module.qkv_proj, args.weight_quant_params, args.act_quant_params)
++        self.o_proj = QuantLinear(org_module.o_proj, args.weight_quant_params, args.act_quant_params)
++        self.qkt_matmul = QuantMatMul(args.q_quant_params, args.k_quant_params, matmul_func=torch.matmul)
++        self.pv_matmul = QuantMatMul(args.p_quant_params, args.v_quant_params, matmul_func=torch.matmul)
++        self.use_weight_quant = False
++        self.use_act_quant = False
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_value=None,
++        output_attentions: bool = False,
++        use_cache: bool = False,
++        **kwargs,
++    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
++        if past_key_value is not None or use_cache:
++            raise NotImplementedError("QuantPhi3Attention is the calibration layer; it has no KV cache")
++        bsz, q_len, _ = hidden_states.size()
++        qkv = self.qkv_proj(hidden_states)
++        query_states = qkv[..., : self.q_dim]
++        key_states = qkv[..., self.q_dim : self.q_dim + self.kv_dim]
++        value_states = qkv[..., self.q_dim + self.kv_dim :]
++        query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
++        key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
++        value_states = value_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
++
++        if position_ids is None:
++            position_ids = torch.arange(q_len, device=hidden_states.device).unsqueeze(0)
++        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=q_len)
++        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++
++        key_states = repeat_kv(key_states, self.num_key_value_groups)
++        value_states = repeat_kv(value_states, self.num_key_value_groups)
++
++        query_states = self.qkt_matmul.quant_x1(query_states)
++        key_states = self.qkt_matmul.quant_x2(key_states)
++        attn_weights = self.qkt_matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
++        if attention_mask is not None:
++            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]].to(attn_weights.dtype)
++            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device))
++        else:
++            causal = torch.ones(q_len, q_len, dtype=torch.bool, device=attn_weights.device).tril()
++            attn_weights = attn_weights.masked_fill(~causal, torch.finfo(attn_weights.dtype).min)
++
++        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
++        attn_weights = self.pv_matmul.quant_x1(attn_weights)
++        value_states = self.pv_matmul.quant_x2(value_states)
++        attn_output = self.pv_matmul(attn_weights, value_states)
++        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
++        attn_output = self.o_proj(attn_output)
++        return attn_output, None, None
++
++    def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
++        self.use_weight_quant = weight_quant
++        self.use_act_quant = act_quant
++        for m in self.modules():
++            if isinstance(m, (QuantLinear, QuantMatMul)):
++                m.set_quant_state(weight_quant, act_quant)
++
++
++class QuantPhi3DecoderLayer(nn.Module):
++    """Phi3DecoderLayer with QuantLinear / QuantMatMul and the LET pairs above."""
++
++    omni_family = "phi3"
++
++    def __init__(self, config, ori_layer, args):
++        super().__init__()
++        self.hidden_size = config.hidden_size
++        self.intermediate_size = config.intermediate_size
++        self.self_attn = QuantPhi3Attention(org_module=ori_layer.self_attn, config=config, args=args)
++        self.mlp = QuantPhi3MLP(org_module=ori_layer.mlp, config=config, args=args)
++        self.input_layernorm = OmniLlamaRMSNorm(ori_layer.input_layernorm, eps=ori_layer.input_layernorm.variance_epsilon)
++        self.post_attention_layernorm = OmniLlamaRMSNorm(
++            ori_layer.post_attention_layernorm, eps=ori_layer.post_attention_layernorm.variance_epsilon
++        )
++        self.down_let = bool(getattr(args, "down_let", False))
++        self.let = False
++        for module in self.modules():
++            if type(module) is UniformAffineQuantizer and not module.lwc:
++                module.__class__ = FP32ActQuantizer  # activation (and Q/K/V) quantizers only
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_value=None,
++        output_attentions: Optional[bool] = False,
++        use_cache: Optional[bool] = False,
++        **kwargs,
++    ):
++        residual = hidden_states
++        hidden_states = self.input_layernorm(hidden_states)
++        attn_out, _, _ = self.self_attn(
++            hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids,
++        )
++        hidden_states = residual + attn_out
++        residual = hidden_states
++        hidden_states = self.post_attention_layernorm(hidden_states)
++        hidden_states = self.mlp(hidden_states)
++        hidden_states = residual + hidden_states
++        return (hidden_states,)
++
++    def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
++        self.use_weight_quant = weight_quant
++        self.use_act_quant = act_quant
++        for m in self.modules():
++            if isinstance(m, (QuantLinear, QuantMatMul)):
++                m.set_quant_state(weight_quant, act_quant)
++
++    # --- LET -----------------------------------------------------------------------------
++
++    @torch.no_grad()
++    def init_let(self, act_scales, prefix, alpha, dev, dtype):
++        """SmoothQuant initialisation of every LET scale (quantize/omniquant.py:224-237)."""
++        attn = self.self_attn
++
++        def smooth(key, weight):
++            if key not in act_scales:
++                raise KeyError(f"no activation scales for {key}")
++            act = act_scales[key].to(device=dev, dtype=dtype).clamp(min=1e-5)
++            w = weight.abs().max(dim=0)[0].to(device=dev, dtype=dtype).clamp(min=1e-5)
++            return (act.pow(alpha) / w.pow(1 - alpha)).clamp(min=1e-5)
++
++        qkv_scale = smooth(f"{prefix}.self_attn.qkv_proj", attn.qkv_proj.weight)
++        out_scale = smooth(f"{prefix}.self_attn.o_proj", attn.o_proj.weight)
++        if attn.num_key_value_groups > 1:
++            # one scale per v channel: the largest over the query heads that read it
++            out_scale = out_scale.view(attn.num_key_value_heads, attn.num_key_value_groups, attn.head_dim).amax(1).reshape(-1)
++        fc1_scale = smooth(f"{prefix}.mlp.gate_up_proj", self.mlp.gate_up_proj.weight)
++        qkt_scale = torch.ones(attn.num_key_value_heads, attn.head_dim // 2, device=dev, dtype=dtype)
++        self.register_parameter("qkv_smooth_scale", nn.Parameter(qkv_scale))
++        self.register_parameter("out_smooth_scale", nn.Parameter(out_scale))
++        self.register_parameter("qkt_smooth_scale", nn.Parameter(qkt_scale))
++        self.register_parameter("fc1_smooth_scale", nn.Parameter(fc1_scale))
++        if self.down_let:
++            down_scale = smooth(f"{prefix}.mlp.down_proj", self.mlp.down_proj.weight)
++            self.register_parameter("down_smooth_scale", nn.Parameter(down_scale))
++
++    def _expanded_scales(self):
++        """Per-row / per-column scale vectors for the fused tensors."""
++        attn = self.self_attn
++        n_kv, n_rep, d = attn.num_key_value_heads, attn.num_key_value_groups, attn.head_dim
++        k_scale = torch.cat([self.qkt_smooth_scale, self.qkt_smooth_scale], dim=-1)  # RoPE pairs (j, j + d/2)
++        q_scale = k_scale.view(n_kv, 1, d).expand(n_kv, n_rep, d).reshape(-1)
++        k_scale = k_scale.reshape(-1)
++        v_scale = self.out_smooth_scale
++        o_scale = v_scale.view(n_kv, 1, d).expand(n_kv, n_rep, d).reshape(-1)
++        return q_scale, k_scale, v_scale, o_scale
++
++    def _transformed_weights(self):
++        """Every LET folded into the weights it touches (autograd-friendly, no in-place)."""
++        attn, mlp = self.self_attn, self.mlp
++        q_scale, k_scale, v_scale, o_scale = self._expanded_scales()
++        w = attn.qkv_proj.weight * self.qkv_smooth_scale.view(1, -1)
++        wq, wk, wv = w.split([attn.q_dim, attn.kv_dim, attn.kv_dim], dim=0)
++        qkv = torch.cat([wq / q_scale.view(-1, 1), wk * k_scale.view(-1, 1), wv / v_scale.view(-1, 1)], dim=0)
++        o = attn.o_proj.weight * o_scale.view(1, -1)
++        gate_up = mlp.gate_up_proj.weight * self.fc1_smooth_scale.view(1, -1)
++        down = mlp.down_proj.weight
++        if self.down_let:
++            gate, up = gate_up.split([self.intermediate_size, self.intermediate_size], dim=0)
++            gate_up = torch.cat([gate, up / self.down_smooth_scale.view(-1, 1)], dim=0)
++            down = down * self.down_smooth_scale.view(1, -1)
++        ln1 = self.input_layernorm.weight / self.qkv_smooth_scale
++        ln2 = self.post_attention_layernorm.weight / self.fc1_smooth_scale
++        return ln1, qkv, o, ln2, gate_up, down
++
++    def _truncate_scales(self):
++        with torch.no_grad():
++            for name, param in self.named_parameters():
++                if "smooth_scale" in name:
++                    param.data = truncate_number(param)
++
++    def smooth_and_quant_temporary(self):
++        """quantize/utils.py:62-101 for the Phi-3 layout."""
++        attn, mlp = self.self_attn, self.mlp
++        if self.let:
++            self._truncate_scales()
++            ln1, qkv, o, ln2, gate_up, down = self._transformed_weights()
++            for norm, weight in ((self.input_layernorm, ln1), (self.post_attention_layernorm, ln2)):
++                norm.use_temporary_parameter = True
++                norm.temp_weight = weight
++                norm.temp_bias = None
++            for module, weight in ((attn.qkv_proj, qkv), (attn.o_proj, o), (mlp.gate_up_proj, gate_up), (mlp.down_proj, down)):
++                module.temp_weight = weight
++        else:
++            for module in self.modules():
++                if isinstance(module, QuantLinear):
++                    module.temp_weight = module.weight
++        for module in self.modules():
++            if isinstance(module, QuantLinear):
++                module.temp_weight = module.weight_quantizer(module.temp_weight)
++                module.temp_bias = module.bias
++                module.use_temporary_parameter = True
++
++    @torch.no_grad()
++    def smooth_and_quant_inplace(self):
++        """quantize/utils.py:111-136 for the Phi-3 layout: fold the LETs, then fake-quantize."""
++        attn, mlp = self.self_attn, self.mlp
++        if self.let:
++            self._truncate_scales()
++            # detach(): a weight left unchanged is still the original nn.Parameter object, and
++            # assigning a Parameter would re-register it as a parameter instead of a buffer.
++            ln1, qkv, o, ln2, gate_up, down = (t.detach() for t in self._transformed_weights())
++            self.input_layernorm.weight = ln1
++            self.post_attention_layernorm.weight = ln2
++            self.input_layernorm.use_temporary_parameter = False
++            self.post_attention_layernorm.use_temporary_parameter = False
++            attn.qkv_proj.weight = qkv
++            attn.o_proj.weight = o
++            mlp.gate_up_proj.weight = gate_up
++            mlp.down_proj.weight = down
++        for module in self.modules():
++            if isinstance(module, QuantLinear):
++                module.weight = module.weight_quantizer(module.weight).detach()
++                module.use_temporary_parameter = False
++
++    def clear_temp_variable(self):
++        for module in self.modules():
++            for attr in ("temp_weight", "temp_bias"):
++                if hasattr(module, attr):
++                    delattr(module, attr)
++            if hasattr(module, "use_temporary_parameter"):
++                module.use_temporary_parameter = False
++
++    def omni_state_dict(self, destination=None, prefix="", keep_vars=False):
++        if destination is None:
++            destination = OrderedDict()
++        for name, param in self.named_parameters():
++            if name.find("smooth") > -1 or name.find("bound_factor") > -1:
++                destination[prefix + name] = param if keep_vars else param.detach()
++        return destination
++
++    @torch.no_grad()
++    def to_native(self, native_layer):
++        """Copy the folded, fake-quantized tensors into a fresh transformers Phi3DecoderLayer."""
++        pairs = (
++            (native_layer.input_layernorm.weight, self.input_layernorm.weight),
++            (native_layer.post_attention_layernorm.weight, self.post_attention_layernorm.weight),
++            (native_layer.self_attn.qkv_proj.weight, self.self_attn.qkv_proj.weight),
++            (native_layer.self_attn.o_proj.weight, self.self_attn.o_proj.weight),
++            (native_layer.mlp.gate_up_proj.weight, self.mlp.gate_up_proj.weight),
++            (native_layer.mlp.down_proj.weight, self.mlp.down_proj.weight),
++        )
++        for dst, src in pairs:
++            if dst.shape != src.shape:
++                raise ValueError(f"shape mismatch {tuple(dst.shape)} vs {tuple(src.shape)}")
++            dst.copy_(src.to(dst.dtype))
++        for module in self.modules():
++            if isinstance(module, QuantLinear) and module.bias is not None:
++                raise ValueError("a Phi-3 linear gained a bias; the native layer cannot hold it")
++        return native_layer
+diff --git a/quant_agent_inference_adapter.py b/quant_agent_inference_adapter.py
+new file mode 100644
+index 0000000..481d0d0
+--- /dev/null
++++ b/quant_agent_inference_adapter.py
+@@ -0,0 +1,180 @@
++"""Reload an OmniQuant W4A4 Phi-3 artifact with its activation quantization.
++
++The artifact (quantize/phi3_export.py) is the repo's own ``--save_dir`` format: a native
++Phi3ForCausalLM checkpoint whose decoder linears hold fake-quantized fp16 weights (4-bit
++asymmetric per output channel with the learned clipping, every LET folded into the norms and
++weights). Saving drops OmniQuant's activation quantizers, so loading it with plain transformers
++would run W4A16. This adapter puts them back, as QuantLinear / QuantMatMul run them in the repo
++(quantize/quantizer.py:118-159, dynamic asymmetric MinMax, ``a_bits`` levels):
++
++* the input of every decoder linear (qkv_proj, o_proj, gate_up_proj, down_proj): per token;
++* Q and K after the rotary embedding, and V: per token and per head (head_dim values),
++  as models/int_llama_layer.py:141-162 does; the softmax output stays 16-bit.
++
++The quantizer arithmetic runs in fp32 and is cast back to fp16, as the calibration layer's
++FP32ActQuantizer (models/int_phi3_layer.py) does.
++
++Per-token quantization of K/V commutes with caching and with repeat_kv, so K/V are quantized
++once before they enter the cache. Quantizer arithmetic, the RMSNorm product order and the eager
++attention follow the calibration layer (models/int_phi3_layer.py) op for op, because a W4A4 model
++amplifies one-level rounding flips: a reload of the same weights with SDPA and a different
++quantizer dtype than calibration differed from the calibrated model by ~0.3 relative logit error on
++two layers (with the same quality versus fp16). There is no packed A4 kernel in the repo; this is fake quantization in fp16 (no VRAM or
++speed gain).
++
++The model is always built with the native transformers class: the artifact has no auto_map and
++no modeling code, so remote code is never loaded whatever ``trust_remote_code`` says.
++"""
++import json
++import math
++import os
++import types
++
++import torch
++import torch.nn.functional as F
++
++QUANT_AGENT_ADAPTER_API = 1
++QUANT_CONFIG_NAME = "quantization_config.json"
++LINEAR_NAMES = ("self_attn.qkv_proj", "self_attn.o_proj", "mlp.gate_up_proj", "mlp.down_proj")
++
++
++def fake_quant_per_token(x, n_bits):
++    """UniformAffineQuantizer(symmetric=False, dynamic per_token) over the last dim.
++
++    Same op order as quantize/quantizer.py:94-159, evaluated in fp32 and cast back to the
++    activation dtype exactly as models/int_phi3_layer.py FP32ActQuantizer does in calibration,
++    so the reload reproduces the calibrated model's rounding.
++    """
++    if n_bits >= 16:
++        return x
++    out_dtype = x.dtype
++    x = x.float()
++    qmax = 2 ** n_bits - 1
++    xmin = x.amin(dim=-1, keepdim=True)
++    xmax = x.amax(dim=-1, keepdim=True)
++    scale = ((xmax - xmin) / qmax).clamp(min=1e-5, max=1e4)
++    round_zero = (-xmin / scale).clamp(min=-1e4, max=1e4).round()
++    x_int = torch.round(x / scale).add(round_zero).clamp(0, qmax)
++    return x_int.sub(round_zero).mul(scale).to(out_dtype)
++
++
++def _omni_rmsnorm_forward(self, hidden_states):
++    """quantize/omni_norm.py OmniLlamaRMSNorm: the weight multiplies the fp32 normalised states."""
++    input_dtype = hidden_states.dtype
++    variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
++    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
++    return (self.weight * hidden_states).to(input_dtype)
++
++
++def _a4_linear_forward(self, x):
++    return F.linear(fake_quant_per_token(x, self.omniquant_a_bits), self.weight, self.bias)
++
++
++def _a4_attention_forward(
++    self,
++    hidden_states,
++    attention_mask=None,
++    position_ids=None,
++    past_key_value=None,
++    output_attentions=False,
++    use_cache=False,
++    cache_position=None,
++    **kwargs,
++):
++    from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, repeat_kv
++
++    bsz, q_len, _ = hidden_states.size()
++    qkv = self.qkv_proj(hidden_states)
++    query_pos = self.num_heads * self.head_dim
++    kv_width = self.num_key_value_heads * self.head_dim
++    query_states = qkv[..., :query_pos]
++    key_states = qkv[..., query_pos : query_pos + kv_width]
++    value_states = qkv[..., query_pos + kv_width :]
++    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
++    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
++    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
++
++    kv_seq_len = key_states.shape[-2]
++    if past_key_value is not None:
++        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
++    cos, sin = self.rotary_emb(value_states, position_ids, seq_len=kv_seq_len)
++    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++
++    bits = self.omniquant_qkv_bits
++    query_states = fake_quant_per_token(query_states, bits)
++    key_states = fake_quant_per_token(key_states, bits)
++    value_states = fake_quant_per_token(value_states, bits)
++
++    if past_key_value is not None:
++        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
++        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
++
++    key_states = repeat_kv(key_states, self.num_key_value_groups)
++    value_states = repeat_kv(value_states, self.num_key_value_groups)
++
++    # Eager attention exactly as models/int_phi3_layer.py (int_llama_layer.py:141-163): fp16 QK^T,
++    # additive causal mask, fp32 softmax cast back, softmax output kept 16-bit.
++    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
++    if attention_mask is not None:
++        attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]].to(attn_weights.dtype)
++        attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device))
++    elif q_len > 1:
++        kv_len = key_states.shape[-2]
++        causal = torch.ones(q_len, kv_len, dtype=torch.bool, device=attn_weights.device).tril(kv_len - q_len)
++        attn_weights = attn_weights.masked_fill(~causal, torch.finfo(attn_weights.dtype).min)
++    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
++    attn_output = torch.matmul(attn_weights, value_states)
++    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
++    attn_output = self.o_proj(attn_output)
++    return attn_output, None, past_key_value
++
++
++def apply_activation_quant(model, a_bits, qkv_bits):
++    """Re-attach OmniQuant's runtime activation quantization to a loaded Phi-3 model."""
++    patched = 0
++    for layer in model.model.layers:
++        attn = layer.self_attn
++        for name in LINEAR_NAMES:
++            module = layer.get_submodule(name)
++            if not isinstance(module, torch.nn.Linear):
++                raise TypeError(f"{name} is {type(module).__name__}, expected nn.Linear")
++            module.omniquant_a_bits = int(a_bits)
++            module.forward = types.MethodType(_a4_linear_forward, module)
++            patched += 1
++        attn.omniquant_qkv_bits = int(qkv_bits)
++        attn.forward = types.MethodType(_a4_attention_forward, attn)
++        for norm in (layer.input_layernorm, layer.post_attention_layernorm):
++            norm.forward = types.MethodType(_omni_rmsnorm_forward, norm)
++    return patched
++
++
++def load_model_and_tokenizer(model_path, model_id, dtype, device, trust_remote_code):
++    from transformers import AutoTokenizer
++    from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
++
++    del model_id, trust_remote_code  # the saved artifact is loaded natively, never remote code
++    with open(os.path.join(model_path, QUANT_CONFIG_NAME)) as handle:
++        quant_config = json.load(handle)
++    a_bits = int(quant_config.get("a_bits", 16))
++    qkv_bits = int(quant_config.get("qkv_bits", a_bits))
++    on_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
++    if dtype == "bfloat16":
++        print("omniquant adapter: fake-quant weights are stored in float16; loading float16, not bfloat16")
++    torch_dtype = torch.float16 if on_cuda else torch.float32
++    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
++    model = Phi3ForCausalLM.from_pretrained(
++        model_path,
++        torch_dtype=torch_dtype,
++        attn_implementation="eager",
++        local_files_only=True,
++    )
++    model.to("cuda" if on_cuda else "cpu")
++    patched = apply_activation_quant(model, a_bits, qkv_bits)
++    model.eval()
++    model.omniquant_runtime = {
++        "a_bits": a_bits,
++        "qkv_bits": qkv_bits,
++        "patched_linears": patched,
++        "attention": "eager on fake-quantized Q/K/V (as calibrated)",
++    }
++    return model, tokenizer
+diff --git a/quantize/omniquant.py b/quantize/omniquant.py
+index c4af3dd..c02ab37 100644
+--- a/quantize/omniquant.py
++++ b/quantize/omniquant.py
+@@ -3,6 +3,7 @@ import torch.nn as nn
+ from models.int_llama_layer import QuantLlamaDecoderLayer
+ from models.int_opt_layer import QuantOPTDecoderLayer
+ from models.int_falcon_layer import QuantFalconDecoderLayer
++from models.int_phi3_layer import QuantPhi3DecoderLayer
+ from quantize.int_linear import QuantLinear
+ from contextlib import nullcontext
+ import copy
+@@ -55,7 +56,15 @@ def omniquant(
+     use_cache = model.config.use_cache
+     model.config.use_cache = False
+     is_llama = False
+-    if "llama" in args.net.lower():
++    is_phi3 = getattr(model.config, "model_type", None) == "phi3"
++    if is_phi3:
++        # Phi-3 (fused qkv_proj / gate_up_proj): models/int_phi3_layer.py owns its LET pairs.
++        layers = model.model.layers
++        model.model.embed_tokens = model.model.embed_tokens.to(dev)
++        model.model.norm = model.model.norm.to(dev)
++        DecoderLayer = QuantPhi3DecoderLayer
++        layer_name_prefix = "model.layers"
++    elif "llama" in args.net.lower():
+         is_llama = True
+         layers = model.model.layers
+         model.model.embed_tokens = model.model.embed_tokens.to(dev)
+@@ -127,7 +136,7 @@ def omniquant(
+             raise ValueError
+ 
+     layers[0] = Catcher(layers[0])
+-    layers[0].is_llama = is_llama
++    layers[0].is_llama = is_llama or is_phi3
+ 
+     with torch.no_grad():
+         for batch in dataloader:
+@@ -141,7 +150,7 @@ def omniquant(
+     # move embedding layer and first layer to cpu
+     layers[0] = layers[0].module
+     layers[0] = layers[0].cpu()
+-    if "llama" in args.net.lower() or "mixtral" in args.net.lower():
++    if is_phi3 or "llama" in args.net.lower() or "mixtral" in args.net.lower():
+         model.model.embed_tokens = model.model.embed_tokens.cpu()
+         model.model.norm = model.model.norm.cpu()
+     elif "opt" in args.net.lower():
+@@ -175,7 +184,7 @@ def omniquant(
+         attention_mask_batch = None
+ 
+     loss_func = torch.nn.MSELoss()
+-    if is_llama:
++    if is_llama or is_phi3:
+         position_ids = cache["position_ids"]
+     else:
+         position_ids = None
+@@ -217,9 +226,12 @@ def omniquant(
+         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
+         qlayer.let = args.let
+         use_shift = True 
+-        if is_llama or args.abits == 16:
++        if is_llama or is_phi3 or args.abits == 16:
+             use_shift = False                   # deactivate channel-wise shifting for llama model and weight-only quantization
+-        if args.let:
++        if args.let and is_phi3:
++            # SmoothQuant init of the Phi-3 LET scales (no shifts: RMSNorm and linears have no bias)
++            qlayer.init_let(act_scales, f"{layer_name_prefix}.{i}", args.alpha, dev, dtype)
++        elif args.let:
+             # init channel-wise scaling and shift
+             qlayer.register_parameter("qkt_smooth_scale",torch.nn.Parameter(torch.ones(layer.self_attn.q_proj.out_features,device=dev, dtype=dtype)))
+             for name,module in qlayer.named_modules():
+@@ -247,36 +259,72 @@ def omniquant(
+             optimizer = torch.optim.AdamW(
+                 [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}],weight_decay=args.wd)
+             loss_scaler = utils.NativeScalerWithGradNormCount()
++            keep_best = getattr(args, "keep_best_epoch", False)
++            best_loss, best_epoch, best_state = float("inf"), -1, None
+             
++            steps_per_epoch = args.nsamples // args.batch_size
+             for epochs in range(args.epochs):
+                 loss_list = []
+                 norm_list = []
+-                for j in range(args.nsamples//args.batch_size):    
++                nonfinite_loss = 0
++                skipped_steps = 0
++                for j in range(steps_per_epoch):
+                     index = j * args.batch_size
+                     # obtain output of quantization model
+                     with traincast():
+-                        smooth_and_quant_temporary(qlayer, args, is_llama)
++                        if is_phi3:
++                            qlayer.smooth_and_quant_temporary()
++                        else:
++                            smooth_and_quant_temporary(qlayer, args, is_llama)
+                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                         if args.aug_loss:
+                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+                     if not math.isfinite(loss.item()):
+-                        logger.info("Loss is NAN, stopping training")
+-                        pdb.set_trace()
+-                        
++                        # skip this step (no update) instead of aborting; checked per epoch below
++                        nonfinite_loss += 1
++                        optimizer.zero_grad()
++                        continue
+                     loss_list.append(loss.detach().cpu())
+                     optimizer.zero_grad()
+                     norm = loss_scaler(loss, optimizer,parameters= get_omni_parameters(qlayer, use_shift)).cpu()
++                    if not torch.isfinite(norm):
++                        skipped_steps += 1  # GradScaler skipped this update (overflowed gradients)
+                     norm_list.append(norm.data)
+ 
+-                loss_mean = torch.stack(loss_list).mean()
+-                norm_mean = torch.stack(norm_list).mean()
+-                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+-            clear_temp_variable(qlayer)
++                params_finite = all(bool(torch.isfinite(p).all()) for p in get_omni_parameters(qlayer, use_shift))
++                loss_mean = torch.stack(loss_list).mean() if loss_list else torch.tensor(float("nan"))
++                norm_mean = torch.stack(norm_list).mean() if norm_list else torch.tensor(float("nan"))
++                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} nonfinite_loss:{nonfinite_loss} skipped_steps:{skipped_steps} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
++                if not params_finite or nonfinite_loss * 2 > steps_per_epoch:
++                    if keep_best and best_state is not None:
++                        logger.info(f"layer {i} epoch {epochs}: non-finite parameters or losses ({nonfinite_loss}/{steps_per_epoch}); stopping this layer at its best epoch")
++                        break
++                    raise RuntimeError(f"non-finite OmniQuant training in layer {i} epoch {epochs}: "
++                                       f"{nonfinite_loss}/{steps_per_epoch} non-finite losses, parameters finite={params_finite}")
++                if keep_best and math.isfinite(loss_mean.item()) and loss_mean.item() < best_loss:
++                    # parameters at the end of the epoch with the lowest mean block loss
++                    best_loss, best_epoch = loss_mean.item(), epochs
++                    best_state = {n: p.detach().clone() for n, p in qlayer.named_parameters()
++                                  if n.find("smooth") > -1 or n.find("bound_factor") > -1}
++            if keep_best and best_state is not None and (best_epoch != epochs or not params_finite):
++                with torch.no_grad():
++                    for n, p in qlayer.named_parameters():
++                        if n in best_state:
++                            p.copy_(best_state[n])
++                logger.info(f"layer {i} keeps the epoch {best_epoch} parameters (mean loss {best_loss})")
++            del best_state
++            if is_phi3:
++                qlayer.clear_temp_variable()
++            else:
++                clear_temp_variable(qlayer)
+             del optimizer
+         qlayer.half() 
+         # real smooth and quantization
+-        smooth_and_quant_inplace(qlayer, args, is_llama)
++        if is_phi3:
++            qlayer.smooth_and_quant_inplace()
++        else:
++            smooth_and_quant_inplace(qlayer, args, is_llama)
+         if args.epochs>0:
+             # update input of quantization model
+             with torch.no_grad():
+diff --git a/quantize/phi3_export.py b/quantize/phi3_export.py
+new file mode 100644
+index 0000000..1aa532d
+--- /dev/null
++++ b/quantize/phi3_export.py
+@@ -0,0 +1,75 @@
++"""Calibration data and fake-quant export for the Phi-3 OmniQuant path.
++
++* get_wikitext2_local: datautils.get_wikitext2's trainloader (random 2048-token windows of the
++  "\\n\\n"-joined WikiText-2 train split, python ``random`` seeded with ``seed``), read from a local
++  parquet file instead of ``load_dataset`` so jobs never touch the Hub.
++* export_phi3_fakequant: main.py's ``--save_dir`` artifact (fake-quantized fp16 weights with every
++  LET folded in) written as a native Phi3ForCausalLM checkpoint: each QuantPhi3DecoderLayer is
++  copied back into a transformers Phi3DecoderLayer, ``auto_map`` is stripped from config.json so
++  the artifact never needs remote code, and quantization_config.json records the activation
++  quantization the reload must re-apply (A4 per-token linear inputs and Q/K/V).
++"""
++import json
++import os
++import random
++
++import torch
++
++
++def get_wikitext2_local(parquet_path, tokenizer, nsamples, seed, seqlen):
++    import pyarrow.parquet as pq
++
++    texts = pq.read_table(parquet_path, columns=["text"]).column("text").to_pylist()
++    trainenc = tokenizer("\n\n".join(texts), return_tensors="pt")
++    total = trainenc.input_ids.shape[1]
++    if total <= seqlen + 1:
++        raise ValueError(f"wikitext2 train has {total} tokens, fewer than seqlen {seqlen}")
++    random.seed(seed)
++    trainloader = []
++    for _ in range(nsamples):
++        i = random.randint(0, total - seqlen - 1)
++        inp = trainenc.input_ids[:, i : i + seqlen]
++        tar = inp.clone()
++        tar[:, :-1] = -100
++        trainloader.append((inp, tar))
++    return trainloader
++
++
++@torch.no_grad()
++def export_phi3_fakequant(model, tokenizer, output_dir, quant_config):
++    from transformers.models.phi3.modeling_phi3 import Phi3DecoderLayer
++
++    from models.int_phi3_layer import QuantPhi3DecoderLayer
++
++    layers = model.model.layers
++    converted = 0
++    for idx in range(len(layers)):
++        qlayer = layers[idx]
++        if not isinstance(qlayer, QuantPhi3DecoderLayer):
++            raise TypeError(f"layer {idx} is {type(qlayer).__name__}, not QuantPhi3DecoderLayer")
++        native = Phi3DecoderLayer(model.config, layer_idx=idx).to(dtype=torch.float16)
++        layers[idx] = qlayer.to_native(native).eval()
++        converted += 1
++        del qlayer
++    model.to(torch.float16)
++    model.config.use_cache = True
++    os.makedirs(output_dir, exist_ok=True)
++    model.save_pretrained(output_dir, safe_serialization=True)
++    tokenizer.save_pretrained(output_dir)
++
++    config_path = os.path.join(output_dir, "config.json")
++    with open(config_path) as handle:
++        config = json.load(handle)
++    config.pop("auto_map", None)
++    config["torch_dtype"] = "float16"
++    config["use_cache"] = True
++    with open(config_path, "w") as handle:
++        json.dump(config, handle, indent=2)
++    for stale in ("configuration_phi3.py", "modeling_phi3.py"):
++        path = os.path.join(output_dir, stale)
++        if os.path.exists(path):
++            os.remove(path)
++
++    with open(os.path.join(output_dir, "quantization_config.json"), "w") as handle:
++        json.dump(quant_config, handle, indent=2)
++    return {"layers": converted, "output_dir": os.path.abspath(output_dir), "files": sorted(os.listdir(output_dir))}

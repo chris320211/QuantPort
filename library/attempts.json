@@ -93,6 +93,53 @@
       "max_seq_len": 2048,
       "verification_status": "passed",
       "benchmark_status": "passed"
+    },
+    {
+      "schema_version": 2,
+      "model_id": "microsoft/Phi-3.5-mini-instruct",
+      "method_name": "OmniQuant",
+      "gpu_instance": "vast-rtx3090",
+      "gpu_name": "NVIDIA GeForce RTX 3090",
+      "slug": "omniquant-phi35-mini-vastrtx3090",
+      "stop_reason": "verify_failed",
+      "quality_ok": false,
+      "issue_codes": [
+        "loader_arch"
+      ],
+      "root_cause": "w4a4_massive_activation_collapse",
+      "notes": [
+        "Model collapsed, not a loader bug: the job reloaded the artifact through the adapter and matched the in-memory model exactly (rel_logit_error 0.0, top-1 1.0); verify then generated only newlines. diagnose labelled it loader_arch because verify failed on an unpacked artifact.",
+        "Per-layer block loss (quantized vs fp16 layer output) after 20 epochs: layers 0-3 <=0.31, 4-12 0.8-1.6, then 29.2 at layer 13 rising to ~40+ by layer 24; training moved deep layers <1%. Phi-3.5 builds massive activations from layer 13 (residual up to 8712, down_proj input 2926); per-token A4 caps the quantized path near 3500. OmniQuant per-channel LET cannot spread a single outlier channel; prefer rotation methods (QuaRot, SpinQuant, FlatQuant) for Phi-3.5 at A4.",
+        "First job 20261102T224718Z-e79ead died at layer 5 epoch 4: fp16 overflow in the backward of the per-token V quantizer (attention-sink rows, scale clamp 1e-5) drove GradScaler to 2.9e-39 and NaN into LET/LWC params. Fixed in the diagnose_fix overlay by running activation and Q/K/V quantizers in fp32 under fp16 AMP (bf16 autocast was stable but gave clearly worse block losses).",
+        "Stopped by the user after one retry (diagnose suggested retry_ranked_overlay phi3_layer, which lacks the fp32 fix). No WikiText-2 benchmark: the pipeline skips it after a failed verify."
+      ],
+      "error_excerpt": "\u202671875 \nomniquant done (9464s)\nsaved {\"layers\": 32, \"output_dir\": \"/workspace/QuantPort/quantized/omniquant-phi35-mini-vastrtx3090\", \"files\": [\"added_tokens.json\", \"config.json\", \"generation_config.json\", \"model-00001-of-00002.safetensors\", \"model-00002-of-00002.safetensors\", \"model.safetensors.index.json\", \"omni_parameters.pth\", \"quantization_config.json\", \"special_tokens_map.json\", \"tokenizer.json\", \"tokenizer.model\", \"tokenizer_config.json\"]}\nreload_vs_inmemory {\"tokens\": 256, \"rel_logit_error_vs_inmemory\": 0.0, \"top1_agreement\": 1.0, \"finite\": true, \"runtime\": {\"a_bits\": 4, \"qkv_bits\": 4, \"patched_linears\": 128, \"attention\": \"eager on fake-quantized Q/K/V (as calibrated)\"}}\ndone in 9513s",
+      "ppl": null,
+      "ppl_ratio": null,
+      "tokens_per_s": null,
+      "peak_vram_gb": null,
+      "fp16_ppl": null,
+      "fp16_tokens_per_s": null,
+      "fp16_peak_vram_gb": null,
+      "improved_throughput": null,
+      "improved_vram": null,
+      "packed": false,
+      "arxiv_id": "2308.13137",
+      "paper_url": "https://arxiv.org/abs/2308.13137",
+      "repo_url": "https://github.com/OpenGVLab/OmniQuant",
+      "repo_commit": "feffe8ea87d80f7bb57b6e25e7cff9dc950fcc14",
+      "job_id": "20261103T000643Z-1b9a18",
+      "best_job_id": "20261103T000643Z-1b9a18",
+      "best_ppl_ratio": null,
+      "best_overlay_dir": null,
+      "retry_gpu_jobs_used": 1,
+      "retry_gpu_jobs_max": 14,
+      "artifact_dir": "quantized/omniquant-phi35-mini-vastrtx3090",
+      "dataset": "wikitext-2-raw-v1",
+      "max_seq_len": 2048,
+      "verification_status": "failed",
+      "benchmark_status": null,
+      "port": "library/ports/attempts/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__OmniQuant"
     }
   ]
 }

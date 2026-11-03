@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "attempt",
+  "model_id": "microsoft/Phi-3.5-mini-instruct",
+  "model_type": "phi3",
+  "method_name": "OmniQuant",
+  "gpu_instance": "vast-rtx3090",
+  "slug": "omniquant-phi35-mini-vastrtx3090",
+  "job_id": "20261103T000643Z-1b9a18",
+  "repo_url": "https://github.com/OpenGVLab/OmniQuant",
+  "repo_commit": "feffe8ea87d80f7bb57b6e25e7cff9dc950fcc14",
+  "patch_sha256": "f0379127c7a2d0bc85e56107cc9ff8b50962f068dabb32ba3a4c6218a9cc7717",
+  "files": [
+    "differences.json",
+    "manifest.json",
+    "method.md",
+    "overlay.patch",
+    "quantize.py"
+  ]
+}
