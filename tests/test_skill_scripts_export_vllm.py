@@ -14,7 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import export_vllm as export_mod  # noqa: E402
 
-_PACK = {"F16": "e", "F32": "f", "I8": "b", "U8": "B"}
+_PACK = {"F16": "e", "F32": "f", "I8": "b", "U8": "B", "I32": "i"}
 
 
 def write_safetensors(path: Path, tensors: dict[str, tuple[str, list[int], list]]) -> None:
@@ -362,3 +362,127 @@ def test_sharded_artifact_writes_index(tmp_path):
     index = json.loads((out / "model.safetensors.index.json").read_text())
     assert index["weight_map"]["model.layers.1.mlp.up_proj.weight_scale"] == "model-00002-of-00002.safetensors"
     assert index["weight_map"]["model.layers.0.self_attn.q_proj.weight_scale"] == "model.safetensors"
+
+
+# --- weight-only native profile (GPTQ / AWQ / AutoRound checkpoints) ---
+
+_QW_MODULES = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj")
+
+
+def _packed_linear(prefix: str, *, layout: str = "gptq", in_features: int = 16, out_features: int = 8, group: int = 8) -> dict:
+    """int32-packed 4-bit linear in GPTQ ([K/8, N]) or AWQ ([K, N/8]) layout."""
+    groups = in_features // group
+    qshape = [in_features // 8, out_features] if layout == "gptq" else [in_features, out_features // 8]
+    return {
+        f"{prefix}.qweight": ("I32", qshape, [0x12345678] * (qshape[0] * qshape[1])),
+        f"{prefix}.qzeros": ("I32", [groups, out_features // 8], [0x77777777] * (groups * out_features // 8)),
+        f"{prefix}.scales": ("F16", [groups, out_features], [0.01] * (groups * out_features)),
+        f"{prefix}.g_idx": ("I32", [in_features], [i // group for i in range(in_features)]),
+    }
+
+
+def make_weight_only_artifact(root: Path, *, native: dict | None = None, layout: str = "gptq") -> Path:
+    root.mkdir(parents=True)
+    tensors = {
+        "model.embed_tokens.weight": ("F16", [6, 16], [0.5] * 96),
+        "model.layers.0.input_layernorm.weight": ("F16", [16], [1.0] * 16),
+        "model.layers.0.self_attn.q_norm.weight": ("F16", [8], [1.0] * 8),
+        "model.norm.weight": ("F16", [16], [1.0] * 16),
+        "lm_head.weight": ("F16", [6, 16], [0.75] * 96),
+    }
+    for module in _QW_MODULES:
+        tensors.update(_packed_linear(f"model.layers.0.{module}", layout=layout))
+    write_safetensors(root / "model.safetensors", tensors)
+    qcfg = native if native is not None else {
+        "quant_method": "auto-round", "bits": 4, "group_size": 8, "sym": True,
+        "data_type": "int", "packing_format": "auto_round:auto_gptq",
+    }
+    (root / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen3ForCausalLM"], "tie_word_embeddings": False, "quantization_config": qcfg})
+    )
+    (root / "tokenizer.json").write_text("{}")
+    return root
+
+
+def test_weight_only_checkpoint_passes_through_unchanged(tmp_path):
+    src = make_weight_only_artifact(tmp_path / "art")
+    out = tmp_path / "out"
+    record = export_mod.export(src, out, reference_dir=tmp_path / "missing-ref")
+    assert record["status"] == "exported"
+    assert record["profile"] == "weight_only_gptq"
+    assert (record["weight_bits"], record["group_size"], record["n_quantized_linears"]) == (4, 8, len(_QW_MODULES))
+    assert record["scale_convention"]["verdict"] == "skipped"
+    name = "model.layers.0.self_attn.q_proj.qweight"
+    assert read_tensor_bytes(out / "model.safetensors", name) == read_tensor_bytes(src / "model.safetensors", name)
+    config = json.loads((out / "config.json").read_text())
+    assert config["quantization_config"]["quant_method"] == "auto-round"
+    assert "lm_head" in record["ignore"]
+    assert (out / "tokenizer.json").is_file()
+
+
+def test_awq_layout_is_recognized(tmp_path):
+    native = {"quant_method": "awq", "bits": 4, "group_size": 8, "zero_point": True}
+    src = make_weight_only_artifact(tmp_path / "art", native=native, layout="awq")
+    record = export_mod.export(src, tmp_path / "out")
+    assert record["profile"] == "weight_only_awq"
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"bits": 3}, "weight_bits_unsupported"),
+        ({"act_bits": 4}, "activation_bits_unsupported"),
+        ({"data_type": "mx_fp"}, "weight_scheme_unsupported"),
+        ({"group_size": 4}, "weight_scale_layout_unsupported"),
+        ({"quant_method": "hqq"}, "already_quantized_config"),
+    ],
+)
+def test_weight_only_refusals(tmp_path, change, reason):
+    native = {
+        "quant_method": "auto-round", "bits": 4, "group_size": 8, "sym": True,
+        "data_type": "int", "packing_format": "auto_round:auto_gptq", **change,
+    }
+    src = make_weight_only_artifact(tmp_path / "art", native=native)
+    record = export_mod.export(src, tmp_path / "out")
+    assert record["reason_code"] == reason
+    assert not (tmp_path / "out").exists()
+
+
+def test_weight_only_with_runtime_transform_is_refused(tmp_path):
+    src = make_weight_only_artifact(tmp_path / "art")
+    (src / "quantization_config.json").write_text(json.dumps({"online_hadamard": True}))
+    assert export_mod.export(src, tmp_path / "out")["reason_code"] == "runtime_transform_unsupported"
+
+
+def test_weight_only_partly_quantized_fused_group_is_refused(tmp_path):
+    src = make_weight_only_artifact(tmp_path / "art")
+    path = src / "model.safetensors"
+    tensors, _ = export_mod.read_safetensors_header(path)
+    kept = {}
+    with path.open("rb") as handle:
+        for info in tensors:
+            if ".v_proj." in info.name:
+                continue
+            handle.seek(info.start)
+            raw = handle.read(info.nbytes)
+            fmt = _PACK[info.dtype]
+            kept[info.name] = (info.dtype, info.shape, list(struct.unpack(f"<{len(raw) // struct.calcsize(fmt)}{fmt}", raw)))
+    kept["model.layers.0.self_attn.v_proj.weight"] = ("F16", [8, 16], [0.1] * 128)
+    write_safetensors(path, kept)
+    record = export_mod.export(src, tmp_path / "out")
+    assert record["reason_code"] == "mixed_fused_group"
+    assert "v_proj" in record["detail"]
+
+
+def test_weight_only_stray_transform_tensor_is_refused(tmp_path):
+    src = make_weight_only_artifact(tmp_path / "art")
+    _add_tensors(src, {"model.layers.0.mlp.smooth_scale": ("F16", [16], [1.0] * 16)})
+    assert export_mod.export(src, tmp_path / "out")["reason_code"] == "unrecognized_quantized_tensors"
+
+
+def test_asymmetric_weight_only_is_exported_with_a_note(tmp_path):
+    native = {"quant_method": "gptq", "bits": 4, "group_size": 8, "sym": False, "desc_act": False}
+    src = make_weight_only_artifact(tmp_path / "art", native=native)
+    record = export_mod.export(src, tmp_path / "out")
+    assert record["status"] == "exported"
+    assert any("sym=True" in note for note in record["notes"])

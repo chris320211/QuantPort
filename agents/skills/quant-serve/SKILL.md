@@ -27,32 +27,46 @@ Do not ask the parent mid-stage. Never read `.env`; this stage needs no tokens.
    ```
 
    Exit 0 `exported` → `quantized/<slug>-vllm/` (safetensors + `config.json`
-   with a compressed-tensors `quantization_config`, tokenizer; no `.py`, no
+   with a `quantization_config` vLLM reads natively, tokenizer; no `.py`, no
    pickles). Exit 2 `unsupported` → stop and return `unsupported` with
    `reason_code`. Both write `jobs/<job_id>/vllm_export.json`.
 
-   The format is detected from the saved tensors, not the method name. Only
-   `w8a8_int8` (int8 per-channel weights + dynamic per-token int8
-   activations) exports today. Typed refusals:
+   The format is detected from the saved tensors, not the method name. Two
+   profiles export today:
+
+   - `w8a8_int8`: int8 per-channel weights + dynamic per-token int8
+     activations, renamed into compressed-tensors `int-quantized`.
+   - `weight_only_gptq` / `weight_only_awq`: the artifact's `config.json`
+     already declares a GPTQ, AWQ or AutoRound `quantization_config` (4- or
+     8-bit integer weights, 16-bit activations). The packed `qweight` /
+     `scales` / `qzeros` / `g_idx` tensors are checked against the declared
+     bits, group size and layout, then passed through unchanged; vLLM runs
+     them on Marlin (sm_80+). Asymmetric weights export with a note (vLLM
+     uses a slower kernel than Marlin).
+
+   Typed refusals:
 
    | `reason_code` | Meaning |
    | --- | --- |
-   | `activation_bits_unsupported` | A4 or lower (FlatQuant/QuaRot W4A4). No vLLM int4-activation GEMM outside NVFP4/MXFP4 on Blackwell. |
+   | `activation_bits_unsupported` | A4 or lower (FlatQuant/QuaRot W4A4). No vLLM int4-activation GEMM outside NVFP4/MXFP4 on Blackwell. A weight-only config with `act_bits` < 16 is refused the same way. |
+   | `weight_bits_unsupported` | Weight-only config with bits other than 4 or 8 (vLLM's Marlin weight-only kernels). |
    | `pickle_weights` | `.pt`/`.bin` only. Re-run with `--allow-torch-load` (uses `torch.load(weights_only=True)`; run under `.venvs/<slug>/bin/python`). |
    | `activation_scheme_unknown` / `activation_scheme_unsupported` | `quantization_config.json` lacks `act_quant`, or it is not `per_token`. |
-   | `weight_scheme_unsupported` / `weight_scale_layout_unsupported` | Not per-output-channel int8 scales. |
+   | `weight_scheme_unsupported` / `weight_scale_layout_unsupported` | Not per-output-channel int8 scales; or, for weight-only, non-integer `data_type` or `qweight`/`scales`/`qzeros` shapes that do not match the declared bits, group size and GPTQ/AWQ layout. |
    | `unrecognized_quantized_tensors` | Integer tensors that match no profile (packed int4, GPTQ `qweight`, …), or leftover float side tensors (zero points, `input_scale`, smoothing scales, Hadamard/rotation matrices). |
    | `runtime_transform_unsupported` | `quantization_config.json` enables an online rotation or Hadamard. vLLM's int8 path has none. |
    | `asymmetric_unsupported` | Asymmetric weights or activations (`w_sym: false`, `*_asym`). |
    | `quantized_embedding_unsupported` | `lm_head` or the embedding is int8. vLLM has no int8 path for those layers. |
    | `mixed_fused_group` | Part of q/k/v or gate/up is int8 and part float. vLLM fuses each group with one scheme. |
    | `tied_lm_head_mismatch` | Config ties `lm_head` to the embedding but the saved head differs. vLLM would ignore the saved head. |
-   | `no_quantized_linears`, `no_weights`, `config_missing`, `already_quantized_config` | Nothing to convert. |
+   | `no_quantized_linears`, `no_weights`, `config_missing` | Nothing to convert. |
+   | `already_quantized_config` | `config.json` declares a `quantization_config` no profile handles (compressed-tensors, HQQ, …); serve it directly if vLLM supports it. |
 
    Do not hand-edit the export to get past a refusal. Do not author an
    overlay. A new profile is a change to `export_vllm.py` with tests.
 
-   Check `scale_convention.verdict` in the output. `confirmed` means
+   Check `scale_convention.verdict` in the output (`skipped` for weight-only
+   pass-throughs: the serve check's drift gate tests them). `confirmed` means
    `int8 * weight_scale` reproduces the fp16 snapshot on modules the method
    left untransformed. `inconclusive` is normal for methods that transform
    every linear. `contradicted` means the export would be wrong: return

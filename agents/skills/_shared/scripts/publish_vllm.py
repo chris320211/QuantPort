@@ -59,13 +59,21 @@ def _speedup_text(decode: dict | None, fmt: str = "{v}× at batch {b}") -> str:
     return ", ".join(fmt.format(v=_fmt(v, 2), b=b) for b, v in items) or "n/a"
 
 
-def render_results_table(report: dict) -> str:
-    """vLLM int8 vs the vLLM baseline, plus plain-Transformers columns when `hf_runtime` is attached."""
+def quant_label(export_record: dict | None) -> str:
+    """Short name of the exported scheme for card columns: `int8` (W8A8) or e.g. `W4A16`."""
+    record = export_record or {}
+    if str(record.get("profile") or "").startswith("weight_only"):
+        return f"W{record.get('weight_bits') or 4}A16"
+    return "int8"
+
+
+def render_results_table(report: dict, label: str = "int8") -> str:
+    """vLLM quantized vs the vLLM baseline, plus plain-Transformers columns when `hf_runtime` is attached."""
     ref = dtype_label(report)
-    sides = [("vLLM int8", report.get("quantized") or {}), (f"vLLM {ref}", report.get("fp16_baseline") or {})]
+    sides = [(f"vLLM {label}", report.get("quantized") or {}), (f"vLLM {ref}", report.get("fp16_baseline") or {})]
     hf = report.get("hf_runtime")
     if isinstance(hf, dict):
-        sides += [("Transformers int8", hf.get("quantized") or {}), (f"Transformers {ref}", hf.get("baseline") or {})]
+        sides += [(f"Transformers {label}", hf.get("quantized") or {}), (f"Transformers {ref}", hf.get("baseline") or {})]
     batches = sorted(_decode_rows(sides[0][1]))
     rows = [
         ("Perplexity", [_fmt(s.get("perplexity"), 4) for _, s in sides]),
@@ -83,7 +91,7 @@ def render_results_table(report: dict) -> str:
     return head + rule + "".join(f"| {label} | " + " | ".join(cells) + " |\n" for label, cells in rows)
 
 
-def _hf_runtime_notes(report: dict, base_repo_id: str) -> str:
+def _hf_runtime_notes(report: dict, base_repo_id: str, label: str = "int8") -> str:
     hf = report.get("hf_runtime")
     if not isinstance(hf, dict):
         return ""
@@ -96,9 +104,33 @@ def _hf_runtime_notes(report: dict, base_repo_id: str) -> str:
         f"`{report.get('model_id') or 'the original model'}` in {ref}, in Transformers "
         f"{hf.get('transformers_version')} (torch {hf.get('torch_version')}) on the same GPU. Transformers "
         "prefills 8 windows per forward; vLLM schedules all 32.\n"
-        f"- Against Transformers {ref}: vLLM int8 prefill {_fmt(cmp_.get('vllm_prefill_speedup'), 2)}×, decode "
+        f"- Against Transformers {ref}: vLLM {label} prefill {_fmt(cmp_.get('vllm_prefill_speedup'), 2)}×, decode "
         f"{_speedup_text(cmp_.get('vllm_decode_speedup'))}. The native artifact in Transformers: prefill "
         f"{_fmt(cmp_.get('int8_prefill_speedup'), 2)}×, decode {_speedup_text(cmp_.get('int8_decode_speedup'))}.\n"
+    )
+
+
+def _format_card_text(export_record: dict, label: str, base_repo_id: str) -> tuple[str, str]:
+    """Hub tags (YAML list lines) and one description paragraph for the exported format."""
+    profile = str(export_record.get("profile") or "w8a8_int8")
+    if profile.startswith("weight_only"):
+        layout = profile.removeprefix("weight_only_")
+        bits = export_record.get("weight_bits") or 4
+        group = export_record.get("group_size")
+        group_text = "per output channel" if group in (None, -1) else f"group size {group}"
+        method = (export_record.get("quantization_config") or {}).get("quant_method") or layout
+        tags = f"- {layout}\n- int{bits}\n- {label.lower()}\n"
+        text = (
+            f"The {bits}-bit weights are the same bytes as `{base_repo_id}`, in its `{method}` format "
+            f"({layout.upper()} packing, {group_text}, {label}: activations stay in 16-bit). vLLM reads "
+            "the `quantization_config` in `config.json` and runs it on its Marlin kernels on sm_80+ GPUs."
+        )
+        return tags, text
+    return (
+        "- compressed-tensors\n- int8\n- w8a8\n",
+        "The int8 weights are the same bytes, renamed into the `compressed-tensors`\n"
+        "format (`int-quantized`: per-channel int8 weights, dynamic per-token int8\n"
+        "activations).",
     )
 
 
@@ -115,6 +147,7 @@ def render_vllm_card(
     quant = report.get("quantized") or {}
     cmp_ = report.get("comparison") or {}
     ref = dtype_label(report)
+    label = quant_label(export_record)
     gpu = quant.get("gpu_name") or "unknown GPU"
     version = quant.get("vllm_version") or "unknown"
     lic = license_info or {"license": "other"}
@@ -131,12 +164,18 @@ def render_vllm_card(
     )
     if drift is not None and drift < 1 / EXPORT_PPL_DRIFT_MAX:
         drift_line += (
-            "- vLLM scores better than the HF benchmark. vLLM's int8 path quantizes only "
-            f"the inputs of linear layers and keeps attention in {ref}, so this build rounds "
-            "less than the benchmarked model (for example, one that also quantized attention "
-            "inputs). Same weights, not bit-identical outputs.\n"
+            (
+                "- vLLM scores better than the HF benchmark. vLLM's int8 path quantizes only "
+                f"the inputs of linear layers and keeps attention in {ref}, so this build rounds "
+                "less than the benchmarked model (for example, one that also quantized attention "
+                "inputs). Same weights, not bit-identical outputs.\n"
+            )
+            if label == "int8"
+            else "- vLLM scores better than the HF benchmark: same weights, different kernels, "
+            "so not bit-identical outputs.\n"
         )
     method_tag = method_name.lower().replace(" ", "-")
+    format_tags, format_text = _format_card_text(export_record, label, base_repo_id)
     report = {**report, "model_id": model_id}
     if isinstance(report.get("hf_runtime"), dict):
         speed_note = (
@@ -157,18 +196,13 @@ tags:
 - quantport
 - {method_tag}
 - vllm
-- compressed-tensors
-- int8
-- w8a8
----
+{format_tags}---
 
 # {method_name} {model_id} for vLLM
 
 A native vLLM checkpoint of [`{base_repo_id}`](https://huggingface.co/{base_repo_id}),
 the {method_name} quantization of [`{model_id}`](https://huggingface.co/{model_id}).
-The int8 weights are the same bytes, renamed into the `compressed-tensors`
-format (`int-quantized`: per-channel int8 weights, dynamic per-token int8
-activations). No custom code, no `trust_remote_code`. Made with
+{format_text} No custom code, no `trust_remote_code`. Made with
 [QuantPort]({QUANTPORT_URL}).
 
 ## Serve
@@ -191,10 +225,10 @@ Measured with vLLM {version} on **{gpu}**, against vLLM {ref} of `{model_id}`.
 WikiText-2 test, 2048-token windows ({quant.get("tokens_evaluated", "?")} tokens),
 the same windows as the HF benchmark in `{base_repo_id}`.
 
-{render_results_table(report)}
-- PPL ratio (int8 / {ref}): {_fmt(cmp_.get("ppl_ratio"), 4)}
+{render_results_table(report, label)}
+- PPL ratio ({label} / {ref}): {_fmt(cmp_.get("ppl_ratio"), 4)}
 {drift_line}- Prefill speedup: {_fmt(cmp_.get("prefill_speedup"), 2)}×. Decode speedup: {decode_speedups}.
-{_hf_runtime_notes(report, base_repo_id)}
+{_hf_runtime_notes(report, base_repo_id, label)}
 {speed_note}
 
 ## Files
@@ -211,7 +245,8 @@ Inherits the license of [`{model_id}`](https://huggingface.co/{model_id})
 
 
 def render_card_section(
-    *, repo_id: str, report: dict, base_repo_id: str | None = None, model_id: str | None = None
+    *, repo_id: str, report: dict, base_repo_id: str | None = None, model_id: str | None = None,
+    label: str = "int8",
 ) -> str:
     """The block added to the base repo's card: where the vLLM build is, and its results."""
     quant = report.get("quantized") or {}
@@ -228,8 +263,8 @@ def render_card_section(
 Measured on {quant.get("gpu_name")}: the vLLM build against vLLM {ref}, and this
 repo's weights in plain Transformers against the original model.
 
-{render_results_table({**report, "model_id": model_id})}
-{_hf_runtime_notes({**report, "model_id": model_id}, base_repo_id or "this repo")}"""
+{render_results_table({**report, "model_id": model_id}, label)}
+{_hf_runtime_notes({**report, "model_id": model_id}, base_repo_id or "this repo", label)}"""
         if slower:
             results += (
                 f"\nFor serving, use [`{repo_id}`](https://huggingface.co/{repo_id}). In plain Transformers this "
@@ -420,9 +455,11 @@ def main() -> int:
             if not args.allow_unsafe_host_execution:
                 raise RuntimeError("upload requires --allow-unsafe-host-execution")
             report = json.loads((Path(manifest["stage_dir"]) / SERVE_REPORT).read_text())
+            export_record = json.loads((Path(manifest["stage_dir"]) / EXPORT_RECORD).read_text())
             section = render_card_section(
                 repo_id=manifest["repo_id"], report=report,
                 base_repo_id=args.base_repo_id, model_id=str(model_id),
+                label=quant_label(export_record),
             )
             with host_execution_policy(True):
                 if args.refresh_card:

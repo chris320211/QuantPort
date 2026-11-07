@@ -11,6 +11,7 @@ Profiles:
 | profile | saved tensors | vLLM checkpoint |
 | --- | --- | --- |
 | `w8a8_int8` | int8 `<linear>.weight [N,K]` + float scale `[N]`/`[N,1]`, per-token dynamic activations | compressed-tensors `int-quantized` |
+| `weight_only_gptq` / `weight_only_awq` | `config.json` already declares a GPTQ / AWQ / AutoRound `quantization_config`; int32 `qweight` + float `scales` (+ `qzeros`, `g_idx`), fp16 activations | the same checkpoint, validated and passed through (Marlin on sm_80+) |
 
 Anything else returns `vllm_servable: false` with a typed `reason_code`
 (`activation_bits_unsupported`, `pickle_weights`, …). That is a normal outcome,
@@ -65,6 +66,10 @@ _EMBEDDING_LEAVES = {"lm_head", "embed_tokens", "wte", "word_embeddings", "embed
 # vLLM fuses these into one layer and needs one scheme across the group.
 _FUSED_GROUPS = (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj"))
 _ADAPTER_FILE = "quant_agent_inference_adapter.py"
+# Weight-only formats vLLM loads natively from config.json -> packing layout.
+# vLLM runs 4/8-bit symmetric ones on Marlin (sm_80+); others fall back to slower kernels.
+_NATIVE_WEIGHT_ONLY = {"gptq": "gptq", "auto-round": "gptq", "auto_round": "gptq", "awq": "awq"}
+_NATIVE_BITS = (4, 8)
 _PICKLE_SUFFIXES = {".pt", ".pth", ".bin"}
 _AUX_FILES = {
     "generation_config.json",
@@ -116,6 +121,8 @@ class ExportPlan:
     config: dict
     quantization_config: dict
     notes: list[str] = field(default_factory=list)
+    weight_bits: int = 8
+    group_size: int = -1  # -1: per output channel
 
 
 def read_safetensors_header(path: Path) -> tuple[list[TensorInfo], dict]:
@@ -215,6 +222,199 @@ def compressed_tensors_w8a8_config(ignore: list[str]) -> dict:
     }
 
 
+def _check_fused_groups(linears: set[str], quantized: set[str], kind: str) -> None:
+    """vLLM fuses q/k/v and gate/up into one layer, so a group needs one scheme."""
+    for module in sorted(linears):
+        parent, _, leaf = module.rpartition(".")
+        for group in _FUSED_GROUPS:
+            if leaf != group[0]:
+                continue
+            members = [f"{parent}.{part}" for part in group if f"{parent}.{part}" in linears]
+            if len({member in quantized for member in members}) > 1:
+                raise Unsupported(
+                    "mixed_fused_group",
+                    f"{', '.join(members)} mix {kind} and float weights; vLLM fuses them "
+                    "into one layer with one scheme",
+                )
+
+
+def _tied_head_and_adapter_notes(model_dir: Path, config: dict, by_name: dict[str, TensorInfo]) -> tuple[set[str], list[str]]:
+    notes: list[str] = []
+    drop: set[str] = set()
+    tied = bool(config.get("tie_word_embeddings", True))
+    head = by_name.get("lm_head.weight")
+    embed = next(
+        (info for name, info in by_name.items() if name.endswith("embed_tokens.weight")),
+        None,
+    )
+    if tied and head and embed:
+        same = head.shape == embed.shape and head.dtype == embed.dtype and _tensor_sha256(head) == _tensor_sha256(embed)
+        if not same:
+            # vLLM ties lm_head to embed_tokens and skips the stored head.
+            raise Unsupported(
+                "tied_lm_head_mismatch",
+                "config ties lm_head to embed_tokens but the saved lm_head.weight differs; "
+                "set tie_word_embeddings explicitly in the artifact if the head is meant to be separate",
+            )
+        drop.add(head.name)
+        notes.append("dropped lm_head.weight: tied to embed_tokens and byte-identical")
+    if (model_dir / _ADAPTER_FILE).is_file():
+        notes.append(
+            f"the HF artifact ships {_ADAPTER_FILE}; the export assumes it applies no runtime "
+            "transform, which the serve check's drift gate confirms"
+        )
+    return drop, notes
+
+
+def _float_linears(by_name: dict[str, TensorInfo], quantized: set[str]) -> list[str]:
+    """Linears the export leaves in float (vLLM's `ignore` list), always including lm_head."""
+    ignore = sorted(
+        name[: -len(".weight")]
+        for name, info in by_name.items()
+        if name.endswith(".weight")
+        and info.dtype in _FLOAT_DTYPES
+        and len(info.shape) == 2
+        and "embed" not in name
+        and name[: -len(".weight")] not in quantized
+    )
+    if "lm_head" not in ignore:
+        ignore.append("lm_head")
+    return ignore
+
+
+def _native_layout(native_cfg: dict) -> str | None:
+    """Packing layout of a config.json quantization_config vLLM loads natively, else None."""
+    if not isinstance(native_cfg, dict):
+        return None
+    layout = _NATIVE_WEIGHT_ONLY.get(str(native_cfg.get("quant_method") or "").lower())
+    if layout is None:
+        return None
+    packing = str(native_cfg.get("packing_format") or native_cfg.get("backend") or "").lower()
+    return "awq" if "awq" in packing else layout
+
+
+def _plan_native_weight_only(
+    model_dir: Path,
+    config: dict,
+    native_cfg: dict,
+    files: dict[Path, list[TensorInfo]],
+    by_name: dict[str, TensorInfo],
+) -> ExportPlan:
+    """Validate a GPTQ/AWQ-layout weight-only checkpoint vLLM reads as-is; copy it through."""
+    method = str(native_cfg.get("quant_method")).lower()
+    layout = _native_layout(native_cfg)
+    bits = native_cfg.get("bits", native_cfg.get("w_bit"))
+    if bits not in _NATIVE_BITS:
+        raise Unsupported(
+            "weight_bits_unsupported",
+            f"{method} bits={bits!r}; vLLM's Marlin weight-only kernels take {'/'.join(map(str, _NATIVE_BITS))}-bit",
+        )
+    act_bits = native_cfg.get("act_bits")
+    if isinstance(act_bits, int) and not isinstance(act_bits, bool) and act_bits < 16:
+        raise Unsupported(
+            "activation_bits_unsupported",
+            f"{method} config quantizes activations to {act_bits} bits; the weight-only profile serves "
+            "fp16/bf16 activations",
+        )
+    data_type = str(native_cfg.get("data_type") or "int").lower()
+    if not data_type.startswith("int"):
+        raise Unsupported("weight_scheme_unsupported", f"{method} data_type={data_type!r}; only integer weights are exported")
+    group = native_cfg.get("group_size", native_cfg.get("q_group_size", -1))
+    group = -1 if group in (None, 0) else int(group)
+    pack = 32 // bits
+
+    modules = sorted(name[: -len(".qweight")] for name in by_name if name.endswith(".qweight"))
+    if not modules:
+        raise Unsupported("no_quantized_linears", f"config declares {method} but no <linear>.qweight tensors were found")
+    accounted: set[str] = set()
+    for module in modules:
+        qweight = by_name[f"{module}.qweight"]
+        scales = by_name.get(f"{module}.scales")
+        qzeros = by_name.get(f"{module}.qzeros")
+        if (
+            qweight.dtype != "I32" or len(qweight.shape) != 2
+            or scales is None or scales.dtype not in _FLOAT_DTYPES or len(scales.shape) != 2
+        ):
+            raise Unsupported(
+                "unrecognized_quantized_tensors",
+                f"{module}: expected int32 qweight and float scales for {method}",
+            )
+        out_features = scales.shape[1]
+        if layout == "gptq":
+            in_features = qweight.shape[0] * pack
+            fits = qweight.shape[1] == out_features
+        else:
+            in_features = qweight.shape[0]
+            fits = qweight.shape[1] * pack == out_features
+        groups = 1 if group == -1 else in_features // group
+        fits = fits and (group == -1 or in_features % group == 0) and scales.shape[0] == groups
+        if qzeros is not None:
+            fits = fits and qzeros.dtype == "I32" and qzeros.shape == [groups, out_features // pack]
+        if not fits:
+            zeros = f", qzeros {qzeros.shape}" if qzeros is not None else ""
+            raise Unsupported(
+                "weight_scale_layout_unsupported",
+                f"{module}: qweight {qweight.shape}, scales {scales.shape}{zeros} do not match the "
+                f"{layout} layout at {bits}-bit, group_size {group}",
+            )
+        accounted.update({qweight.name, scales.name})
+        for extra in (qzeros, by_name.get(f"{module}.g_idx")):
+            if extra is not None:
+                accounted.add(extra.name)
+
+    stray = sorted(
+        name for name, info in by_name.items()
+        if name not in accounted
+        and (
+            info.dtype not in _FLOAT_DTYPES
+            or name.rsplit(".", 1)[-1] in _AUX_TENSOR_LEAVES
+            or any(marker in name.lower() for marker in _TRANSFORM_MARKERS)
+        )
+    )
+    if stray:
+        raise Unsupported(
+            "unrecognized_quantized_tensors",
+            f"{len(stray)} quantization or transform tensors match no profile "
+            f"(e.g. {', '.join(stray[:4])})",
+        )
+    quantized_set = set(modules)
+    embeddings = [m for m in modules if m.rsplit(".", 1)[-1] in _EMBEDDING_LEAVES]
+    if embeddings:
+        raise Unsupported(
+            "quantized_embedding_unsupported",
+            f"{', '.join(embeddings)} is quantized; the export only passes through quantized decoder linears",
+        )
+    linears = quantized_set | {
+        name[: -len(".weight")] for name, info in by_name.items()
+        if name.endswith(".weight") and len(info.shape) == 2
+    }
+    _check_fused_groups(linears, quantized_set, f"{bits}-bit")
+
+    drop, notes = _tied_head_and_adapter_notes(model_dir, config, by_name)
+    if native_cfg.get("sym") is False:
+        notes.append(
+            "asymmetric weights: vLLM's Marlin path needs sym=True, so vLLM uses a slower "
+            "weight-only kernel for this checkpoint"
+        )
+    out_config = dict(config)
+    if out_config.pop("auto_map", None) is not None:
+        notes.append("removed auto_map: the export loads with vLLM's built-in architecture")
+    notes.append(f"passed through the {method} checkpoint unchanged; vLLM reads its quantization_config")
+    return ExportPlan(
+        profile=f"weight_only_{layout}",
+        files=files,
+        renames={},
+        drop=drop,
+        quantized_modules=modules,
+        ignore=_float_linears(by_name, quantized_set),
+        config=out_config,
+        quantization_config=dict(native_cfg),
+        notes=notes,
+        weight_bits=bits,
+        group_size=group,
+    )
+
+
 def plan_export(model_dir: Path) -> ExportPlan:
     """Detect the saved format and plan the rename. Raises Unsupported."""
     model_dir = Path(model_dir)
@@ -222,10 +422,12 @@ def plan_export(model_dir: Path) -> ExportPlan:
     if not config_path.is_file():
         raise Unsupported("config_missing", f"no config.json in {model_dir}")
     config = _read_json(config_path)
-    if config.get("quantization_config"):
+    native_cfg = config.get("quantization_config")
+    if native_cfg and _native_layout(native_cfg) is None:
         raise Unsupported(
             "already_quantized_config",
-            "config.json already carries a quantization_config; serve it directly",
+            "config.json already carries a quantization_config that no export profile "
+            f"handles (quant_method={(native_cfg or {}).get('quant_method')!r}); serve it directly",
         )
     qcfg_path = model_dir / "quantization_config.json"
     qcfg = _read_json(qcfg_path) if qcfg_path.is_file() else {}
@@ -245,7 +447,9 @@ def plan_export(model_dir: Path) -> ExportPlan:
             "path applies no online rotation",
         )
     asym = [key for key in _ASYM_KEYS if qcfg.get(key) is False]
-    if asym or any("asym" in str(qcfg.get(key) or "").lower() for key in ("weight_quant", "act_quant")):
+    if native_cfg:
+        asym = []  # zero points are part of the native weight-only formats
+    elif asym or any("asym" in str(qcfg.get(key) or "").lower() for key in ("weight_quant", "act_quant")):
         raise Unsupported(
             "asymmetric_unsupported",
             f"asymmetric quantization ({', '.join(asym) or 'asym scheme'}); the w8a8 "
@@ -272,6 +476,9 @@ def plan_export(model_dir: Path) -> ExportPlan:
             if info.name in by_name:
                 raise ValueError(f"tensor {info.name} appears in two weight files")
             by_name[info.name] = info
+
+    if native_cfg:
+        return _plan_native_weight_only(model_dir, config, native_cfg, files, by_name)
 
     renames: dict[str, tuple[str, list[int]]] = {}
     quantized: list[str] = []
@@ -329,19 +536,7 @@ def plan_export(model_dir: Path) -> ExportPlan:
         for name, info in by_name.items()
         if name.endswith(".weight") and len(info.shape) == 2
     }
-    for module in sorted(linears):
-        parent, _, leaf = module.rpartition(".")
-        for group in _FUSED_GROUPS:
-            if leaf != group[0]:
-                continue
-            members = [f"{parent}.{part}" for part in group if f"{parent}.{part}" in linears]
-            schemes = {member in quantized_set for member in members}
-            if len(schemes) > 1:
-                raise Unsupported(
-                    "mixed_fused_group",
-                    f"{', '.join(members)} mix int8 and float weights; vLLM fuses them "
-                    "into one layer with one scheme",
-                )
+    _check_fused_groups(linears, quantized_set, "int8")
 
     act = str(qcfg.get("act_quant") or "").lower()
     if not act:
@@ -362,42 +557,8 @@ def plan_export(model_dir: Path) -> ExportPlan:
             f"weight_quant={weight_quant!r}; only per-channel int8 weights are exported",
         )
 
-    notes: list[str] = []
-    drop: set[str] = set()
-    tied = bool(config.get("tie_word_embeddings", True))
-    head = by_name.get("lm_head.weight")
-    embed = next(
-        (info for name, info in by_name.items() if name.endswith("embed_tokens.weight")),
-        None,
-    )
-    if tied and head and embed:
-        same = head.shape == embed.shape and head.dtype == embed.dtype and _tensor_sha256(head) == _tensor_sha256(embed)
-        if not same:
-            # vLLM ties lm_head to embed_tokens and skips the stored head.
-            raise Unsupported(
-                "tied_lm_head_mismatch",
-                "config ties lm_head to embed_tokens but the saved lm_head.weight differs; "
-                "set tie_word_embeddings explicitly in the artifact if the head is meant to be separate",
-            )
-        drop.add(head.name)
-        notes.append("dropped lm_head.weight: tied to embed_tokens and byte-identical")
-    if (model_dir / _ADAPTER_FILE).is_file():
-        notes.append(
-            f"the HF artifact ships {_ADAPTER_FILE}; the export assumes it applies no runtime "
-            "transform, which the serve check's drift gate confirms"
-        )
-
-    ignore = sorted(
-        name[: -len(".weight")]
-        for name, info in by_name.items()
-        if name.endswith(".weight")
-        and info.dtype in _FLOAT_DTYPES
-        and len(info.shape) == 2
-        and "embed" not in name
-        and name[: -len(".weight")] not in quantized_set
-    )
-    if "lm_head" not in ignore:
-        ignore.append("lm_head")
+    drop, notes = _tied_head_and_adapter_notes(model_dir, config, by_name)
+    ignore = _float_linears(by_name, quantized_set)
 
     if qcfg.get("quantize_bmm_input"):
         notes.append(
@@ -630,6 +791,8 @@ def export(
                 "status": "exported",
                 "vllm_servable": True,
                 "profile": plan.profile,
+                "weight_bits": plan.weight_bits,
+                "group_size": plan.group_size,
                 "n_quantized_linears": len(plan.quantized_modules),
                 "renamed_scales": len(plan.renames),
                 "dropped": sorted(plan.drop),
@@ -641,7 +804,13 @@ def export(
                 "serve_check": "pending",
             }
         )
-        if reference_dir is not None:
+        if plan.profile != "w8a8_int8":
+            record["scale_convention"] = {
+                "verdict": "skipped",
+                "detail": "packed weight-only checkpoint: vLLM dequantizes it with its own "
+                "loader; the serve check's drift gate is the test",
+            }
+        elif reference_dir is not None:
             record["scale_convention"] = check_scale_convention(plan, Path(reference_dir))
         atomic_write_text(staging / EXPORT_RECORD, json.dumps(record, indent=2) + "\n", mode=0o644)
         if output_dir.exists():

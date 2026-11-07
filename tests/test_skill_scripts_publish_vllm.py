@@ -203,3 +203,23 @@ def test_base_card_section_carries_vllm_results_and_serving_advice():
     card = "# X\n\n## License\n\nMIT\n"
     once = pv.merge_card_section(card, section)
     assert pv.merge_card_section(once, section) == once
+
+
+def test_weight_only_export_gets_its_own_label_and_tags():
+    record = {
+        "profile": "weight_only_gptq", "weight_bits": 4, "group_size": 128, "ignore": ["lm_head"],
+        "quantization_config": {"quant_method": "auto-round", "bits": 4, "group_size": 128},
+    }
+    assert pv.quant_label(record) == "W4A16"
+    assert pv.quant_label({}) == "int8"
+    card = pv.render_vllm_card(
+        model_id="org/model", method_name="AutoRound", base_repo_id="me/ar-model", repo_id="me/ar-model-vllm",
+        report=_with_hf_runtime(_report()), export_record=record, license_info=LICENSE,
+    )
+    assert "| | vLLM W4A16 | vLLM fp16 | Transformers W4A16 | Transformers fp16 |" in card
+    assert "- gptq\n- int4\n- w4a16\n" in card
+    assert "`auto-round` format (GPTQ packing, group size 128" in card
+    assert "compressed-tensors" not in card
+    assert "PPL ratio (W4A16 / fp16)" in card
+    section = pv.render_card_section(repo_id="me/ar-model-vllm", report=_with_hf_runtime(_report()), label="W4A16")
+    assert "vLLM W4A16 | vLLM fp16 |" in section
