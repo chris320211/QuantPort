@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "duquant_w4a4_int8_storage",
+  "kind": "port",
+  "port": "library/ports/Qwen_Qwen3-8B__vast-rtx3090__DuQuant",
+  "match": {
+    "format": ["duquant_w4a4_int8_storage"],
+    "quant_method": ["duquant"],
+    "w_bits": [4],
+    "a_bits": [4],
+    "weight_quant": ["per_channel"],
+    "act_quant": ["per_token"],
+    "w_sym": [false],
+    "a_sym": [false],
+    "online_transforms": [true]
+  },
+  "requires": ["torch", "triton"],
+  "min_compute_capability": "8.0",
+  "tuned_on": [
+    {
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "compute_capability": "8.6",
+      "torch": "2.7.1+cu128",
+      "triton": "3.3.1"
+    }
+  ],
+  "results": [
+    {
+      "method_name": "DuQuant",
+      "model_id": "Qwen/Qwen3-8B",
+      "gpu_instance": "vast-rtx3090",
+      "job_id": "20261107T051504Z-f42730",
+      "ppl_ratio": 1.1286,
+      "prefill_tokens_per_s": 5046.9,
+      "fp16_prefill_tokens_per_s": 3496.1,
+      "peak_vram_gb": 12.05,
+      "fp16_peak_vram_gb": 18.46,
+      "port": "library/ports/Qwen_Qwen3-8B__vast-rtx3090__DuQuant"
+    }
+  ],
+  "notes": "Asymmetric W4A4 on the shared w8a8_int8 GEMM mainloop, exact: weights stored as int8 centred codes (q - z) with an fp32 per-channel scale chosen so fp16(scale*code) reproduces every fake-quant weight; activations stay uint4 codes in int8 lanes and the epilogue applies (acc - z_x[m]*rowsum(c_w)[n]) * s_x * s_w (handles any integer z, including all-positive rows). Pieces in the port overlay.patch: duquant_port/kernels.py (epilogue GEMM, per-token asym A4 code kernel, per-(token,head) asym Q/K/V fake-quant kernel, Triton zigzag gather), duquant_port/int8_runtime.py (fused [q;k;v] and [gate;up] storage, meta-device loader, SDPA with flash when q_len == kv_len). Online block rotations/Hadamard kept in fp32 so codes match the fake-quant runtime bit for bit. Fake-quant 1856 tok/s / 18.5 GB -> 5047 tok/s / 12.05 GB, same PPL. Prefill profile per 2048 tokens (~377 ms): int8 GEMM 118, fp32 rotations 57, lm_head 37, casts 35, attention 23, gather 19. Not vLLM-servable (A4 + online transforms); decode not optimized."
+}

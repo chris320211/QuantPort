@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "method_id": "duquant-qwen3-8b-vastrtx3090",
+  "model_id": "Qwen/Qwen3-8B",
+  "base_commit": "d56cfc6fe97c34c0eb100fec82fe439865905679",
+  "patch_sha256": "08d4f48ac3c6429e6ca682ba49c27290ac2d50d0e058ef99a73088603897eb8d",
+  "rationale": "Kernel overlay on role_driver_qwen3 (all of its duquant_port files unchanged) that runs the verified DuQuant W4A4 fake-quant numbers on integers, format duquant_w4a4_int8_storage. Zero points are integers (round(-xmin/scale)) for both the per-channel asym weights and per-token asym activations, so weights are stored as int8 centred codes q-z (in [-15,15]) + fp32 per-channel scale, converted from the fake-quant checkpoint with a bit-exact check (fp16(scale*code) == weight for all 6.9e9 codes; fp32 scale because no fp16 scale reproduces every code), and Y = s_x*s_w*((q_x . c_w) - z_x*rowsum(c_w)) runs on the shared w8a8_int8 Triton GEMM tiling (triton_w8a8.py copied unchanged) with an exact int32 zero-point epilogue (duquant_port/kernels.py). Activation path per linear: /Lambda (GQA o_proj) -> R1 -> zigzag permutation (Triton row gather) -> R2 with the runtime fp32 GEMMs, then one Triton per-token asym A4 (lac 0.9) code kernel bit-identical to fake_quant_per_token; q/k/v and gate/up each share one transform and one fused GEMM. Attention: q_norm/k_norm before RoPE, 128-Hadamard + Triton per-(token,head) asym A4 on Q/K (K before Cache.update), V A4 after concat, then SDPA (flash; is_causal only when q_len==kv_len, decode without mask, explicit additive mask for offsets/padding). lm_head/embeddings/norms fp16. Meta-device loader (no fp16 projections); the adapter still loads the duquant_fakequant format unchanged. Measured on the RTX 3090 with the benchmark script: PPL 10.900 (fake-quant 10.928, fp16 9.658), 4995 tok/s 2048-prefill (fake 1856, fp16 3447), peak 12.05 GB (18.50 / 18.46), weights 9.49 GB (16.43). Per-module on real activations: 2.7e9 activation codes, 6.9e9 weight codes, all Q/K/V values bit-identical to the fake-quant runtime; GEMM output rel diff <= 4.9e-4 (2x closer to the exact product than the fp16 fake-quant GEMM).",
+  "evidence_files": [
+    "out/analysis/duquant-qwen3-8b-vastrtx3090/method.md",
+    "out/analysis/duquant-qwen3-8b-vastrtx3090/differences.json"
+  ],
+  "target_modules": [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6",
+    "D7",
+    "D8",
+    "D9",
+    "D13"
+  ]
+}

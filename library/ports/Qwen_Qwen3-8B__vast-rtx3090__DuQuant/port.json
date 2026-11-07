@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "contribution",
+  "model_id": "Qwen/Qwen3-8B",
+  "model_type": "qwen3",
+  "method_name": "DuQuant",
+  "gpu_instance": "vast-rtx3090",
+  "slug": "duquant-qwen3-8b-vastrtx3090",
+  "job_id": "20261107T051504Z-f42730",
+  "repo_url": "https://github.com/Hsu1023/DuQuant",
+  "repo_commit": "d56cfc6fe97c34c0eb100fec82fe439865905679",
+  "patch_sha256": "08d4f48ac3c6429e6ca682ba49c27290ac2d50d0e058ef99a73088603897eb8d",
+  "files": [
+    "differences.json",
+    "manifest.json",
+    "method.md",
+    "overlay.patch",
+    "quantize.py"
+  ]
+}

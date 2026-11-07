@@ -5,7 +5,7 @@
   "gpu_name": "NVIDIA GeForce RTX 3090",
   "fp16_baseline": {
     "perplexity": 9.657565503476947,
-    "tokens_per_s": 3493.4794027318935,
+    "tokens_per_s": 3496.095035233528,
     "peak_vram_gb": 18.46218729019165
   },
   "methods": [
@@ -29,6 +29,27 @@
       "repo_commit": "60b74237cf2cf20e3354569d998ab708ff598ce3",
       "verification_status": "passed",
       "rank": 1
+    },
+    {
+      "method_name": "DuQuant",
+      "slug": "duquant-qwen3-8b-vastrtx3090",
+      "job_id": "20261107T051504Z-f42730",
+      "quality_ok": true,
+      "ppl": 10.899951614229137,
+      "ppl_ratio": 1.1286438192218216,
+      "tokens_per_s": 5046.888665252492,
+      "peak_vram_gb": 12.04873514175415,
+      "improved_throughput": true,
+      "improved_vram": true,
+      "packed": false,
+      "artifact_dir": "quantized/duquant-qwen3-8b-vastrtx3090",
+      "hub_url": "https://huggingface.co/chris320211/duquant-qwen3-8b-vastrtx3090",
+      "arxiv_id": "2406.01721",
+      "paper_url": "https://arxiv.org/abs/2406.01721",
+      "repo_url": "https://github.com/Hsu1023/DuQuant",
+      "repo_commit": "d56cfc6fe97c34c0eb100fec82fe439865905679",
+      "verification_status": "passed",
+      "rank": 2
     }
   ],
   "best": {

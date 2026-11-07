@@ -58,6 +58,7 @@ GPU: NVIDIA GeForce RTX 3090
 | Model | GPU | Method | Paper | Repo | Port | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |
 | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
 | Qwen/Qwen3-8B | vast-rtx3090 | PrefixQuant | [paper](https://arxiv.org/abs/2410.05265) | [repo](https://github.com/ChenMnZ/PrefixQuant) | [port](ports/Qwen_Qwen3-8B__vast-rtx3090__PrefixQuant) | [hub](https://huggingface.co/chris320211/prefixquant-qwen3-8b-vastrtx3090) |  | 1.1516 | 6588.5 | 11.998 |
+| Qwen/Qwen3-8B | vast-rtx3090 | DuQuant | [paper](https://arxiv.org/abs/2406.01721) | [repo](https://github.com/Hsu1023/DuQuant) | [port](ports/Qwen_Qwen3-8B__vast-rtx3090__DuQuant) | [hub](https://huggingface.co/chris320211/duquant-qwen3-8b-vastrtx3090) |  | 1.1286 | 5046.9 | 12.049 |
 
 **Best:** PrefixQuant (`prefixquant-qwen3-8b-vastrtx3090`).
 

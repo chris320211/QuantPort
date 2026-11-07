@@ -19,7 +19,7 @@
       "model_id": "Qwen/Qwen3-8B",
       "gpu_instance": "vast-rtx3090",
       "gpu_name": "NVIDIA GeForce RTX 3090",
-      "n_methods": 1,
+      "n_methods": 2,
       "best_method": "PrefixQuant"
     },
     {

@@ -1,0 +1,1868 @@
+diff --git a/duquant_port/__init__.py b/duquant_port/__init__.py
+new file mode 100644
+index 0000000..5c025bd
+--- /dev/null
++++ b/duquant_port/__init__.py
+@@ -0,0 +1,4 @@
++"""DuQuant (arXiv 2406.01721) port driver for transformers-4.51 decoders (plan role_driver_qwen3).
++
++`driver` calibrates and saves; `runtime` rebuilds the online-transform modules on reload.
++"""
+diff --git a/duquant_port/data.py b/duquant_port/data.py
+new file mode 100644
+index 0000000..a38dba5
+--- /dev/null
++++ b/duquant_port/data.py
+@@ -0,0 +1,39 @@
++"""WikiText-2 train calibration windows, sampled exactly like datautils.get_wikitext2 (seeded random windows)."""
++from __future__ import annotations
++
++import glob
++import os
++import random
++
++import torch
++
++PARQUET_GLOB = ("datasets--Salesforce--wikitext/snapshots/*/wikitext-2-raw-v1/train-00000-of-00001.parquet")
++
++
++def wikitext2_train_texts(cache_dirs):
++    """Train rows in dataset order: a cached parquet when one exists, else datasets.load_dataset."""
++    for cache_dir in cache_dirs:
++        for path in sorted(glob.glob(os.path.join(str(cache_dir), PARQUET_GLOB))):
++            import pyarrow.parquet as pq
++
++            texts = pq.read_table(path, columns=["text"]).column("text").to_pylist()
++            print(f"wikitext2 train: {len(texts)} rows from {path}", flush=True)
++            return texts
++    from datasets import load_dataset
++
++    # Same rows as the repo's load_dataset('wikitext', 'wikitext-2-raw-v1', split='train').
++    texts = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")["text"]
++    print(f"wikitext2 train: {len(texts)} rows from the Hub", flush=True)
++    return list(texts)
++
++
++def get_wikitext2_calib(tokenizer, nsamples, seqlen, seed, cache_dirs):
++    """datautils.get_wikitext2 trainloader: '\\n\\n'.join(train), random.seed(seed), randint windows."""
++    texts = wikitext2_train_texts(cache_dirs)
++    enc = tokenizer("\n\n".join(texts), return_tensors="pt").input_ids
++    random.seed(seed)
++    samples = []
++    for _ in range(nsamples):
++        i = random.randint(0, enc.shape[1] - seqlen - 1)
++        samples.append(enc[:, i:i + seqlen].clone())
++    return torch.cat(samples, dim=0)
+diff --git a/duquant_port/driver.py b/duquant_port/driver.py
+new file mode 100644
+index 0000000..2646225
+--- /dev/null
++++ b/duquant_port/driver.py
+@@ -0,0 +1,351 @@
++"""DuQuant calibration on stock transformers-4.51 decoder layers (method.md Steps 1-13, run.sh recipe).
++
++Replaces the repo's family glue (D1: args.net switch, LMClass, QuantLlamaDecoderLayer, Catcher) with a
++role walk over `model.model.layers`; reuses the repo's generic pieces as-is:
++  - get_rot.py base rotation table (built in memory for block_size and seeded into utils.Rot, so no
++    cwd-relative Rot.pkl is needed) and utils.get_rot / exchange_row_col (D7);
++  - generate_act_scale_shift.get_act_scales semantics (per-input-channel max|x| of every linear, fp16 model,
++    same calibration windows), collected layer by layer on the ORIGINAL layer before it is touched (D7);
++  - duquant.py smoothing formula s = act^a / max|W_col|^(1-a) (clamp 1e-5, truncate_number 1e-2) and the
++    models/transformation.py fusers' algebra (norm / s, columns * s, up rows / s_down);
++  - quantize/quantizer.py UniformAffineQuantizer: online_duquant_cali (greedy rotation R1, zigzag P, R2) for
++    every activation quantizer and the weight quantizer (init_duquant + swc per-channel asym fake_quant).
++Layer inputs come from a forward pre-hook on layer 0 (hidden_states plus attention_mask, position_ids,
++position_embeddings, cache_position kwargs; D2). The rotation search runs on ONE averaged sequence that is
++propagated through the already-quantized layers (duquant.py:135,281). Statistics and transforms are
++computed in fp32 (D8); the stored model stays fp16.
++"""
++from __future__ import annotations
++
++import json
++import math
++import os
++import random
++import time
++
++import numpy as np
++import torch
++
++from . import runtime
++from .data import get_wikitext2_calib
++
++
++class _StopForward(Exception):
++    pass
++
++
++def base_rotation(n: int, device) -> torch.Tensor:
++    """get_rot.py: product of n-1 Givens rotations (cos 1/sqrt(i+2)), then swap row/col 0 and n-1."""
++    R = torch.eye(n, device=device)
++    for i in range(n - 1):
++        rot = torch.eye(n, device=device)
++        cos = 1 / np.sqrt(i + 2)
++        sin = np.sqrt(i + 1) / np.sqrt(i + 2)
++        rot[i, i] = rot[i + 1, i + 1] = cos
++        rot[i, i + 1] = -sin
++        rot[i + 1, i] = sin
++        R = torch.matmul(rot, R)
++    import utils as repo_utils
++
++    return repo_utils.exchange_row_col(R, 0, n - 1).cpu()
++
++
++def seed_everything(seed: int):
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed(seed)
++
++
++def _capture_layer0(model, layers, calib_ids, dev):
++    """Layer-0 inputs and decoder-layer kwargs via a pre-hook (replaces duquant.py Catcher)."""
++    inner = model.model
++    inner.embed_tokens.to(dev)
++    inner.rotary_emb.to(dev)
++    n, seqlen = calib_ids.shape
++    inps = torch.zeros((n, seqlen, model.config.hidden_size), dtype=torch.float16, device=dev)
++    captured = {}
++
++    def hook(module, args, kwargs):
++        hidden = args[0] if args else kwargs["hidden_states"]
++        inps[captured.setdefault("i", 0)] = hidden[0]
++        captured["i"] += 1
++        if "kwargs" not in captured:
++            captured["kwargs"] = {k: v for k, v in kwargs.items() if k != "hidden_states"}
++        raise _StopForward
++
++    handle = layers[0].register_forward_pre_hook(hook, with_kwargs=True)
++    try:
++        with torch.no_grad():
++            for j in range(n):
++                try:
++                    model(calib_ids[j:j + 1].to(dev), use_cache=False)
++                except _StopForward:
++                    pass
++    finally:
++        handle.remove()
++    inner.embed_tokens.cpu()
++    torch.cuda.empty_cache()
++    kw = dict(captured["kwargs"])
++    kw["use_cache"] = False
++    kw["past_key_value"] = None
++    kw["output_attentions"] = False
++    mask = kw.get("attention_mask")
++    if mask is None or mask.dim() != 4:
++        raise RuntimeError("expected a 4-D eager causal mask from the model (attn_implementation='eager', D6)")
++    return inps, kw
++
++
++def _fp_pass(layer, fp_inps, kw):
++    """Original fp16 layer over all samples: act max|x| per input channel of every linear (D7), in place."""
++    stats = {}
++
++    def make_hook(name):
++        def hook(module, args, output):
++            x = args[0].detach()
++            cur = x.reshape(-1, x.shape[-1]).abs().amax(dim=0).float()
++            stats[name] = cur if name not in stats else torch.maximum(stats[name], cur)
++        return hook
++
++    handles = [layer.get_submodule(n).register_forward_hook(make_hook(n)) for n in runtime.LAYER_LINEARS]
++    try:
++        for j in range(fp_inps.shape[0]):
++            fp_inps[j:j + 1] = layer(fp_inps[j:j + 1], **kw)[0]
++    finally:
++        for h in handles:
++            h.remove()
++    for name, value in stats.items():
++        if not torch.isfinite(value).all():
++            raise FloatingPointError(f"non-finite activation statistic at {name} (fp16 overflow, D8)")
++    if not torch.isfinite(fp_inps).all():
++        raise FloatingPointError("non-finite fp16 layer output during the statistics pass (D8)")
++    return stats
++
++
++def _smooth_scale(act, weight, alpha):
++    """duquant.py:209-213 + quantize/utils.py truncate_number(1e-2), in fp32."""
++    act = act.float().clamp(min=runtime.CLIPMIN)
++    wmax = weight.float().abs().amax(dim=0).clamp(min=runtime.CLIPMIN)
++    s = (act.pow(alpha) / wmax.pow(1 - alpha)).clamp(min=runtime.CLIPMIN)
++    small = s.abs() < 1e-2
++    return torch.where(small, s.sign() * 1e-2, s)
++
++
++def _div_bias(linear, scale):
++    """Output-side smoothing also scales a real bias (smooth_fc_fc_inplace: fc1.bias / s)."""
++    if linear.bias is not None:
++        linear.bias.data.copy_((linear.bias.float() / scale).to(linear.bias.dtype))
++
++
++def _smooth_layer(layer, stats, alpha):
++    """Fuse Lambda offline where elementwise producers allow; GQA o_proj gets the online division (D4)."""
++    attn, mlp = layer.self_attn, layer.mlp
++    w32 = {name: layer.get_submodule(name).weight.detach().float().clone() for name in runtime.LAYER_LINEARS}
++    s_qkv = _smooth_scale(stats["self_attn.q_proj"], w32["self_attn.q_proj"], alpha)
++    s_out = _smooth_scale(stats["self_attn.o_proj"], w32["self_attn.o_proj"], alpha)
++    s_fc1 = _smooth_scale(stats["mlp.up_proj"], w32["mlp.up_proj"], alpha)
++    s_down = _smooth_scale(stats["mlp.down_proj"], w32["mlp.down_proj"], alpha)
++
++    # smooth_ln_fcs_inplace: residual norm weight / s, readers' columns * s (shift = 0 for llama-like nets).
++    # Only the residual norms by name; q_norm/k_norm are never touched (D3).
++    norm = layer.input_layernorm
++    norm.weight.data.copy_((norm.weight.float() / s_qkv).to(norm.weight.dtype))
++    for name in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"):
++        w32[name].mul_(s_qkv.view(1, -1))
++    norm = layer.post_attention_layernorm
++    norm.weight.data.copy_((norm.weight.float() / s_fc1).to(norm.weight.dtype))
++    for name in ("mlp.gate_proj", "mlp.up_proj"):
++        w32[name].mul_(s_fc1.view(1, -1))
++    # smooth_fc_fc_inplace(up, down): valid because down's input is act(gate) * up elementwise.
++    w32["mlp.up_proj"].div_(s_down.view(-1, 1))
++    _div_bias(mlp.up_proj, s_down)
++    w32["mlp.down_proj"].mul_(s_down.view(1, -1))
++    # v -> o: offline fold only when each o input channel is exactly one v output channel (MHA).
++    gqa = attn.v_proj.out_features != attn.o_proj.in_features
++    online = None
++    if gqa:
++        w32["self_attn.o_proj"].mul_(s_out.view(1, -1))  # smooth_fc_inplace
++        online = s_out
++    else:
++        w32["self_attn.v_proj"].div_(s_out.view(-1, 1))
++        _div_bias(attn.v_proj, s_out)
++        w32["self_attn.o_proj"].mul_(s_out.view(1, -1))
++    scales = {"qkv": s_qkv, "out": s_out, "fc1": s_fc1, "down": s_down}
++    return w32, online, scales, gqa
++
++
++def _make_calibrator(group, w32, act_params, w_params, timings):
++    from quantize.quantizer import UniformAffineQuantizer
++
++    def calibrate(module, xf):
++        start = time.time()
++        aq = UniformAffineQuantizer(**act_params, rotate=True)
++        aq.online_duquant_cali(xf.reshape(-1, xf.shape[-1]))  # R1 -> zigzag P -> R2 on the activation
++        aq.init_duquant_params = torch.tensor(1)
++        R = aq.R.detach().float()
++        perm = aq.permutation_list.detach().long().cpu()
++        for name, lin in group:
++            W = w32.pop(name)
++            wq = UniformAffineQuantizer(**w_params, shape=W.shape, rotate=True)
++            wq.copy_duquant_params(aq)  # QuantLinear: weight quantizer copies its act quantizer's R/perm
++            Wq = wq(W)  # init_duquant(W) (same G on the input dim) + per-channel asym swc fake-quant
++            if not torch.isfinite(Wq).all():
++                raise FloatingPointError(f"non-finite fake-quant weight for {name}")
++            lin.weight.data.copy_(Wq.to(lin.weight.dtype))
++            lin.du_R = R.clone().to(lin.weight.device)
++            lin.du_perm = perm.clone()
++            lin._du_perm_dev = None
++            lin.du_calibrator = None
++        timings[group[0][0]] = round(time.time() - start, 2)
++
++    return calibrate
++
++
++def quantize(model_src, output_dir, settings, *, data_dirs, extra_config=None):
++    from transformers import AutoModelForCausalLM, AutoTokenizer
++
++    seed = int(settings["seed"])
++    seed_everything(seed)  # main.py:315-318
++    dev = torch.device("cuda")
++    bs = int(settings["block_size"])
++    tokenizer = AutoTokenizer.from_pretrained(model_src)
++    model = AutoModelForCausalLM.from_pretrained(
++        model_src, torch_dtype=torch.float16, attn_implementation="eager", low_cpu_mem_usage=True)
++    model.eval()
++    for p in model.parameters():
++        p.requires_grad_(False)
++    cfg = model.config
++    layers, _ = runtime.decoder_layers(model)
++    for dim_name in ("hidden_size", "intermediate_size"):
++        if getattr(cfg, dim_name) % bs:
++            raise ValueError(f"{dim_name} {getattr(cfg, dim_name)} not divisible by block_size {bs}")
++
++    # Step 1: base rotation table, seeded into the repo's utils.Rot cache (instead of ./Rot.pkl).
++    import utils as repo_utils
++
++    repo_utils.Rot[bs] = base_rotation(bs, dev)
++
++    calib = get_wikitext2_calib(tokenizer, int(settings["nsamples"]), int(settings["seqlen"]), seed, data_dirs)
++    print(f"calibration ids {tuple(calib.shape)}", flush=True)
++    inps, kw = _capture_layer0(model, layers, calib, dev)
++    fp_inps = inps
++    rotate_inps = inps.float().mean(dim=0).to(torch.float16)  # duquant.py:135 "mean embeddings"
++
++    act_params = {
++        "n_bits": settings["abits"], "per_channel_axes": [], "symmetric": False, "lac": settings["lac"],
++        "act_group_size": None, "dynamic_method": "per_token", "quant_method": "duquant",
++        "block_size": bs, "max_rotation_step": settings["max_rotation_step"],
++        "permutation_times": settings["permutation_times"],
++    }
++    w_params = {
++        "n_bits": settings["wbits"], "per_channel_axes": [0], "symmetric": False,
++        "dynamic_method": "per_channel", "group_size": None, "lwc": settings["lwc"], "swc": settings["swc"],
++        "quant_method": "duquant", "block_size": bs, "max_rotation_step": settings["max_rotation_step"],
++        "permutation_times": settings["permutation_times"],
++    }
++    qcfg = build_qconfig(settings, len(layers), extra_config)
++    log = []
++    total_start = time.time()
++    for i, layer in enumerate(layers):
++        start = time.time()
++        layer.to(dev)
++        with torch.no_grad():
++            fp_ref = layer(rotate_inps.unsqueeze(0), **kw)[0][0].float()
++            stats = _fp_pass(layer, fp_inps, kw)
++            w32, online, scales, gqa = _smooth_layer(layer, stats, float(settings["alpha"]))
++            runtime.install_layer(layer, qcfg)
++            timings = {}
++            attn, mlp = layer.self_attn, layer.mlp
++            groups = [
++                [("self_attn.q_proj", attn.q_proj), ("self_attn.k_proj", attn.k_proj),
++                 ("self_attn.v_proj", attn.v_proj)],
++                [("self_attn.o_proj", attn.o_proj)],
++                [("mlp.gate_proj", mlp.gate_proj), ("mlp.up_proj", mlp.up_proj)],
++                [("mlp.down_proj", mlp.down_proj)],
++            ]
++            for group in groups:
++                group[0][1].du_calibrator = _make_calibrator(group, w32, act_params, w_params, timings)
++            if online is not None:
++                attn.o_proj.du_smooth = online.to(dev)
++            out = layer(rotate_inps.unsqueeze(0), **kw)[0][0]
++            missing = [n for n in runtime.LAYER_LINEARS if layer.get_submodule(n).du_R is None]
++            if missing or w32:
++                raise RuntimeError(f"layer {i}: transforms not calibrated for {missing or sorted(w32)}")
++            if not torch.isfinite(out).all():
++                raise FloatingPointError(f"layer {i}: non-finite quantized output on the rotation input")
++            rel = ((out.float() - fp_ref).norm() / fp_ref.norm().clamp(min=1e-12)).item()
++            rotate_inps = out
++        layer.to("cpu")
++        torch.cuda.empty_cache()
++        entry = {
++            "layer": i, "seconds": round(time.time() - start, 1), "rotation_seconds": timings,
++            "rel_err_vs_fp_on_rotation_input": round(rel, 5), "gqa_online_o_smooth": gqa,
++            "act_max": {k.split(".")[-1]: round(v.max().item(), 3) for k, v in stats.items()},
++            "smooth_range": {k: [round(v.min().item(), 4), round(v.max().item(), 3)] for k, v in scales.items()},
++        }
++        log.append(entry)
++        print("layer " + json.dumps(entry), flush=True)
++    del inps, fp_inps
++    torch.cuda.empty_cache()
++    qcfg["quantize_seconds"] = round(time.time() - total_start, 1)
++    save(model, tokenizer, output_dir, qcfg, log)
++    return qcfg
++
++
++def build_qconfig(settings, num_layers, extra_config=None):
++    qcfg = {
++        "quant_method": "duquant",
++        "format": "duquant_fakequant",
++        "w_bits": settings["wbits"],
++        "a_bits": settings["abits"],
++        "weight_quant": "per_channel",
++        "w_sym": False,
++        "act_quant": "per_token",
++        "a_sym": False,
++        "online_transforms": True,
++        "qk_bits": settings["abits"],
++        "qk_lac": settings["lac"],
++        "qk_hadamard": True,
++        "v_bits": settings["abits"],
++        "v_lac": None,
++        "p_bits": 16,
++        "kv_cache": "K stored Hadamard-rotated + fake-quant; V stored fp16, fake-quant on read",
++        "block_size": settings["block_size"],
++        "max_rotation_step": settings["max_rotation_step"],
++        "permutation_times": settings["permutation_times"],
++        "alpha": settings["alpha"],
++        "smooth": True,
++        "lac": settings["lac"],
++        "swc": settings["swc"],
++        "lwc": settings["lwc"],
++        "epochs": settings["epochs"],
++        "weights_basis": "transformed (Q(W*Lambda*R1*P*R2)); activations transformed online",
++        "online_smooth_linears": ["self_attn.o_proj"],
++        "runtime_file": runtime.RUNTIME_FILE,
++        "runtime_module": "duquant_port.runtime",
++        "num_layers": num_layers,
++        "dtype": "float16",
++        "attn_implementation": "eager",
++        "calibration": {"dataset": "wikitext2", "nsamples": settings["nsamples"], "seqlen": settings["seqlen"],
++                        "seed": settings["seed"]},
++        "publish_exclude": ["duquant_calib_log.json"],
++    }
++    qcfg.update(extra_config or {})
++    return qcfg
++
++
++def save(model, tokenizer, output_dir, qcfg, log):
++    from safetensors.torch import save_file
++
++    os.makedirs(output_dir, exist_ok=True)
++    model.config.use_cache = True
++    model.config.torch_dtype = torch.float16
++    model.save_pretrained(output_dir, safe_serialization=True, max_shard_size="5GB")
++    tokenizer.save_pretrained(output_dir)
++    save_file(runtime.runtime_state(model), os.path.join(output_dir, runtime.RUNTIME_FILE),
++              metadata={"format": "pt"})
++    with open(os.path.join(output_dir, runtime.QCONFIG_FILE), "w") as handle:
++        json.dump(qcfg, handle, indent=2)
++    with open(os.path.join(output_dir, "duquant_calib_log.json"), "w") as handle:
++        json.dump(log, handle, indent=1)
++    print(f"saved DuQuant artifact to {output_dir}: {sorted(os.listdir(output_dir))}", flush=True)
+diff --git a/duquant_port/int8_runtime.py b/duquant_port/int8_runtime.py
+new file mode 100644
+index 0000000..c6e192b
+--- /dev/null
++++ b/duquant_port/int8_runtime.py
+@@ -0,0 +1,567 @@
++"""DuQuant integer runtime, format ``duquant_w4a4_int8_storage``: convert, load, run.
++
++Same quantization as the fake-quant runtime (``runtime.py``), run on integers:
++
++* weights: every decoder projection stores its W4 asymmetric codes CENTRED on the integer zero point,
++  ``weight = q_w - z_w`` (int8, [out, in], in [-15, 15]), plus an fp32 per-output-channel
++  ``weight_scale`` [out]. ``convert_artifact`` recovers them from the verified fake-quant checkpoint
++  (fp16 weights fp16(s * (q - z))) and checks that EVERY code reproduces its fp16 weight bit for bit,
++  fp16(fp32(scale) * code) == weight. fp32 scales: an fp16 scale cannot reproduce all codes exactly.
++* activations, per linear input and in the runtime's order: / Lambda (o_proj, GQA online smooth) ->
++  R1 -> permutation -> R2 (the runtime's own fp32 ``block_transform``: one [M*K/128, 128] @ [128, 128]
++  GEMM per rotation, an index_select for the permutation), then one Triton kernel for the per-token
++  asymmetric A4 quantizer (lac) that emits uint4 codes + fp32 scale + int32 zero, bit-identical to
++  ``fake_quant_per_token``. q/k/v share one transform and one GEMM (fused [q; k; v] weight), gate/up
++  share one transform and one GEMM (fused [gate; up]).
++* GEMM: int8 x int8 -> int32 Triton tensor-core kernel (the shared ``w8a8_int8`` kernel's tiling, copied
++  in ``triton_w8a8.py``) with an exact zero-point epilogue
++  ``(acc - z_x[m] * rowsum(c_w)[n]) * s_x[m] * s_w[n]`` (see ``kernels.py``).
++* attention: q_norm/k_norm before RoPE, 128-Hadamard + per-(token, head) asym A4 (lac) on Q and K (K
++  before ``Cache.update``), V per-(token, head) asym A4 after the cache concat, exactly as the runtime;
++  then ``scaled_dot_product_attention`` (flash when unmasked): ``is_causal`` only when q_len == kv_len,
++  decode (q_len == 1) without a mask, any other offset or a padding mask uses an explicit additive mask.
++* embeddings, lm_head, residual norms, q_norm/k_norm stay fp16.
++
++``load_int8_model`` builds the model on the meta device, swaps in the integer modules, allocates on the
++GPU and copies the saved tensors in, so no fp16 copy of the projections is ever built.
++"""
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import sys
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from . import kernels, runtime
++
++FORMAT = "duquant_w4a4_int8_storage"
++SOURCE_FORMAT = "duquant_fakequant"
++SHARD_BYTES = 4 * 1024 ** 3
++COPY_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
++              "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt", "tokenizer.model",
++              "chat_template.jinja", runtime.RUNTIME_FILE)
++
++
++# ----------------------------------------------------------------------------- config
++
++def read_config(model_path):
++    with open(os.path.join(model_path, runtime.QCONFIG_FILE)) as handle:
++        return json.load(handle)
++
++
++def is_int8_artifact(model_path) -> bool:
++    path = os.path.join(model_path, runtime.QCONFIG_FILE)
++    return os.path.exists(path) and read_config(model_path).get("format") == FORMAT
++
++
++def check_supported(qcfg):
++    """The integer path implements the DuQuant W4A4 setting of the fake-quant runtime exactly."""
++    want = {"quant_method": "duquant", "w_bits": 4, "a_bits": 4, "weight_quant": "per_channel",
++            "act_quant": "per_token", "w_sym": False, "a_sym": False, "online_transforms": True}
++    bad = {k: qcfg.get(k) for k, v in want.items() if qcfg.get(k) != v}
++    if int(qcfg.get("qk_bits", 4)) > 8 or int(qcfg.get("v_bits", 4)) > 8:
++        bad["kv_bits"] = (qcfg.get("qk_bits"), qcfg.get("v_bits"))
++    if bad:
++        raise ValueError(f"{FORMAT} needs DuQuant W4 per-channel asym x A4 per-token asym; artifact differs: {bad}")
++
++
++def kernel_quant_config(source_qcfg):
++    """quantization_config.json keys for the integer artifact (what `kernels.py match` reads)."""
++    qcfg = {k: v for k, v in source_qcfg.items() if k not in ("format", "attn_implementation", "publish_exclude",
++                                                               "weights_basis")}
++    qcfg.update({
++        "format": FORMAT,
++        "quant_method": "duquant",
++        "w_bits": 4,
++        "a_bits": 4,
++        "weight_quant": "per_channel",
++        "act_quant": "per_token",
++        "w_sym": False,
++        "a_sym": False,
++        "online_transforms": True,
++        "zero_point": "integer (round(-xmin / scale)); weights stored centred, activations corrected in the "
++                      "GEMM epilogue",
++        "weight_storage": "int8 centred codes q - z in [-15, 15] [out, in] + fp32 per-channel weight_scale [out]",
++        "weights_basis": "transformed (codes of Q(W*Lambda*R1*P*R2)); activations transformed online",
++        "kernels": "Triton int8 GEMM (shared w8a8_int8 tiling) + exact zero-point epilogue; Triton per-token "
++                   "asym A4 codes; Triton per-(token, head) asym fake quant for Q/K/V; SDPA (flash) attention",
++        "attn_implementation": "sdpa",
++        "real_quant": True,
++        "runtime_module": "duquant_port.int8_runtime",
++        "publish_exclude": [],
++    })
++    return qcfg
++
++
++# ----------------------------------------------------------------------------- conversion
++
++def _exact_scale(w16, codes):
++    """fp32 per-row scale s with fp16(fp32(s) * code) == w for every element, from the intersection of the
++    per-element fp16 rounding intervals (fp64 bounds). Returns (scale fp32 [N], ok bool [N])."""
++    w64 = w16.double()
++    bits = w16.view(torch.int16)
++    # fp16 neighbours of every value (bit +- 1 moves away from / towards zero by sign)
++    up = (bits + torch.where(bits >= 0, 1, -1).to(torch.int16)).view(torch.float16).double()
++    dn = (bits - torch.where(bits >= 0, 1, -1).to(torch.int16)).view(torch.float16).double()
++    zero_bits = bits == 0
++    dn = torch.where(zero_bits, torch.zeros_like(dn), dn)
++    a, b = (w64 + dn) / 2, (w64 + up) / 2  # rounding interval of w (|a| < |w| < |b|)
++    lo, hi = torch.minimum(a, b), torch.maximum(a, b)
++    k = codes.double()
++    nz = codes != 0
++    safe_k = torch.where(nz, k, torch.ones_like(k))
++    c1, c2 = lo / safe_k, hi / safe_k
++    s_lo = torch.where(nz, torch.minimum(c1, c2), torch.full_like(c1, -float("inf"))).amax(1)
++    s_hi = torch.where(nz, torch.maximum(c1, c2), torch.full_like(c1, float("inf"))).amin(1)
++    s = ((s_lo + s_hi) / 2)
++    s = torch.where(torch.isfinite(s), s, torch.full_like(s, runtime.CLIPMIN)).float()
++    back = (s[:, None] * codes.float()).to(torch.float16).view(torch.int16)
++    ok = (back == bits).all(1)
++    return s, ok
++
++
++@torch.no_grad()
++def pack_weight(weight: torch.Tensor, n_bits: int = 4):
++    """fp16 fake-quant weight [N, K] on a per-row asym grid -> (int8 centred codes, fp32 scale [N]).
++
++    Recovers code = q - z per row (the row's span is qmax steps when both clip ends are hit, which swc
++    clipping makes the rule; narrower rows are retried with spans qmax-1 .. 1) and an fp32 scale; raises
++    unless every code reproduces its fp16 weight bit for bit."""
++    qmax = 2 ** n_bits - 1
++    w16 = weight.to(torch.float16).contiguous()
++    w = w16.float()
++    wmax, wmin = w.amax(1), w.amin(1)
++    codes = torch.zeros(w.shape, dtype=torch.int16, device=w.device)
++    scale = torch.zeros(w.shape[0], dtype=torch.float32, device=w.device)
++    todo = torch.ones(w.shape[0], dtype=torch.bool, device=w.device)
++    for span in range(qmax, 0, -1):
++        rows = todo.nonzero().flatten()
++        if rows.numel() == 0:
++            break
++        s0 = ((wmax[rows] - wmin[rows]) / span).clamp(min=runtime.CLIPMIN)
++        k = torch.round(w[rows] / s0[:, None])
++        fits = (k.amax(1) - k.amin(1)) <= qmax
++        s, ok = _exact_scale(w16[rows], k.to(torch.int16))
++        ok &= fits
++        good = rows[ok]
++        codes[good] = k[ok].to(torch.int16)
++        scale[good] = s[ok]
++        todo[good] = False
++    flat_zero = todo & (wmax == 0) & (wmin == 0)  # all-zero row: any scale
++    scale[flat_zero] = runtime.CLIPMIN
++    todo &= ~flat_zero
++    if todo.any():
++        raise RuntimeError(f"{int(todo.sum())} of {w.shape[0]} rows are not on a {n_bits}-bit asym grid")
++    if codes.abs().max() > 127:
++        raise RuntimeError("centred codes exceed int8")
++    back = (scale[:, None] * codes.float()).to(torch.float16).view(torch.int16)
++    bad = int((back != w16.view(torch.int16)).sum())
++    if bad:
++        raise RuntimeError(f"{bad} of {w16.numel()} weights are not reproduced bit for bit by their int codes")
++    return codes.to(torch.int8), scale
++
++
++def _weight_files(model_path):
++    index = os.path.join(model_path, "model.safetensors.index.json")
++    if os.path.exists(index):
++        with open(index) as handle:
++            return sorted(set(json.load(handle)["weight_map"].values()))
++    return ["model.safetensors"]
++
++
++def _decoder_linear(key):
++    """'model.layers.3.self_attn.q_proj.weight' -> 'model.layers.3.self_attn.q_proj' for the 7 projections."""
++    if not key.endswith(".weight") or ".layers." not in key:
++        return None
++    prefix = key[: -len(".weight")]
++    if any(prefix.endswith("." + name) for name in runtime.LAYER_LINEARS):
++        return prefix
++    return None
++
++
++@torch.no_grad()
++def convert_artifact(src, dst, device="cuda", log=print):
++    """Fake-quant DuQuant artifact at ``src`` -> integer ``duquant_w4a4_int8_storage`` artifact at ``dst``."""
++    from safetensors import safe_open
++    from safetensors.torch import save_file
++
++    if os.path.abspath(src) == os.path.abspath(dst):
++        raise ValueError("convert into a new directory, not in place")
++    qcfg = read_config(src)
++    if qcfg.get("format") != SOURCE_FORMAT:
++        raise ValueError(f"{src} is not a {SOURCE_FORMAT} artifact (format={qcfg.get('format')})")
++    check_supported(qcfg)
++    os.makedirs(dst, exist_ok=True)
++    n_bits = int(qcfg["w_bits"])
++    out, stats = {}, {"projections": 0, "codes": 0, "max_abs_code": 0, "rows": 0}
++    for name in _weight_files(src):
++        with safe_open(os.path.join(src, name), framework="pt") as handle:
++            for key in handle.keys():
++                tensor = handle.get_tensor(key)
++                proj = _decoder_linear(key)
++                if proj is None:
++                    out[key] = tensor.contiguous()
++                    continue
++                codes, scale = pack_weight(tensor.to(device), n_bits)
++                out[proj + ".weight"] = codes.cpu()
++                out[proj + ".weight_scale"] = scale.cpu()
++                stats["projections"] += 1
++                stats["codes"] += codes.numel()
++                stats["rows"] += codes.shape[0]
++                stats["max_abs_code"] = max(stats["max_abs_code"], int(codes.abs().max()))
++    if stats["projections"] != 7 * int(qcfg["num_layers"]):
++        raise RuntimeError(f"packed {stats['projections']} projections, expected {7 * int(qcfg['num_layers'])}")
++    shards, current, size = [], {}, 0
++    for key in sorted(out):
++        nbytes = out[key].numel() * out[key].element_size()
++        if current and size + nbytes > SHARD_BYTES:
++            shards.append(current)
++            current, size = {}, 0
++        current[key] = out[key]
++        size += nbytes
++    shards.append(current)
++    weight_map, total = {}, 0
++    for i, shard in enumerate(shards):
++        fname = f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors"
++        save_file(shard, os.path.join(dst, fname), metadata={"format": "pt", "quant_format": FORMAT})
++        for key, tensor in shard.items():
++            weight_map[key] = fname
++            total += tensor.numel() * tensor.element_size()
++    with open(os.path.join(dst, "model.safetensors.index.json"), "w") as handle:
++        json.dump({"metadata": {"total_size": total, "quant_format": FORMAT}, "weight_map": weight_map}, handle,
++                  indent=2)
++    for fname in COPY_FILES:
++        path = os.path.join(src, fname)
++        if os.path.exists(path):
++            shutil.copy2(path, os.path.join(dst, fname))
++    new_cfg = kernel_quant_config(qcfg)
++    new_cfg["converted_from_format"] = SOURCE_FORMAT
++    with open(os.path.join(dst, runtime.QCONFIG_FILE), "w") as handle:
++        json.dump(new_cfg, handle, indent=2)
++    stats.update(shards=len(shards), tensor_bytes=total, bit_exact=True)
++    log(f"converted {stats['projections']} projections ({stats['codes']} codes, all bit-exact) into "
++        f"{len(shards)} shard(s), {total / 1e9:.2f} GB of tensors")
++    return stats
++
++
++# ----------------------------------------------------------------------------- modules
++
++class DuQuantInt8Linear(nn.Module):
++    """Decoder projection: int8 centred W4 codes + fp32 scale; online DuQuant transform + A4 codes + int8 GEMM."""
++
++    def __init__(self, in_features, out_features, bias=False, *, a_bits=4, lac=None, block_size=128,
++                 dtype=torch.float16):
++        super().__init__()
++        if in_features % block_size:
++            raise ValueError(f"in_features {in_features} not divisible by block_size {block_size}")
++        self.in_features, self.out_features = int(in_features), int(out_features)
++        self.du_a_bits, self.du_lac, self.du_block = int(a_bits), lac, int(block_size)
++        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
++        self.register_buffer("weight_scale", torch.empty((out_features,), dtype=torch.float32))
++        if bias:
++            self.register_buffer("bias", torch.empty(out_features, dtype=dtype))
++        else:
++            self.bias = None
++        self.register_buffer("weight_rowsum", None, persistent=False)
++        self.register_buffer("du_R", None, persistent=False)
++        self.register_buffer("du_perm", None, persistent=False)
++        self.register_buffer("du_smooth", None, persistent=False)
++        self.gemm_config = None
++
++    def finalize(self):
++        self.weight_rowsum = self.weight.sum(dim=1, dtype=torch.int32)
++
++    def set_transform(self, R, perm, smooth):
++        dev = self.weight.device
++        self.du_R = R.detach().float().to(dev)
++        self.du_perm = None if perm is None else perm.detach().long().to(dev)
++        self.du_smooth = None if smooth is None else smooth.detach().float().reshape(-1).to(dev)
++
++    def transform_input(self, x):
++        """fp32 / Lambda -> R1 -> P -> R2 on [M, K], the numbers of runtime.DuQuantLinear.du_quant_input:
++        the same fp32 ops and GEMM shapes ([M*K/bs, bs] @ [bs, bs] per rotation); the permutation (pure data
++        movement, so exact by construction) is a Triton row gather instead of index_select."""
++        k = self.in_features
++        if x.dtype == torch.float32:
++            xf = x.reshape(-1, k)
++            if self.du_smooth is not None:
++                xf = xf / self.du_smooth
++        else:
++            if x.is_contiguous():
++                xf = x.reshape(-1, k).float()
++            else:  # e.g. the attention output [b, L, h, d] seen through a transpose: one convert+copy pass
++                xf = torch.empty(x.shape, dtype=torch.float32, device=x.device)
++                xf.copy_(x)
++                xf = xf.view(-1, k)
++            if self.du_smooth is not None:
++                xf.div_(self.du_smooth)  # fresh fp32 tensor: same IEEE division as xf / smooth
++        R, perm, bs = self.du_R, self.du_perm, self.du_block
++        n_perm = 0 if perm is None else perm.shape[0]
++        for i in range(n_perm):
++            xf = (xf.reshape(-1, bs) @ R[i]).reshape(-1, k)
++            xf = kernels.permute_cols(xf, perm[i])
++        return (xf.reshape(-1, bs) @ R[-1]).reshape(-1, k)
++
++    def quant_input(self, x):
++        """-> (uint4 codes int8 [M, K], fp32 scale [M], int32 zero [M])."""
++        return kernels.asym_codes(self.transform_input(x), self.du_a_bits, self.du_lac)
++
++    def dequantized_weight(self, dtype=torch.float16):
++        return (self.weight_scale[:, None] * self.weight.float()).to(dtype)
++
++    def forward(self, x):
++        return self.forward_rows(x, x.shape[:-1])
++
++    def forward_rows(self, x, lead):
++        """x holds prod(lead) rows of in_features values in any (possibly strided) shape, e.g. the attention
++        output [b, L, h, d] seen through a transpose."""
++        q, s, z = self.quant_input(x)
++        out = kernels.w4a4_azp_matmul(q, s, z, self.weight, self.weight_scale, self.weight_rowsum, x.dtype,
++                                      self.gemm_config)
++        if self.bias is not None:
++            out = out + self.bias
++        return out.view(*lead, self.out_features)
++
++    def extra_repr(self):
++        return (f"in={self.in_features}, out={self.out_features}, a_bits={self.du_a_bits}, lac={self.du_lac}, "
++                f"format={FORMAT}")
++
++
++class _Fused:
++    """[a; b; ...] weights of linears that share one input transform: one GEMM, module weights are views."""
++
++    def __init__(self, linears):
++        self.linears = linears
++        self.splits = [lin.out_features for lin in linears]
++        self.weight = torch.cat([lin.weight for lin in linears], 0).contiguous()
++        self.scale = torch.cat([lin.weight_scale for lin in linears], 0).contiguous()
++        self.rowsum = self.weight.sum(dim=1, dtype=torch.int32)
++        biases = [lin.bias for lin in linears]
++        self.bias = None
++        if any(b is not None for b in biases):
++            self.bias = torch.cat([b if b is not None else torch.zeros(lin.out_features, dtype=torch.float16,
++                                                                       device=lin.weight.device)
++                                   for b, lin in zip(biases, linears)])
++        start = 0
++        for lin, n in zip(linears, self.splits):  # re-point the modules at the fused storage (no extra copy)
++            lin.weight = self.weight[start:start + n]
++            lin.weight_scale = self.scale[start:start + n]
++            lin.weight_rowsum = self.rowsum[start:start + n]
++            start += n
++        self.config = None
++
++    def __call__(self, codes, out_dtype):
++        q, s, z = codes
++        out = kernels.w4a4_azp_matmul(q, s, z, self.weight, self.scale, self.rowsum, out_dtype, self.config)
++        if self.bias is not None:
++            out = out + self.bias
++        return out.split(self.splits, dim=-1)
++
++
++def _qk_quant(self, x):
++    """runtime._qk_quant: 128-Hadamard over head_dim (fp32, same op) then per-(token, head) asym fake quant."""
++    shape = x.shape
++    xf = x.float().reshape(-1, self.du_H.shape[0]) @ self.du_H
++    return kernels.asym_fake_quant_rows(xf, self.du_qk_bits, self.du_qk_lac, x.dtype).reshape(shape)
++
++
++def _sdpa(query, key, value, attention_mask, scaling, cache_position):
++    bsz, _, q_len, _ = query.shape
++    kv_len = key.shape[-2]
++    gqa = query.shape[1] != key.shape[1]
++    if attention_mask is not None and attention_mask.dim() == 4:
++        mask = attention_mask[:, :, :, :kv_len]
++        return F.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=scaling, enable_gqa=gqa)
++    if attention_mask is None and q_len == kv_len:
++        return F.scaled_dot_product_attention(query, key, value, is_causal=q_len > 1, scale=scaling,
++                                              enable_gqa=gqa)
++    if attention_mask is None and q_len == 1:
++        return F.scaled_dot_product_attention(query, key, value, scale=scaling, enable_gqa=gqa)
++    # chunked prefill with a cache offset, or a 2-D padding mask: explicit additive causal mask (runtime D6)
++    mask = runtime._causal_mask(attention_mask, bsz, q_len, kv_len, cache_position, query.dtype, query.device)
++    return F.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=scaling, enable_gqa=gqa)
++
++
++def int8_attention_forward(self, hidden_states, position_embeddings=None, attention_mask=None,
++                           past_key_value=None, cache_position=None, **kwargs):
++    """runtime.du_attention_forward on integers. Q/K stay in [b, L, h, d] through q_norm/k_norm, RoPE, the
++    Hadamard and the quantizer (element-wise / per-row ops, so the same numbers as the [b, h, L, d] runtime
++    without its transpose copies) and are handed to SDPA as transposed views."""
++    hf = sys.modules[type(self).__mro__[1].__module__]
++    bsz, q_len, _ = hidden_states.shape
++    hidden_shape = (bsz, q_len, -1, self.head_dim)
++    codes = self.q_proj.quant_input(hidden_states)  # q/k/v share q_proj's transform
++    query, key, value = self._du_qkv(codes, hidden_states.dtype)
++    query = query.view(hidden_shape)
++    key = key.view(hidden_shape)
++    # own storage for V: the cache must not pin the whole fused qkv output
++    value = value.reshape(hidden_shape).transpose(1, 2).contiguous()
++    if getattr(self, "q_norm", None) is not None:
++        query = self.q_norm(query)
++    if getattr(self, "k_norm", None) is not None:
++        key = self.k_norm(key)
++    cos, sin = position_embeddings
++    query, key = hf.apply_rotary_pos_emb(query, key, cos, sin, unsqueeze_dim=2)
++    query = _qk_quant(self, query).transpose(1, 2)
++    key = _qk_quant(self, key).transpose(1, 2)  # K enters the cache Hadamard-rotated + quantized
++    if past_key_value is not None:
++        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
++        key, value = past_key_value.update(key, value, self.layer_idx, cache_kwargs)
++    value = kernels.asym_fake_quant_rows(value, self.du_v_bits, None, value.dtype)  # V quantized after concat
++    out = _sdpa(query, key, value, attention_mask, self.scaling, cache_position)
++    return self.o_proj.forward_rows(out.transpose(1, 2), (bsz, q_len)), None
++
++
++def int8_mlp_forward(self, x):
++    codes = self.gate_proj.quant_input(x)  # gate/up share gate_proj's transform
++    gate, up = self._du_gate_up(codes, x.dtype)
++    h = self.act_fn(gate) * up
++    return self.down_proj(h.view(*x.shape[:-1], -1))
++
++
++_CLASS_CACHE: dict = {}
++
++
++def _swap_class(module, forward, tag):
++    base = type(module)
++    if getattr(base, "_duquant_int8", False):
++        return
++    key = (base, tag)
++    if key not in _CLASS_CACHE:
++        _CLASS_CACHE[key] = type(f"DuQuantInt8{base.__name__}", (base,), {"forward": forward, "_duquant_int8": True})
++    module.__class__ = _CLASS_CACHE[key]
++
++
++# ----------------------------------------------------------------------------- build + load
++
++def _build_skeleton(model_path, qcfg, dtype):
++    from transformers import AutoConfig
++    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
++
++    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
++    bs = int(qcfg["block_size"])
++    # Resolve (import) the model class before entering the meta-device context: lazy imports under a
++    # TorchFunctionMode hit a circular torch._dynamo import.
++    model_cls = MODEL_FOR_CAUSAL_LM_MAPPING[type(config)]
++    with torch.device("meta"):
++        model = model_cls._from_config(config, torch_dtype=dtype, attn_implementation="sdpa")
++        layers, _ = runtime.decoder_layers(model)
++        for layer in layers:
++            for name in runtime.LAYER_LINEARS:
++                parent_name, child = name.rsplit(".", 1)
++                parent = layer.get_submodule(parent_name)
++                lin = getattr(parent, child)
++                setattr(parent, child, DuQuantInt8Linear(
++                    lin.in_features, lin.out_features, bias=lin.bias is not None, a_bits=qcfg["a_bits"],
++                    lac=qcfg.get("lac"), block_size=bs, dtype=dtype))
++    return model, config
++
++
++@torch.no_grad()
++def _load_tensors(model, model_path):
++    from safetensors import safe_open
++
++    state = dict(model.named_parameters())
++    state.update(dict(model.named_buffers()))
++    expected = set(model.state_dict().keys())
++    tied = bool(getattr(model.config, "tie_word_embeddings", False))
++    if tied:
++        expected.discard("lm_head.weight")
++    seen = set()
++    for name in _weight_files(model_path):
++        with safe_open(os.path.join(model_path, name), framework="pt") as handle:
++            for key in handle.keys():
++                if key not in expected:
++                    raise RuntimeError(f"unexpected tensor in {FORMAT} artifact: {key}")
++                tensor = handle.get_tensor(key)
++                target = state[key]
++                if tuple(tensor.shape) != tuple(target.shape):
++                    raise RuntimeError(f"{key}: saved {tuple(tensor.shape)} vs built {tuple(target.shape)}")
++                if target.dtype in (torch.int8, torch.float32) and tensor.dtype != target.dtype:
++                    raise RuntimeError(f"{key}: expected {target.dtype}, got {tensor.dtype}")
++                target.copy_(tensor)
++                seen.add(key)
++    missing = sorted(expected - seen)
++    if missing:
++        raise RuntimeError(f"{FORMAT} artifact is missing {len(missing)} tensors: {missing[:8]}")
++    if tied:
++        model.tie_weights()
++
++
++def install_int8_runtime(model, qcfg, tensors):
++    layers, prefix = runtime.decoder_layers(model)
++    if len(layers) != int(qcfg["num_layers"]):
++        raise ValueError(f"artifact has {qcfg['num_layers']} DuQuant layers, model has {len(layers)}")
++    bs = int(qcfg["block_size"])
++    for i, layer in enumerate(layers):
++        attn, mlp = layer.self_attn, layer.mlp
++        if attn.head_dim % bs:
++            raise ValueError(f"block_size {bs} must divide head_dim {attn.head_dim} for the Q/K Hadamard")
++        if getattr(attn, "sliding_window", None):
++            raise NotImplementedError("sliding-window attention is not supported by the DuQuant runtime")
++        for name in runtime.LAYER_LINEARS:
++            key = f"{prefix}.{i}.{name}"
++            lin = layer.get_submodule(name)
++            lin.set_transform(tensors[f"{key}.du_R"], tensors.get(f"{key}.du_perm"), tensors.get(f"{key}.du_smooth"))
++            lin.finalize()
++        for lead, followers in (("self_attn.q_proj", ("self_attn.k_proj", "self_attn.v_proj")),
++                                ("mlp.gate_proj", ("mlp.up_proj",))):
++            ref = layer.get_submodule(lead)
++            for name in followers:
++                other = layer.get_submodule(name)
++                same = torch.equal(ref.du_R, other.du_R) and (
++                    (ref.du_perm is None and other.du_perm is None) or torch.equal(ref.du_perm, other.du_perm))
++                if not same or other.du_smooth is not None:
++                    raise ValueError(f"layer {i}: {name} transform differs from {lead}")
++        attn._du_qkv = _Fused([attn.q_proj, attn.k_proj, attn.v_proj])
++        mlp._du_gate_up = _Fused([mlp.gate_proj, mlp.up_proj])
++        _swap_class(attn, int8_attention_forward, "attn")
++        _swap_class(mlp, int8_mlp_forward, "mlp")
++        attn.du_qk_bits = int(qcfg.get("qk_bits", qcfg["a_bits"]))
++        attn.du_qk_lac = qcfg.get("qk_lac", qcfg.get("lac"))
++        attn.du_v_bits = int(qcfg.get("v_bits", qcfg["a_bits"]))
++        attn.register_buffer("du_H", runtime.get_hadamard(bs).to(attn.q_proj.weight.device), persistent=False)
++    model.config.use_cache = True
++    return model
++
++
++def load_int8_model(model_path, device="cuda", dtype=torch.float16):
++    """Rebuild a ``duquant_w4a4_int8_storage`` artifact on the GPU (meta-device build, no fp16 projections)."""
++    from safetensors.torch import load_file
++    from transformers import AutoTokenizer
++
++    if not (str(device).startswith("cuda") and torch.cuda.is_available()):
++        raise RuntimeError(f"{FORMAT} needs CUDA (Triton int8 GEMM); got device={device}")
++    dtype = torch.float16  # the method is fp16 end to end
++    qcfg = read_config(model_path)
++    if qcfg.get("format") != FORMAT:
++        raise ValueError(f"{model_path} is not a {FORMAT} artifact")
++    check_supported(qcfg)
++    tokenizer = AutoTokenizer.from_pretrained(model_path)
++    model, config = _build_skeleton(model_path, qcfg, dtype)
++    model.to_empty(device=device)
++    _load_tensors(model, model_path)
++    for param in model.parameters():
++        param.requires_grad_(False)
++    inner = model.model
++    inner.rotary_emb = type(inner.rotary_emb)(config=config, device=device)  # inv_freq is non-persistent
++    tensors = load_file(os.path.join(model_path, qcfg.get("runtime_file", runtime.RUNTIME_FILE)), device=str(device))
++    install_int8_runtime(model, qcfg, tensors)
++    try:
++        from transformers import GenerationConfig
++
++        model.generation_config = GenerationConfig.from_pretrained(model_path, local_files_only=True)
++    except Exception:  # noqa: BLE001 - optional file
++        pass
++    model.eval()
++    model.quant_agent_runtime = {
++        "format": FORMAT,
++        "int8_linears": sum(isinstance(m, DuQuantInt8Linear) for m in model.modules()),
++        "attention": "sdpa (flash when unmasked)",
++        "qk_bits": qcfg.get("qk_bits"), "v_bits": qcfg.get("v_bits"), "lac": qcfg.get("lac"),
++    }
++    return model, tokenizer
+diff --git a/duquant_port/kernels.py b/duquant_port/kernels.py
+new file mode 100644
+index 0000000..4f261c3
+--- /dev/null
++++ b/duquant_port/kernels.py
+@@ -0,0 +1,260 @@
++"""Triton kernels for the DuQuant integer format ``duquant_w4a4_int8_storage``.
++
++DuQuant quantizes asymmetrically (weights per output channel, activations per token, 4 bits, integer
++zero points: ``round(-xmin / scale)``). For a 4-bit code q in [0, 15] and an integer zero z the
++dequantized value is ``s * (q - z)``, so
++
++    Y[m, n] = s_x[m] * s_w[n] * sum_k (q_x[m, k] - z_x[m]) * c_w[n, k]
++            = s_x[m] * s_w[n] * (sum_k q_x[m, k] * c_w[n, k]  -  z_x[m] * rowsum(c_w)[n])
++
++with the weight codes stored centred, ``c_w = q_w - z_w`` (int8, in [-15, 15] for any row that spans
++zero). The int8 x int8 -> int32 tensor-core GEMM computes the first sum exactly; the zero-point term is
++an exact int32 rank-1 correction in the epilogue. No approximation for ANY integer z_x (a token whose
++values are all positive has z_x < 0 and codes q - z_x outside int8; the correction keeps that exact too).
++
++Kernels:
++1. ``_asym_codes_kernel`` / ``_asym_codes_looped_kernel``: per-token asymmetric quantizer of a linear's
++   (already rotated, fp32) input -> uint4 codes in int8 lanes, fp32 scale, int32 zero. Bit-identical to
++   ``runtime.fake_quant_per_token`` (fp32: min/max, * lac, / 15, clamp, IEEE division, round half even).
++2. ``_asym_fake_quant_rows_kernel``: the same quantizer as fake quant (fp16/fp32 in, fp16 out) over many
++   short rows at once: per-(token, head) Q/K (after the Hadamard) and V (head_dim = 128).
++3. ``_w4a4_azp_gemm_kernel``: the shared ``w8a8_int8`` Triton GEMM (same tiling/configs, from
++   ``triton_w8a8.py`` copied unchanged) plus the zero-point epilogue above.
++4. ``_gather_cols_kernel``: the DuQuant zigzag permutation between R1 and R2 as a row gather (exact data
++   movement, ~1.5x faster than index_select at these shapes).
++torch computes ``tensor / qmax`` (Python-scalar divisor) as a multiply by the fp32 reciprocal and every
++other division IEEE-exactly; the kernels mirror that with explicitly rounded ops (no FMA contraction).
++Triton value arguments are Python floats/ints (0-d tensors would compile as pointers).
++"""
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++try:  # triton >= 3.0
++    from triton.language.extra import libdevice
++except ImportError:  # pragma: no cover - older layouts
++    from triton.language.extra.cuda import libdevice
++
++from . import triton_w8a8
++
++@triton.jit
++def _asym_params(xmin, xmax, clip, inv_qmax, HAS_CLIP: tl.constexpr):
++    """fp32, torch order: (min, max) * clip -> (max - min) / qmax -> clamp -> zero = round(clamp(-min / s)).
++
++    Every product/difference/quotient is an explicitly rounded op (mul_rn / sub_rn / div_rn): LLVM would
++    otherwise contract ``max*c - min*c`` into an FMA and change the last bit of the scale."""
++    if HAS_CLIP:
++        xmin = libdevice.mul_rn(xmin, clip)
++        xmax = libdevice.mul_rn(xmax, clip)
++    # torch computes ``tensor / qmax`` (Python-scalar divisor) as a multiply by the fp32 reciprocal
++    scale = libdevice.mul_rn(libdevice.sub_rn(xmax, xmin), inv_qmax)
++    scale = tl.minimum(tl.maximum(scale, 1e-5), 1e4)
++    zero = tl.math.div_rn(-xmin, scale)
++    zero = libdevice.rint(tl.minimum(tl.maximum(zero, -1e4), 1e4))
++    return scale, zero
++
++
++@triton.jit
++def _asym_q(x, scale, zero, QMAX: tl.constexpr):
++    """clamp(round(x / s) + z, 0, qmax) with IEEE division and round half to even (torch.round)."""
++    q = libdevice.add_rn(libdevice.rint(tl.math.div_rn(x, scale)), zero)
++    return tl.minimum(tl.maximum(q, 0.0), QMAX)
++
++
++@triton.jit
++def _asym_codes_kernel(x_ptr, q_ptr, s_ptr, z_ptr, K, stride_x, stride_q, clip, inv_qmax,
++                       HAS_CLIP: tl.constexpr, QMAX: tl.constexpr, BLOCK_K: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < K
++    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
++    xmin = tl.min(tl.where(mask, x, float("inf")), axis=0)
++    xmax = tl.max(tl.where(mask, x, float("-inf")), axis=0)
++    scale, zero = _asym_params(xmin, xmax, clip, inv_qmax, HAS_CLIP)
++    q = _asym_q(x, scale, zero, QMAX)
++    tl.store(q_ptr + row * stride_q + offs, q.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++    tl.store(z_ptr + row, zero.to(tl.int32))
++
++
++@triton.jit
++def _asym_codes_looped_kernel(x_ptr, q_ptr, s_ptr, z_ptr, K, stride_x, stride_q, clip, inv_qmax,
++                              HAS_CLIP: tl.constexpr, QMAX: tl.constexpr, BLOCK_K: tl.constexpr):
++    """Long rows (K > BLOCK_K): min/max pass, then the code pass (second read hits L2)."""
++    row = tl.program_id(0).to(tl.int64)
++    x_row = x_ptr + row * stride_x
++    q_row = q_ptr + row * stride_q
++    offs = tl.arange(0, BLOCK_K)
++    run_min = tl.full((BLOCK_K,), float("inf"), tl.float32)
++    run_max = tl.full((BLOCK_K,), float("-inf"), tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        run_min = tl.minimum(run_min, tl.where(mask, x, float("inf")))
++        run_max = tl.maximum(run_max, tl.where(mask, x, float("-inf")))
++    scale, zero = _asym_params(tl.min(run_min, axis=0), tl.max(run_max, axis=0), clip, inv_qmax, HAS_CLIP)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        tl.store(q_row + k0 + offs, _asym_q(x, scale, zero, QMAX).to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++    tl.store(z_ptr + row, zero.to(tl.int32))
++
++
++@triton.jit
++def _asym_fake_quant_rows_kernel(x_ptr, y_ptr, n_rows, clip, inv_qmax,
++                                 HAS_CLIP: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr,
++                                 ROWS: tl.constexpr):
++    """y = ((q - z) * s).to(y.dtype) per row of D contiguous values (runtime.fake_quant_per_token)."""
++    pid = tl.program_id(0).to(tl.int64)
++    rows = pid * ROWS + tl.arange(0, ROWS)
++    cols = tl.arange(0, D)
++    rmask = rows < n_rows
++    ptrs = rows[:, None] * D + cols[None, :]
++    x = tl.load(x_ptr + ptrs, mask=rmask[:, None], other=0.0).to(tl.float32)
++    scale, zero = _asym_params(tl.min(x, axis=1), tl.max(x, axis=1), clip, inv_qmax, HAS_CLIP)
++    q = _asym_q(x, scale[:, None], zero[:, None], QMAX)
++    y = libdevice.mul_rn(libdevice.sub_rn(q, zero[:, None]), scale[:, None])
++    tl.store(y_ptr + ptrs, y.to(y_ptr.dtype.element_ty), mask=rmask[:, None])
++
++
++@triton.jit
++def _gather_cols_kernel(x_ptr, p_ptr, y_ptr, K, stride_x, stride_y, BLOCK: tl.constexpr):
++    """y[m, j] = x[m, perm[j]]: one program per row, the whole row's indices at once (row stays in L1/L2)."""
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.arange(0, BLOCK)
++    mask = cols < K
++    src = tl.load(p_ptr + cols, mask=mask, other=0)
++    v = tl.load(x_ptr + row * stride_x + src, mask=mask)
++    tl.store(y_ptr + row * stride_y + cols, v, mask=mask)
++
++
++@triton.jit
++def _w4a4_azp_gemm_kernel(
++    a_ptr, b_ptr, c_ptr, as_ptr, az_ptr, bs_ptr, brs_ptr,
++    M, N, K,
++    stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
++    EVEN_K: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
++):
++    """C = ((A_u4[M,K] @ B_c[N,K]^T) - a_zero[M] * b_rowsum[N]) * a_scale[M] * b_scale[N] (int32 exact)."""
++    pid = tl.program_id(0)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    num_pid_in_group = GROUP_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_am = offs_m % M
++    offs_bn = offs_n % N
++    offs_k = tl.arange(0, BLOCK_K)
++    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
++    b_ptrs = b_ptr + offs_bn[None, :].to(tl.int64) * stride_bn + offs_k[:, None] * stride_bk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
++    for k in range(0, tl.cdiv(K, BLOCK_K)):
++        if EVEN_K:
++            a = tl.load(a_ptrs)
++            b = tl.load(b_ptrs)
++        else:
++            k_left = K - k * BLOCK_K
++            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_left, other=0)
++            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_left, other=0)
++        acc = tl.dot(a, b, acc, out_dtype=tl.int32)
++        a_ptrs += BLOCK_K * stride_ak
++        b_ptrs += BLOCK_K * stride_bk
++
++    a_zero = tl.load(az_ptr + offs_am)
++    b_rowsum = tl.load(brs_ptr + offs_bn)
++    acc = acc - a_zero[:, None] * b_rowsum[None, :]
++    a_scale = tl.load(as_ptr + offs_am).to(tl.float32)
++    b_scale = tl.load(bs_ptr + offs_bn).to(tl.float32)
++    out = acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]
++    c_ptrs = c_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
++    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask)
++
++
++# ----------------------------------------------------------------------------- host wrappers
++
++def _inv_qmax(n_bits):
++    """fp32(1) / fp32(qmax) as a Python float (exactly representable in fp32)."""
++    one = torch.tensor(1.0, dtype=torch.float32)
++    return float(one / torch.tensor(float(2 ** n_bits - 1), dtype=torch.float32))
++
++
++def asym_codes(x2d: torch.Tensor, n_bits: int, clip: float | None):
++    """Per-token asym quant of x2d [M, K] (fp32/fp16, unit stride) -> (int8 codes in [0, qmax], fp32 scale [M],
++    int32 zero [M]); identical numbers to runtime.fake_quant_per_token."""
++    m, k = x2d.shape
++    if x2d.stride(-1) != 1:
++        x2d = x2d.contiguous()
++    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
++    s = torch.empty((m,), dtype=torch.float32, device=x2d.device)
++    z = torch.empty((m,), dtype=torch.int32, device=x2d.device)
++    if m:
++        args = (x2d, q, s, z, int(k), int(x2d.stride(0)), int(q.stride(0)), float(clip or 1.0), _inv_qmax(n_bits))
++        meta = dict(HAS_CLIP=bool(clip), QMAX=float(2 ** n_bits - 1))
++        block = triton.next_power_of_2(int(k))
++        if block <= 4096:
++            _asym_codes_kernel[(int(m),)](*args, **meta, BLOCK_K=block, num_warps=8 if block >= 2048 else 4)
++        else:
++            _asym_codes_looped_kernel[(int(m),)](*args, **meta, BLOCK_K=4096, num_warps=8)
++    return q, s, z
++
++
++def asym_fake_quant_rows(x: torch.Tensor, n_bits: int, clip: float | None, out_dtype=torch.float16):
++    """runtime.fake_quant_per_token(x, n_bits, clip).to(out_dtype) for rows of the last dim (power of 2)."""
++    d = x.shape[-1]
++    if d & (d - 1) or d > 1024:
++        raise ValueError(f"row length {d} must be a power of two <= 1024")
++    src = x if x.is_contiguous() else x.contiguous()
++    y = torch.empty(src.shape, dtype=out_dtype, device=src.device)
++    n_rows = src.numel() // d
++    if n_rows:
++        rows = max(1, 4096 // d)
++        _asym_fake_quant_rows_kernel[(triton.cdiv(n_rows, rows),)](
++            src, y, int(n_rows), float(clip or 1.0), _inv_qmax(n_bits), HAS_CLIP=bool(clip), QMAX=float(2 ** n_bits - 1),
++            D=int(d), ROWS=rows, num_warps=4)
++    return y
++
++
++def permute_cols(x2d: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
++    """x2d.index_select(-1, perm) (exact data movement) at copy bandwidth for rows up to 16384 values."""
++    m, k = x2d.shape
++    block = triton.next_power_of_2(int(k))
++    if block > 16384 or x2d.stride(-1) != 1 or not x2d.is_cuda:
++        return x2d.index_select(-1, perm)
++    y = torch.empty_like(x2d, memory_format=torch.contiguous_format)
++    if m:
++        _gather_cols_kernel[(int(m),)](x2d, perm, y, int(k), int(x2d.stride(0)), int(y.stride(0)), BLOCK=block,
++                                       num_warps=8 if block <= 4096 else 16)
++    return y
++
++
++def w4a4_azp_matmul(q, a_scale, a_zero, weight, weight_scale, weight_rowsum, out_dtype, config=None):
++    """uint4-in-int8 activation codes [M, K] x centred int8 weight codes [N, K] -> out_dtype [M, N]."""
++    m, k = q.shape
++    n = weight.shape[0]
++    out = torch.empty((m, n), dtype=out_dtype, device=q.device)
++    if m == 0:
++        return out
++    block_m, block_n, block_k, group_m, warps, stages = config or triton_w8a8._gemm_config(m, n, k)
++    grid = (triton.cdiv(int(m), block_m) * triton.cdiv(int(n), block_n),)
++    _w4a4_azp_gemm_kernel[grid](
++        q, weight, out, a_scale, a_zero, weight_scale, weight_rowsum,
++        int(m), int(n), int(k),
++        int(q.stride(0)), int(q.stride(1)), int(weight.stride(0)), int(weight.stride(1)),
++        int(out.stride(0)), int(out.stride(1)),
++        EVEN_K=(int(k) % block_k == 0),
++        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=group_m,
++        num_warps=warps, num_stages=stages,
++    )
++    return out
+diff --git a/duquant_port/runtime.py b/duquant_port/runtime.py
+new file mode 100644
+index 0000000..85b3760
+--- /dev/null
++++ b/duquant_port/runtime.py
+@@ -0,0 +1,302 @@
++"""DuQuant inference runtime on stock transformers-4.51 decoder modules (fake-quant, online transforms).
++
++Every decoder linear becomes a `DuQuantLinear` (an `nn.Linear` subclass). Its `.weight` holds the frozen
++fake-quant weight Q(W . Lambda . G) in the TRANSFORMED basis (fp16, <= 2^w_bits values per row). Its input
++gets, online and in this order (method.md Invariants, "Activation transform order"):
++  / Lambda_online (o_proj under GQA only, D4) -> R1 -> zigzag permutation P -> R2 -> per-token asym quant (lac)
++which is `quantize/quantizer.py` init_duquant + per_token_dynamic_calibration + fake_quant, except that the
++permutation is applied with index_select on the LAST dim, so any batch/sequence shape works (D9).
++
++The attention keeps q_norm/k_norm before RoPE (D3), then applies the block_size Hadamard on head_dim and
++per-(token, head) asym quant (lac) to Q and K; K is quantized BEFORE the Cache.update, V is quantized per
++(token, head) AFTER it (repo int_llama_layer.py:132-168). Softmax output stays 16-bit. The causal mask is
++the model's 4-D eager mask, or is built here with the cache offset when the caller passes None/2-D (D6).
++"""
++from __future__ import annotations
++
++import json
++import math
++import os
++import sys
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++RUNTIME_FILE = "duquant_runtime.safetensors"
++QCONFIG_FILE = "quantization_config.json"
++CLIPMIN, CLIPMAX = 1e-5, 1e4  # quantize/const.py
++ATTN_LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj")
++MLP_LINEARS = ("gate_proj", "up_proj", "down_proj")
++LAYER_LINEARS = tuple(f"self_attn.{n}" for n in ATTN_LINEARS) + tuple(f"mlp.{n}" for n in MLP_LINEARS)
++
++
++def get_hadamard(n: int) -> torch.Tensor:
++    """utils.get_hadamard: normalized Sylvester Hadamard (power-of-two n)."""
++    if n & (n - 1):
++        raise ValueError(f"Hadamard size must be a power of two, got {n}")
++    if n == 1:
++        return torch.ones(1, 1)
++    h = get_hadamard(n // 2)
++    return torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0) / math.sqrt(2)
++
++
++def fake_quant_per_token(x: torch.Tensor, n_bits: int, clip: float | None = None) -> torch.Tensor:
++    """quantizer.py per_token_dynamic_calibration (asym, reduce over last dim, clip) + fake_quant, in fp32."""
++    xf = x.float()
++    if n_bits >= 16:
++        return xf
++    xmin = xf.amin(-1, keepdim=True)
++    xmax = xf.amax(-1, keepdim=True)
++    if clip:
++        xmin = xmin * clip
++        xmax = xmax * clip
++    qmax = 2 ** n_bits - 1
++    scale = ((xmax - xmin) / qmax).clamp(min=CLIPMIN, max=CLIPMAX)
++    zero = (-xmin / scale).clamp(min=-CLIPMAX, max=CLIPMAX).round()
++    q = (torch.round(xf / scale) + zero).clamp(0, qmax)
++    return (q - zero) * scale
++
++
++def block_transform(x: torch.Tensor, R: torch.Tensor, perm: torch.Tensor | None) -> torch.Tensor:
++    """quantizer.init_duquant (calibrated path): x.reshape(-1,bs)@R[i], permute, ..., @R[-1] on the last dim."""
++    shape = x.shape
++    channels = shape[-1]
++    bs = R.shape[-1]
++    x = x.reshape(-1, channels)
++    n_perm = 0 if perm is None else perm.shape[0]
++    for i in range(n_perm):
++        x = (x.reshape(-1, bs) @ R[i]).reshape(-1, channels)
++        x = x.index_select(-1, perm[i])
++    x = (x.reshape(-1, bs) @ R[-1]).reshape(-1, channels)
++    return x.reshape(shape)
++
++
++class DuQuantLinear(nn.Linear):
++    """nn.Linear holding Q(W.Lambda.G) whose input is transformed and fake-quantized online."""
++
++    def du_setup(self, *, a_bits: int, lac: float | None, block_size: int):
++        if self.in_features % block_size:
++            raise ValueError(f"in_features {self.in_features} not divisible by block_size {block_size}")
++        self.du_a_bits = int(a_bits)
++        self.du_lac = lac
++        self.du_block = int(block_size)
++        # Non-persistent: the saved checkpoint stays a plain Qwen3 state dict; transforms live in RUNTIME_FILE.
++        self.register_buffer("du_R", None, persistent=False)
++        self.register_buffer("du_smooth", None, persistent=False)
++        # Kept off the buffer list so dtype casts never touch it and it is not counted as int weight storage.
++        self.du_perm = None
++        self._du_perm_dev = None
++        self.du_calibrator = None
++
++    def du_set_transform(self, R, perm, smooth=None):
++        device = self.weight.device
++        self.du_R = R.detach().float().to(device)
++        self.du_perm = None if perm is None else perm.detach().long().cpu()
++        self._du_perm_dev = None
++        self.du_smooth = None if smooth is None else smooth.detach().float().reshape(-1).to(device)
++
++    def _perm_on(self, device):
++        if self.du_perm is None:
++            return None
++        cached = self._du_perm_dev
++        if cached is None or cached.device != device:
++            cached = self.du_perm.to(device)
++            self._du_perm_dev = cached
++        return cached
++
++    def du_quant_input(self, x: torch.Tensor) -> torch.Tensor:
++        xf = x.float()
++        if self.du_smooth is not None:
++            xf = xf / self.du_smooth.to(xf.device)  # GQA o_proj online division (quantizer.py:344-345)
++        if self.du_R is None:
++            if self.du_calibrator is None:
++                raise RuntimeError("DuQuantLinear has no transform; reload through the DuQuant adapter")
++            self.du_calibrator(self, xf)
++        xf = block_transform(xf, self.du_R.to(xf.device, torch.float32), self._perm_on(xf.device))
++        return fake_quant_per_token(xf, self.du_a_bits, self.du_lac).to(x.dtype)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return F.linear(self.du_quant_input(x), self.weight, self.bias)
++
++
++def _causal_mask(attention_mask, bsz, q_len, kv_len, cache_position, dtype, device):
++    """Additive (bsz,1,q,kv) mask. Uses the model's 4-D mask when given; else causal with cache offset (D6)."""
++    if attention_mask is not None and attention_mask.dim() == 4:
++        return attention_mask[:, :, :, :kv_len].to(device=device, dtype=dtype)
++    if cache_position is not None and cache_position.numel() == q_len:
++        q_pos = cache_position.to(device)
++    else:
++        q_pos = torch.arange(kv_len - q_len, kv_len, device=device)
++    k_pos = torch.arange(kv_len, device=device)
++    min_value = torch.finfo(dtype).min
++    mask = torch.zeros(q_len, kv_len, dtype=dtype, device=device)
++    mask = mask.masked_fill(k_pos[None, :] > q_pos[:, None], min_value)
++    mask = mask[None, None].expand(bsz, 1, q_len, kv_len)
++    if attention_mask is not None and attention_mask.dim() == 2:
++        pad = attention_mask[:, -kv_len:].to(device) == 0
++        mask = mask.masked_fill(pad[:, None, None, :], min_value)
++    return mask
++
++
++def _qk_quant(self, x: torch.Tensor) -> torch.Tensor:
++    """Hadamard over head_dim blocks then per-(token, head) asym quant (QuantMatMul quant_x1/x2, rotate=None)."""
++    shape = x.shape
++    H = self.du_H.to(x.device, torch.float32)
++    xf = (x.float().reshape(-1, H.shape[0]) @ H).reshape(shape)
++    return fake_quant_per_token(xf, self.du_qk_bits, self.du_qk_lac).to(x.dtype)
++
++
++def du_attention_forward(self, hidden_states, position_embeddings=None, attention_mask=None,
++                         past_key_value=None, cache_position=None, **kwargs):
++    hf = sys.modules[type(self).__mro__[1].__module__]  # the stock attention's modeling module
++    bsz, q_len, _ = hidden_states.shape
++    hidden_shape = (bsz, q_len, -1, self.head_dim)
++
++    # q/k/v share one transform computed on q_proj's input (int_llama_layer.py:119-124).
++    xq = self.q_proj.du_quant_input(hidden_states)
++    query = F.linear(xq, self.q_proj.weight, self.q_proj.bias).view(hidden_shape)
++    key = F.linear(xq, self.k_proj.weight, self.k_proj.bias).view(hidden_shape)
++    value = F.linear(xq, self.v_proj.weight, self.v_proj.bias).view(hidden_shape).transpose(1, 2)
++    if getattr(self, "q_norm", None) is not None:
++        query = self.q_norm(query)
++    if getattr(self, "k_norm", None) is not None:
++        key = self.k_norm(key)
++    query = query.transpose(1, 2)
++    key = key.transpose(1, 2)
++
++    cos, sin = position_embeddings
++    query, key = hf.apply_rotary_pos_emb(query, key, cos, sin)
++    query = _qk_quant(self, query)
++    key = _qk_quant(self, key)  # K enters the cache already rotated + quantized
++
++    if past_key_value is not None:
++        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
++        key, value = past_key_value.update(key, value, self.layer_idx, cache_kwargs)
++    value = fake_quant_per_token(value, self.du_v_bits, None).to(value.dtype)  # V quantized after concat
++
++    key = hf.repeat_kv(key, self.num_key_value_groups)
++    value = hf.repeat_kv(value, self.num_key_value_groups)
++    attn = torch.matmul(query, key.transpose(2, 3)) * self.scaling
++    kv_len = key.shape[-2]
++    attn = attn + _causal_mask(attention_mask, bsz, q_len, kv_len, cache_position, attn.dtype, attn.device)
++    attn = torch.max(attn, torch.tensor(torch.finfo(attn.dtype).min, dtype=attn.dtype, device=attn.device))
++    attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(query.dtype)  # P stays 16-bit
++    out = torch.matmul(attn, value).transpose(1, 2).reshape(bsz, q_len, -1).contiguous()
++    out = self.o_proj(out)
++    return out, (attn if kwargs.get("output_attentions") else None)
++
++
++def du_mlp_forward(self, x):
++    # gate/up share one transform computed on gate_proj's input (int_llama_layer.py:44-46).
++    xq = self.gate_proj.du_quant_input(x)
++    gate = F.linear(xq, self.gate_proj.weight, self.gate_proj.bias)
++    up = F.linear(xq, self.up_proj.weight, self.up_proj.bias)
++    return self.down_proj(self.act_fn(gate) * up)
++
++
++_CLASS_CACHE: dict = {}
++
++
++def _swap_class(module: nn.Module, forward, tag: str):
++    base = type(module)
++    if getattr(base, "_duquant_swapped", False):
++        return
++    key = (base, tag)
++    if key not in _CLASS_CACHE:
++        _CLASS_CACHE[key] = type(f"DuQuant{base.__name__}", (base,), {"forward": forward, "_duquant_swapped": True})
++    module.__class__ = _CLASS_CACHE[key]
++
++
++def decoder_layers(model):
++    inner = getattr(model, "model", None)
++    layers = getattr(inner, "layers", None)
++    if layers is None:
++        raise ValueError("expected a decoder-only model with model.model.layers")
++    return layers, "model.layers"
++
++
++def install_layer(layer: nn.Module, qcfg: dict):
++    """Swap one stock decoder layer's attention/MLP/linears to the DuQuant runtime classes (no weights touched)."""
++    attn, mlp = layer.self_attn, layer.mlp
++    bs = int(qcfg["block_size"])
++    if attn.head_dim % bs:
++        raise ValueError(f"block_size {bs} must divide head_dim {attn.head_dim} for the Q/K Hadamard")
++    if getattr(attn, "sliding_window", None):
++        raise NotImplementedError("sliding-window attention is not supported by the DuQuant runtime")
++    for name in LAYER_LINEARS:
++        lin = layer.get_submodule(name)
++        if type(lin) is nn.Linear:
++            lin.__class__ = DuQuantLinear
++        if not isinstance(lin, DuQuantLinear):
++            raise TypeError(f"{name} is {type(lin).__name__}, expected nn.Linear")
++        lin.du_setup(a_bits=qcfg["a_bits"], lac=qcfg.get("lac"), block_size=bs)
++    _swap_class(attn, du_attention_forward, "attn")
++    _swap_class(mlp, du_mlp_forward, "mlp")
++    attn.du_qk_bits = int(qcfg.get("qk_bits", qcfg["a_bits"]))
++    attn.du_qk_lac = qcfg.get("qk_lac", qcfg.get("lac"))
++    attn.du_v_bits = int(qcfg.get("v_bits", qcfg["a_bits"]))
++    attn.register_buffer("du_H", get_hadamard(bs).to(attn.q_proj.weight.device), persistent=False)
++
++
++def runtime_state(model) -> dict:
++    """Per-linear transform tensors for RUNTIME_FILE."""
++    layers, prefix = decoder_layers(model)
++    out = {}
++    for i, layer in enumerate(layers):
++        for name in LAYER_LINEARS:
++            lin = layer.get_submodule(name)
++            key = f"{prefix}.{i}.{name}"
++            out[f"{key}.du_R"] = lin.du_R.detach().float().cpu().contiguous()
++            if lin.du_perm is not None:
++                out[f"{key}.du_perm"] = lin.du_perm.detach().long().cpu().contiguous()
++            if lin.du_smooth is not None:
++                out[f"{key}.du_smooth"] = lin.du_smooth.detach().float().cpu().contiguous()
++    return out
++
++
++def install_runtime(model, qcfg: dict, tensors: dict):
++    layers, prefix = decoder_layers(model)
++    if len(layers) != int(qcfg["num_layers"]):
++        raise ValueError(f"artifact has {qcfg['num_layers']} DuQuant layers, model has {len(layers)}")
++    for i, layer in enumerate(layers):
++        install_layer(layer, qcfg)
++        for name in LAYER_LINEARS:
++            key = f"{prefix}.{i}.{name}"
++            lin = layer.get_submodule(name)
++            lin.du_set_transform(tensors[f"{key}.du_R"], tensors.get(f"{key}.du_perm"), tensors.get(f"{key}.du_smooth"))
++        # Shared transforms must really be shared, since the fused forwards apply q's / gate's only.
++        for lead, followers in (("self_attn.q_proj", ("self_attn.k_proj", "self_attn.v_proj")),
++                                ("mlp.gate_proj", ("mlp.up_proj",))):
++            ref = layer.get_submodule(lead)
++            for name in followers:
++                other = layer.get_submodule(name)
++                same = torch.equal(ref.du_R.cpu(), other.du_R.cpu()) and (
++                    (ref.du_perm is None and other.du_perm is None) or torch.equal(ref.du_perm, other.du_perm))
++                if not same or other.du_smooth is not None:
++                    raise ValueError(f"layer {i}: {name} transform differs from {lead}")
++    model.config.use_cache = True
++    return model
++
++
++def load_quantized(model_path, device="cuda", dtype=torch.float16):
++    """Rebuild a DuQuant fake-quant model from a saved OUTPUT_DIR (never from the Hub id)."""
++    from safetensors.torch import load_file
++    from transformers import AutoModelForCausalLM, AutoTokenizer
++
++    with open(os.path.join(model_path, QCONFIG_FILE)) as handle:
++        qcfg = json.load(handle)
++    if qcfg.get("quant_method") != "duquant":
++        raise ValueError(f"{model_path} is not a DuQuant artifact")
++    tokenizer = AutoTokenizer.from_pretrained(model_path)
++    kwargs = {"torch_dtype": dtype, "attn_implementation": "eager", "low_cpu_mem_usage": True}
++    on_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
++    if on_cuda:
++        kwargs["device_map"] = {"": device}
++    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
++    if not on_cuda:
++        model.to("cpu")
++    tensors = load_file(os.path.join(model_path, qcfg.get("runtime_file", RUNTIME_FILE)))
++    install_runtime(model, qcfg, tensors)
++    model.eval()
++    return model, tokenizer
+diff --git a/duquant_port/triton_w8a8.py b/duquant_port/triton_w8a8.py
+new file mode 100644
+index 0000000..f99dd7e
+--- /dev/null
++++ b/duquant_port/triton_w8a8.py
+@@ -0,0 +1,256 @@
++"""W8A8 int8 linear for any artifact saved in the `w8a8_int8` format.
++
++The format: every quantized linear stores an int8 ``weight`` [out, in] (K-major)
++and a float per-output-channel ``weight_scale`` [out, 1]; activations are
++quantized at runtime, symmetric int8 per token. It is method-agnostic
++(SmoothQuant writes it; so can any method that folds its transform into the
++weights offline), and it is the layout `export_vllm.py` maps to
++compressed-tensors `int-quantized`.
++
++Kernels:
++
++1. ``_act_quant_kernel`` / ``_act_quant_looped_kernel``: per-token absmax,
++   fp32 scale and int8 codes in one pass (the looped variant for K > 4096).
++   Codes and scales are bit-identical to rounding in the activation dtype the
++   way torch does (clamp 1e-5, /127, round half to even).
++2. ``_w8a8_gemm_kernel``: int8 x int8 -> int32 tensor-core GEMM with a fused
++   epilogue, acc * act_scale[m] * weight_scale[n] (+ bias[n]) -> fp16/bf16.
++   Any M, so decode and prefill share one kernel.
++
++``w8a8_linear_reference`` is the dense fp16 path for CPU or for checking.
++Needs torch and triton (bundled with CUDA torch); int8 ``tl.dot`` needs sm_80+.
++Copy this file into an inference adapter, or import it by path; it has no other
++dependencies.
++"""
++import time
++
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++
++
++
++@triton.jit
++def _act_quant_kernel(
++    x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm,
++    BLOCK_K: tl.constexpr,
++):
++    """Per-token absmax int8 quantization of one row of x (fp16/bf16)."""
++    row = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < K
++    x_raw = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0)
++    act_ty = x_raw.dtype
++    x = x_raw.to(tl.float32)
++    amax = tl.max(tl.abs(x), axis=0)
++    # Mirror torch on the activation dtype: clamp, cast, divide, cast.
++    amax = tl.maximum(amax, 1e-5).to(act_ty).to(tl.float32)
++    scale = tl.math.div_rn(amax, 127.0).to(act_ty).to(tl.float32)
++    v = tl.math.div_rn(x, scale).to(act_ty).to(tl.float32)
++    # Round half to even, like torch.round; |v| <= ~127.5 so v + 0.5 is exact.
++    r = tl.floor(v + 0.5)
++    tie = (r - v) == 0.5
++    odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++    r = tl.where(tie & odd, r - 1.0, r)
++    r = tl.minimum(tl.maximum(r, -127.0), 127.0)
++    tl.store(q_ptr + row * stride_qm + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _act_quant_looped_kernel(
++    x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm,
++    BLOCK_K: tl.constexpr,
++):
++    """Same math as _act_quant_kernel for long rows: absmax pass, then quantize pass."""
++    row = tl.program_id(0).to(tl.int64)
++    x_row = x_ptr + row * stride_xm
++    q_row = q_ptr + row * stride_qm
++    offs = tl.arange(0, BLOCK_K)
++    run_max = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        run_max = tl.maximum(run_max, tl.abs(x))
++    act_ty = x_ptr.dtype.element_ty
++    amax = tl.max(run_max, axis=0)
++    amax = tl.maximum(amax, 1e-5).to(act_ty).to(tl.float32)
++    scale = tl.math.div_rn(amax, 127.0).to(act_ty).to(tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        v = tl.math.div_rn(x, scale).to(act_ty).to(tl.float32)
++        r = tl.floor(v + 0.5)
++        tie = (r - v) == 0.5
++        odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++        r = tl.where(tie & odd, r - 1.0, r)
++        r = tl.minimum(tl.maximum(r, -127.0), 127.0)
++        tl.store(q_row + k0 + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _w8a8_gemm_kernel(
++    a_ptr, b_ptr, c_ptr, as_ptr, bs_ptr, bias_ptr,
++    M, N, K,
++    stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
++    HAS_BIAS: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GROUP_M: tl.constexpr,
++):
++    """C[M, N] = (A_int8[M, K] @ B_int8[N, K]^T) * a_scale[M] * b_scale[N] + bias[N]."""
++    pid = tl.program_id(0)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    num_pid_in_group = GROUP_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    # Wrap out-of-range rows/cols onto valid memory; the store is masked.
++    offs_am = offs_m % M
++    offs_bn = offs_n % N
++    offs_k = tl.arange(0, BLOCK_K)
++    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
++    b_ptrs = b_ptr + offs_bn[None, :].to(tl.int64) * stride_bn + offs_k[:, None] * stride_bk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
++    for k in range(0, tl.cdiv(K, BLOCK_K)):
++        if EVEN_K:
++            a = tl.load(a_ptrs)
++            b = tl.load(b_ptrs)
++        else:
++            k_left = K - k * BLOCK_K
++            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_left, other=0)
++            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_left, other=0)
++        acc = tl.dot(a, b, acc, out_dtype=tl.int32)
++        a_ptrs += BLOCK_K * stride_ak
++        b_ptrs += BLOCK_K * stride_bk
++
++    a_scale = tl.load(as_ptr + offs_am).to(tl.float32)
++    b_scale = tl.load(bs_ptr + offs_bn).to(tl.float32)
++    out = acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]
++    if HAS_BIAS:
++        bias = tl.load(bias_ptr + offs_bn).to(tl.float32)
++        out = out + bias[None, :]
++    c_ptrs = c_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
++    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask)
++
++
++def quantize_activation_int8(x):
++    """x [M, K] fp16/bf16 contiguous -> (int8 codes [M, K], fp32 per-token scale [M])."""
++    m, k = x.shape
++    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
++    scale = torch.empty((m,), dtype=torch.float32, device=x.device)
++    if m == 0:
++        return q, scale
++    block_k = triton.next_power_of_2(int(k))
++    args = (x, q, scale, int(k), int(x.stride(0)), int(q.stride(0)))
++    if block_k <= 4096:
++        # Whole row in registers: one read of x.
++        _act_quant_kernel[(int(m),)](*args, BLOCK_K=block_k, num_warps=8)
++    else:
++        # Long rows: absmax pass + quantize pass over 4096-wide chunks; the
++        # second read hits L2. Measured at copy bandwidth on sm_86.
++        _act_quant_looped_kernel[(int(m),)](*args, BLOCK_K=4096, num_warps=8)
++    return q, scale
++
++
++def _gemm_config(m, n, k):
++    """Default (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages).
++
++    Tuned on sm_86 (RTX 3090, see kernel.json `tuned_on`). On another compute
++    capability, run `tune_config` on the model's shapes and pass the result as
++    `config` to `w8a8_matmul`.
++    """
++    if m <= 16:
++        return 16, 64, 256, 1, 4, 3
++    if m <= 64:
++        return 64, 64, 128, 8, 4, 4
++    return 128, 128, 64, 8, 4, 4
++
++
++def w8a8_matmul(q, a_scale, weight, weight_scale, bias, out_dtype, config=None):
++    """int8 q [M, K] x int8 weight [N, K] -> out_dtype [M, N] with the dequant epilogue."""
++    m, k = q.shape
++    n = weight.shape[0]
++    out = torch.empty((m, n), dtype=out_dtype, device=q.device)
++    if m == 0:
++        return out
++    block_m, block_n, block_k, group_m, warps, stages = config or _gemm_config(m, n, k)
++    grid = (triton.cdiv(int(m), block_m) * triton.cdiv(int(n), block_n),)
++    _w8a8_gemm_kernel[grid](
++        q, weight, out, a_scale, weight_scale, bias if bias is not None else a_scale,
++        int(m), int(n), int(k),
++        int(q.stride(0)), int(q.stride(1)),
++        int(weight.stride(0)), int(weight.stride(1)),
++        int(out.stride(0)), int(out.stride(1)),
++        HAS_BIAS=bias is not None,
++        EVEN_K=(int(k) % block_k == 0),
++        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=group_m,
++        num_warps=warps, num_stages=stages,
++    )
++    return out
++
++
++def w8a8_linear(x2d, weight, weight_scale, bias):
++    """Real int8 W8A8 linear: Triton per-token quant, then int8 GEMM + epilogue."""
++    q, a_scale = quantize_activation_int8(x2d)
++    return w8a8_matmul(q, a_scale, weight, weight_scale, bias, x2d.dtype)
++
++
++def w8a8_linear_reference(x, weight, weight_scale, bias):
++    """fp16 dequant reference: same quantization, dense fp16 matmul. CPU-safe."""
++    x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / 127
++    x_q = torch.round(x / x_scale).clamp_(-127, 127).mul_(x_scale)
++    w = weight.to(x.dtype).mul_(weight_scale.reshape(-1, 1).to(x.dtype))
++    b = None if bias is None else bias.to(x.dtype)
++    return F.linear(x_q, w, b)
++
++
++CONFIG_CANDIDATES = (
++    (128, 128, 64, 8, 4, 4),
++    (128, 128, 64, 8, 8, 3),
++    (128, 256, 64, 8, 8, 3),
++    (64, 128, 128, 8, 4, 4),
++    (64, 64, 128, 8, 4, 4),
++    (16, 64, 256, 1, 4, 3),
++)
++
++
++def tune_config(m, n, k, *, device="cuda", candidates=CONFIG_CANDIDATES, iters=20):
++    """Time each candidate tile config on random int8 inputs of this shape; return the fastest.
++
++    Use once per (M, N, K) on a GPU whose compute capability is not in kernel.json
++    `tuned_on`, then pass the result as `config` to `w8a8_matmul`.
++    """
++    q = torch.randint(-127, 128, (m, k), dtype=torch.int8, device=device)
++    w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device=device)
++    a_scale = torch.rand(m, dtype=torch.float32, device=device)
++    w_scale = torch.rand(n, 1, dtype=torch.float16, device=device)
++    best, best_t = None, float("inf")
++    for config in candidates:
++        try:
++            w8a8_matmul(q, a_scale, w, w_scale, None, torch.float16, config)
++        except Exception:  # a tile the GPU cannot fit (shared memory, registers)
++            continue
++        torch.cuda.synchronize(device)
++        start = time.perf_counter()
++        for _ in range(iters):
++            w8a8_matmul(q, a_scale, w, w_scale, None, torch.float16, config)
++        torch.cuda.synchronize(device)
++        elapsed = (time.perf_counter() - start) / iters
++        if elapsed < best_t:
++            best, best_t = config, elapsed
++    if best is None:
++        raise RuntimeError(f"no candidate config ran for M={m} N={n} K={k}")
++    return best
+diff --git a/quant_agent_inference_adapter.py b/quant_agent_inference_adapter.py
+new file mode 100644
+index 0000000..a623b8f
+--- /dev/null
++++ b/quant_agent_inference_adapter.py
+@@ -0,0 +1,41 @@
++"""Reload a DuQuant (W4A4, 4-bit Q/K/V) artifact saved by duquant_port: integer or fake-quant format.
++
++Loads the SAVED directory only (never the Hub id); quantization_config.json `format` picks the path:
++
++* ``duquant_w4a4_int8_storage`` (kernel overlay): decoder projections hold int8 centred W4 codes + fp32
++  per-channel scales, built on the meta device and filled straight on the GPU (no fp16 projection copy).
++  Online / Lambda -> R1 -> P -> R2 (fp32, the runtime's ops) -> Triton per-token asym A4 codes -> Triton
++  int8 GEMM with an exact zero-point epilogue; q/k/v and gate/up each share one transform and one GEMM.
++  q_norm/k_norm -> RoPE -> 128-Hadamard + per-(token, head) A4 on Q/K (K before the cache), V A4 after the
++  cache concat, scaled_dot_product_attention (flash when unmasked). CUDA only.
++* ``duquant_fakequant`` (role_driver overlay): unchanged fp16 fake-quant runtime (duquant_port.runtime).
++
++Works for forward and generate (DynamicCache).
++"""
++import json
++import os
++import sys
++
++import torch
++
++QUANT_AGENT_ADAPTER_API = 1
++
++
++def load_model_and_tokenizer(model_path, model_id, dtype, device, trust_remote_code):
++    # The adapter sits at the method repo root next to the duquant_port package. Put it first so a caller's
++    # own quantize.py (the wrapper script) cannot shadow the repo's quantize package.
++    here = os.path.dirname(os.path.abspath(__file__))
++    sys.path[:] = [here] + [p for p in sys.path if os.path.abspath(p or ".") != here]
++
++    del model_id, trust_remote_code  # the artifact is self-describing; never touch the Hub id
++    del dtype  # the method is fp16 end to end (the repo forces fp16); a bf16 request still runs fp16
++    target = "cuda" if str(device).startswith("cuda") and torch.cuda.is_available() else "cpu"
++    with open(os.path.join(model_path, "quantization_config.json")) as handle:
++        fmt = json.load(handle).get("format")
++    if fmt == "duquant_w4a4_int8_storage":
++        from duquant_port.int8_runtime import load_int8_model
++
++        return load_int8_model(model_path, device=target, dtype=torch.float16)
++    from duquant_port.runtime import load_quantized
++
++    return load_quantized(model_path, device=target, dtype=torch.float16)
