@@ -1,0 +1,20 @@
+diff --git a/quantport_autoround/README.md b/quantport_autoround/README.md
+new file mode 100644
+--- /dev/null
++++ b/quantport_autoround/README.md
+@@ -0,0 +1,15 @@
++# QuantPort: AutoRound on Qwen/Qwen3-8B (plan repo_api_qwen3)
++
++This overlay changes no auto-round code. The port calls the repo's public API
++as-is from the wrapper `out/overlays/autoround-qwen3-8b-vastrtx3090/repo_api_qwen3/quantize.py`:
++
++- `AutoRound(model, scheme="W4A16", iters=200, nsamples=128, seqlen=2048,
++  batch_size=8, seed=42, device_map=0, low_gpu_mem_usage=False)`
++  (int4, group 128, full-range sym; lm_head and embeddings stay unquantized).
++- `quantize_and_save(..., format="auto_round")`; the wrapper moves the
++  `<model>-w4g128` subfolder's files up so `OUTPUT_DIR` holds `config.json`,
++  `quantization_config.json` and the safetensors directly.
++- Reload: `AutoModelForCausalLM.from_pretrained(OUTPUT_DIR,
++  quantization_config=AutoRoundConfig(backend="auto_round:tritonv2_zp"))`.
++
++The file exists only because an overlay bundle needs a non-empty patch.

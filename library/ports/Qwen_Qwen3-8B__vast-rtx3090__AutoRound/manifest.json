@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "method_id": "autoround-qwen3-8b-vastrtx3090",
+  "model_id": "Qwen/Qwen3-8B",
+  "base_commit": "34d16e916f6d459f685033b889fd078117edf22d",
+  "patch_sha256": "53e693d301a07ec31a414e86efae93353183f54bb2c73b77f52f262662a41017",
+  "rationale": "No repo code change: the wrapper drives auto-round 0.17.0 through its public API (AutoRound scheme W4A16 = int4 g128 full-range sym, iters 200, nsamples 128, seqlen 2048, batch 8, seed 42, device_map 0, low_gpu_mem_usage False, bf16 model as the repo loads it). D1: quantize_and_save(format=auto_round) packs GPTQ-style (qweight int32, fp16 scales, quant_method auto-round, packing_format auto_round:auto_gptq); the wrapper asserts bits/group_size/sym in config.json. D2: the <model>-w4g128 subfolder that quantize_and_save creates is moved up so OUTPUT_DIR holds config.json, quantization_config.json and the safetensors. D3: in-wrapper reload pins AutoRoundConfig(backend=auto_round:tritonv2_zp) and logs the QuantLinear class that ran. D7: sym=True kept (Marlin uint4b8). D8: NeelNanda/pile-10k (repo default, seed 42) when a timed Hub probe succeeds, else the first nsamples Pile-validation texts with >= seqlen tokens read line by line from the local val.jsonl; the choice is logged. D9: low_gpu_mem_usage False (fits 24 GB). The patch only adds quantport_autoround/README.md because a bundle needs a non-empty patch.",
+  "evidence_files": [
+    "out/analysis/autoround-qwen3-8b-vastrtx3090/method.md",
+    "out/analysis/autoround-qwen3-8b-vastrtx3090/differences.json"
+  ],
+  "target_modules": [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj"
+  ],
+  "inference_adapter_path": null,
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D7",
+    "D8",
+    "D9"
+  ]
+}

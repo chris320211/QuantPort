@@ -1,0 +1,69 @@
+{
+  "schema_version": 2,
+  "model_id": "Qwen/Qwen3-8B",
+  "method_name": "AutoRound",
+  "gpu_instance": "vast-rtx3090",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "quality_ok": true,
+  "ppl": 10.060140554226164,
+  "ppl_ratio": 1.0416849412622964,
+  "tokens_per_s": 3352.2192133331705,
+  "peak_vram_gb": 8.8913254737854,
+  "fp16_ppl": 9.657565503476947,
+  "fp16_tokens_per_s": 3450.936913306737,
+  "fp16_peak_vram_gb": 18.46218729019165,
+  "packed": false,
+  "hub_url": "https://huggingface.co/chris320211/autoround-qwen3-8b-vastrtx3090",
+  "hub_repo_id": "chris320211/autoround-qwen3-8b-vastrtx3090",
+  "arxiv_id": "2309.05516",
+  "paper_url": "https://arxiv.org/abs/2309.05516",
+  "repo_url": "https://github.com/intel/auto-round",
+  "repo_commit": "34d16e916f6d459f685033b889fd078117edf22d",
+  "dataset": "wikitext-2-raw-v1",
+  "max_seq_len": 2048,
+  "job_id": "20261107T062044Z-8b5fee",
+  "slug": "autoround-qwen3-8b-vastrtx3090",
+  "artifact_dir": "quantized/autoround-qwen3-8b-vastrtx3090",
+  "verification_status": "passed",
+  "port": "library/ports/Qwen_Qwen3-8B__vast-rtx3090__AutoRound",
+  "vllm": {
+    "status": "passed",
+    "profile": "weight_only_gptq",
+    "vllm_version": "0.30.0",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "dtype": "float16",
+    "ppl_ratio": 1.0417047173483702,
+    "hf_ppl_ratio": 1.0416849412622964,
+    "ppl_ratio_drift": 1.0000189847095704,
+    "prefill_speedup": 0.9735847051358127,
+    "decode_speedup": {
+      "1": 2.6377987239714047,
+      "16": 2.193835254912925
+    },
+    "runtimes": [
+      {
+        "runtime": "vLLM",
+        "precision": "int8",
+        "ppl": 10.06009802161192,
+        "prefill_tokens_per_s": 4748.844163402725,
+        "decode_tokens_per_s": {
+          "1": 131.1318820016527,
+          "16": 1453.091588444561
+        }
+      },
+      {
+        "runtime": "vLLM",
+        "precision": "fp16",
+        "ppl": 9.657341331063195,
+        "prefill_tokens_per_s": 4877.689777121419,
+        "decode_tokens_per_s": {
+          "1": 49.71261863536873,
+          "16": 662.3521913008163
+        }
+      }
+    ],
+    "checked_at": "2026-11-07",
+    "hub_repo_id": "chris320211/autoround-qwen3-8b-vastrtx3090-vllm",
+    "hub_url": "https://huggingface.co/chris320211/autoround-qwen3-8b-vastrtx3090-vllm"
+  }
+}

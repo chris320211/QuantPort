@@ -5,7 +5,7 @@
   "gpu_name": "NVIDIA GeForce RTX 3090",
   "fp16_baseline": {
     "perplexity": 9.657565503476947,
-    "tokens_per_s": 3496.095035233528,
+    "tokens_per_s": 3450.936913306737,
     "peak_vram_gb": 18.46218729019165
   },
   "methods": [
@@ -50,6 +50,27 @@
       "repo_commit": "d56cfc6fe97c34c0eb100fec82fe439865905679",
       "verification_status": "passed",
       "rank": 2
+    },
+    {
+      "method_name": "AutoRound",
+      "slug": "autoround-qwen3-8b-vastrtx3090",
+      "job_id": "20261107T062044Z-8b5fee",
+      "quality_ok": true,
+      "ppl": 10.060140554226164,
+      "ppl_ratio": 1.0416849412622964,
+      "tokens_per_s": 3352.2192133331705,
+      "peak_vram_gb": 8.8913254737854,
+      "improved_throughput": false,
+      "improved_vram": true,
+      "packed": false,
+      "artifact_dir": "quantized/autoround-qwen3-8b-vastrtx3090",
+      "hub_url": "https://huggingface.co/chris320211/autoround-qwen3-8b-vastrtx3090",
+      "arxiv_id": "2309.05516",
+      "paper_url": "https://arxiv.org/abs/2309.05516",
+      "repo_url": "https://github.com/intel/auto-round",
+      "repo_commit": "34d16e916f6d459f685033b889fd078117edf22d",
+      "verification_status": "passed",
+      "rank": 3
     }
   ],
   "best": {

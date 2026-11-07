@@ -59,8 +59,18 @@ GPU: NVIDIA GeForce RTX 3090
 | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
 | Qwen/Qwen3-8B | vast-rtx3090 | PrefixQuant | [paper](https://arxiv.org/abs/2410.05265) | [repo](https://github.com/ChenMnZ/PrefixQuant) | [port](ports/Qwen_Qwen3-8B__vast-rtx3090__PrefixQuant) | [hub](https://huggingface.co/chris320211/prefixquant-qwen3-8b-vastrtx3090) |  | 1.1516 | 6588.5 | 11.998 |
 | Qwen/Qwen3-8B | vast-rtx3090 | DuQuant | [paper](https://arxiv.org/abs/2406.01721) | [repo](https://github.com/Hsu1023/DuQuant) | [port](ports/Qwen_Qwen3-8B__vast-rtx3090__DuQuant) | [hub](https://huggingface.co/chris320211/duquant-qwen3-8b-vastrtx3090) |  | 1.1286 | 5046.9 | 12.049 |
+| Qwen/Qwen3-8B | vast-rtx3090 | AutoRound | [paper](https://arxiv.org/abs/2309.05516) | [repo](https://github.com/intel/auto-round) | [port](ports/Qwen_Qwen3-8B__vast-rtx3090__AutoRound) | [hub](https://huggingface.co/chris320211/autoround-qwen3-8b-vastrtx3090) | [vLLM](https://huggingface.co/chris320211/autoround-qwen3-8b-vastrtx3090-vllm) | 1.0417 | 3352.2 | 8.891 |
 
 **Best:** PrefixQuant (`prefixquant-qwen3-8b-vastrtx3090`).
+
+**vLLM** (GPU: NVIDIA GeForce RTX 3090)
+
+| Method | Runtime | Precision | PPL | PPL ratio | Prefill tok/s | Decode tok/s, batch 1 | Decode tok/s, batch 16 | VRAM GB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AutoRound | vLLM | [int8](https://huggingface.co/chris320211/autoround-qwen3-8b-vastrtx3090-vllm) | 10.0601 | 1.0417 | 4748.8 | 131.1 | 1453.1 | – |
+| AutoRound | vLLM | fp16 | 9.6573 | 1.0000 | 4877.7 | 49.7 | 662.4 | – |
+
+PPL ratio is against the same runtime's 16-bit model. vLLM reserves its KV cache up front, so its VRAM is not shown. AutoRound: export drift 1.0000 vs this board (≤ 1.02); vLLM 0.30.0, 2026-11-07.
 
 ## google/gemma-2-2b-it on g5.2xlarge
 GPU: NVIDIA A10G

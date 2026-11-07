@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "contribution",
+  "model_id": "Qwen/Qwen3-8B",
+  "model_type": "qwen3",
+  "method_name": "AutoRound",
+  "gpu_instance": "vast-rtx3090",
+  "slug": "autoround-qwen3-8b-vastrtx3090",
+  "job_id": "20261107T062044Z-8b5fee",
+  "repo_url": "https://github.com/intel/auto-round",
+  "repo_commit": "34d16e916f6d459f685033b889fd078117edf22d",
+  "patch_sha256": "53e693d301a07ec31a414e86efae93353183f54bb2c73b77f52f262662a41017",
+  "files": [
+    "differences.json",
+    "manifest.json",
+    "method.md",
+    "overlay.patch",
+    "quantize.py"
+  ]
+}
