@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "method_id": "prefixquant-qwen3-8b-vastrtx3090",
+  "model_id": "Qwen/Qwen3-8B",
+  "base_commit": "60b74237cf2cf20e3354569d998ab708ff598ce3",
+  "patch_sha256": "25bf41420cf826a064e0e0cfca9e2a75d7ff85d3445635acc06fbbc5e82db78d",
+  "rationale": "diagnose_fix of job 20261106T201841Z-53a7a2 on top of repo_pipeline_qwen3/0cf48efadbe1ae86 (all of its D1-D9 changes kept). D16: Qwen3-8B layer 16 down_proj input has content-triggered token outliers (token \"2\") that the prefix cannot absorb, so the O2 per-tensor static A4 scale collapsed (block 16 MSE-init loss 9.5, block loss ~30). The wrapper switches to PrefixQuant-O1 (paper Table 1; README: add --activation_clipping for dynamic): --input_mode dynamic --kv_mode dynamic --kv_group_size 128 --activation_clipping, keeping prefix tokens, rotations, mse_init and block-AP (epochs default 20, PREFIXQUANT_EPOCHS override, 0 = mse_init only). Repo fixes needed for O1: block_mse_init_dynamic kept the bound_factor shape ([1]; the original assigned a 0-dim linspace element, which save_pretrained wrote as a scalar that a fresh quantizer cannot load); dynamic_fake_quant restores the input shape after group-wise quantization (the original check never fired). prefix_runtime/adapter rebuild the saved mode from prefixequant_config.json (dynamic per-token A4 and group-wise KV4, learned clipping factors loaded and checked; K quantizer is unclipped as in the repo), reshape legacy 0-dim factors, report mode/clipping in quant_agent_runtime, and keep the fresh prefix-KV injection for forward and generate.",
+  "evidence_files": [
+    "out/analysis/prefixquant-qwen3-8b-vastrtx3090/method.md",
+    "out/analysis/prefixquant-qwen3-8b-vastrtx3090/differences.json",
+    "jobs/20261106T201841Z-53a7a2/diagnose.json"
+  ],
+  "target_modules": [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6",
+    "D7",
+    "D8",
+    "D9",
+    "D16"
+  ]
+}

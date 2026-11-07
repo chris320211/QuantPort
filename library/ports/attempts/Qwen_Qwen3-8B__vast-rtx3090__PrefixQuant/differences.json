@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "slug": "prefixquant-qwen3-8b-vastrtx3090",
+  "method_name": "PrefixQuant",
+  "model_id": "Qwen/Qwen3-8B",
+  "model_type": "qwen3",
+  "mapping": [
+    {
+      "role": "residual stream",
+      "steps": [
+        "R1 rotate writers and readers"
+      ],
+      "modules": [
+        "model.embed_tokens",
+        "self_attn.o_proj",
+        "mlp.down_proj",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "lm_head"
+      ],
+      "status": "mapped",
+      "note": "hidden 4096, power of two"
+    },
+    {
+      "role": "token embeddings",
+      "steps": [
+        "mean-centre",
+        "R1 output side"
+      ],
+      "modules": [
+        "model.embed_tokens"
+      ],
+      "status": "mapped",
+      "note": "untied from lm_head"
+    },
+    {
+      "role": "LM head",
+      "steps": [
+        "fuse final norm",
+        "R1 input side"
+      ],
+      "modules": [
+        "lm_head"
+      ],
+      "status": "mapped",
+      "note": "fp16, never quantized"
+    },
+    {
+      "role": "residual-reading norms",
+      "steps": [
+        "fuse gamma into readers",
+        "weightless RMSNorm",
+        "A4 per-tensor static output quantizer"
+      ],
+      "modules": [
+        "input_layernorm",
+        "post_attention_layernorm"
+      ],
+      "status": "partial",
+      "note": "Qwen3RMSNorm is the same class as the per-head q_norm/k_norm, so class-based selection hits both"
+    },
+    {
+      "role": "final norm",
+      "steps": [
+        "fuse gamma into lm_head"
+      ],
+      "modules": [
+        "model.norm"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "attention input projections",
+      "steps": [
+        "R1 input side",
+        "W4 per-channel"
+      ],
+      "modules": [
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj"
+      ],
+      "status": "mapped",
+      "note": "no biases; k/v out 1024 (8 KV heads x 128)"
+    },
+    {
+      "role": "value/output pair",
+      "steps": [
+        "R2 per-head Hadamard"
+      ],
+      "modules": [
+        "self_attn.v_proj",
+        "self_attn.o_proj"
+      ],
+      "status": "mapped",
+      "note": "GQA 32 Q / 8 KV handled by the repo's reshape"
+    },
+    {
+      "role": "attention output projection",
+      "steps": [
+        "R1 output side",
+        "R2 input side",
+        "W4 per-channel",
+        "A4 per-tensor static input"
+      ],
+      "modules": [
+        "self_attn.o_proj"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "MLP input projections",
+      "steps": [
+        "R1 input side",
+        "W4 per-channel"
+      ],
+      "modules": [
+        "mlp.gate_proj",
+        "mlp.up_proj"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "MLP output projection",
+      "steps": [
+        "R1 output side",
+        "R4 offline+online Hadamard",
+        "W4 per-channel",
+        "A4 per-tensor static input"
+      ],
+      "modules": [
+        "mlp.down_proj"
+      ],
+      "status": "mapped",
+      "note": "intermediate 12288 = 12 x 1024, get_hadK K=12"
+    },
+    {
+      "role": "linear biases",
+      "steps": [
+        "rotate writer biases"
+      ],
+      "modules": [],
+      "status": "unmapped",
+      "note": "Qwen3 has no linear biases"
+    },
+    {
+      "role": "Q activations",
+      "steps": [
+        "R3 online Hadamard after RoPE"
+      ],
+      "modules": [
+        "self_attn (q after q_norm and RoPE)"
+      ],
+      "status": "partial",
+      "note": "q_norm sits before RoPE; R3 must stay after both"
+    },
+    {
+      "role": "K cache",
+      "steps": [
+        "R3 online Hadamard after RoPE",
+        "K4 per-head static"
+      ],
+      "modules": [
+        "self_attn (k after k_norm and RoPE)"
+      ],
+      "status": "partial",
+      "note": "k_norm before RoPE; transformers 4.51 cache API"
+    },
+    {
+      "role": "V cache",
+      "steps": [
+        "R2",
+        "V4 per-head static"
+      ],
+      "modules": [
+        "self_attn.v_proj (output)"
+      ],
+      "status": "mapped"
+    },
+    {
+      "role": "prefix KV",
+      "steps": [
+        "detect outlier tokens",
+        "fp prefill once",
+        "inject fresh copy every forward"
+      ],
+      "modules": [
+        "past_key_values (36 layers x [1, 8, P, 128])"
+      ],
+      "status": "partial",
+      "note": "legacy tuple caches and name-based start-token choice do not work for Qwen3 on transformers 4.51"
+    },
+    {
+      "role": "per-head q/k norms",
+      "steps": [],
+      "modules": [
+        "self_attn.q_norm",
+        "self_attn.k_norm"
+      ],
+      "status": "extra",
+      "note": "RMSNorm over head_dim with learned gamma before RoPE; the method never mentions them"
+    },
+    {
+      "role": "attention probs, softmax, RoPE, SiLU, residual adds",
+      "steps": [],
+      "modules": [
+        "self_attn",
+        "mlp.act_fn"
+      ],
+      "status": "mapped",
+      "note": "fp16"
+    },
+    {
+      "role": "quantizer parameters",
+      "steps": [
+        "max init",
+        "mse_init grid search",
+        "block-AP fine-tuning"
+      ],
+      "modules": [
+        "weight/input/output/k quantizer scales"
+      ],
+      "status": "mapped"
+    }
+  ],
+  "differences": [
+    {
+      "id": "D1",
+      "kind": "module_names",
+      "severity": "must",
+      "role": "residual stream",
+      "detail": "Model-family dispatch is hard-coded to OPT/Llama/Mistral/Qwen2/InternLM2 and raises ValueError for qwen3; the RoPE function name used by the R3 monkeypatch is only set for Llama/Mistral/Qwen2. Qwen3 must be dispatched (or the pipeline must find layers, norms, attention and apply_rotary_pos_emb from the model itself).",
+      "evidence": [
+        "utils/model_utils.py:13-47",
+        "utils/model_utils.py:53-56",
+        "utils/model_utils.py:108-199",
+        "arch.json model_class Qwen3ForCausalLM"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D2",
+      "kind": "qk_norm",
+      "severity": "must",
+      "role": "residual-reading norms",
+      "detail": "Norm fusion, RMSN replacement, QuantRMSNorm wrapping and stats hooks select norms by class. Qwen3RMSNorm is also the class of the per-head q_norm/k_norm, so class-based selection would replace them with RMSN(4096) (broadcast error, learned gamma lost) and attach A4 quantizers to pre-RoPE q/k. Select residual norms by name (input_layernorm, post_attention_layernorm, model.norm); leave q_norm/k_norm untouched, unquantized and frozen in block-AP (their weight would otherwise match the trainable-weight selector).",
+      "evidence": [
+        "utils/rotation_utils.py:83-89",
+        "quant_utils.py:96-114",
+        "quant_utils.py:655-669",
+        "arch.json layer0.norms self_attn.q_norm/k_norm Qwen3RMSNorm",
+        "method.md Invariants (only residual-stream norms may be fused)"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D3",
+      "kind": "rope",
+      "severity": "must",
+      "role": "K cache",
+      "detail": "transformers 4.51 decoder layers take position_embeddings=(cos, sin) from model.model.rotary_emb instead of computing RoPE from position_ids, and the cache kwarg/return conventions differ from 4.40. The block-AP Catcher must capture position_embeddings (positions [P, P+L)) and every block call (update_dataset, train/eval, mse_init, block_mse_init_*, k_cache_mse_init) must pass it; check the layer return type instead of blindly taking [0].",
+      "evidence": [
+        "quantize/block_ap.py:29",
+        "quantize/block_ap.py:41",
+        "quantize/block_ap.py:76",
+        "quantize/block_ap.py:155-197",
+        "quant_utils.py:467-564",
+        "arch.json transformers_version 4.51.3"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D4",
+      "kind": "save_load",
+      "severity": "must",
+      "role": "prefix KV",
+      "detail": "The repo stores and feeds the prefix as a 4.40 legacy tuple (from_legacy_cache, kv_cache_repeat, tuple past_key_values in test_ppl, torch.save of output.past_key_values without map_location). On 4.51 build a fresh DynamicCache per forward from saved per-layer (K, V) fp16 tensors, batch-expanded, never reusing a mutated cache; save plain tensors and load with map_location. Masks must cover the P prefix columns (bottom-right causal; q_len != kv_len).",
+      "evidence": [
+        "utils/model_utils.py:10",
+        "utils/model_utils.py:367-415",
+        "utils/data_utils.py:235",
+        "main.py:243-250",
+        "main.py:323",
+        "method.md Steps 8 and 16"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D5",
+      "kind": "other",
+      "severity": "must",
+      "role": "prefix KV",
+      "detail": "Prefix-token selection keys off model_name.split('-')[0] (qwen3 -> NotImplementedError) and picks eos_token as start token when the name contains 'qwen'. Qwen3 has no bos_token; for Qwen3-8B eos_token is <|im_end|>. Choose the start token generically (bos if defined, else the tokenizer's document-start/pad <|endoftext|>), log it, and handle zero detected outliers (assert outlier_num > 0) by falling back to the start token alone.",
+      "evidence": [
+        "utils/stat_utils.py:193-227",
+        "utils/stat_utils.py:253",
+        "utils/stat_utils.py:268-274",
+        "method.md Steps 7"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D6",
+      "kind": "save_load",
+      "severity": "must",
+      "role": "prefix KV",
+      "detail": "Reload (eval.py) re-wraps only RMSN/LlamaRMSNorm, so on Qwen3 the norm output quantizers are silently dropped, and the repo has no generate() path. The inference adapter must rebuild exactly the saved quantizer set (residual norms, o_proj/down_proj inputs, v_proj output, K wrapper), register the R4 online Hadamard (K=12) and the R3 wrapper, and inject a fresh prefix cache into every forward and generate call (real tokens at positions >= P; strip prefix ids from generate output).",
+      "evidence": [
+        "eval.py:52-107",
+        "utils/model_utils.py:392-415",
+        "method.md Save and reload"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D7",
+      "kind": "norm_type",
+      "severity": "should",
+      "role": "residual-reading norms",
+      "detail": "RMSN hard-codes eps 1e-5; Qwen3 rms_norm_eps is 1e-6. Use config.rms_norm_eps at quantize time and reload.",
+      "evidence": [
+        "utils/model_utils.py:240",
+        "utils/rotation_utils.py:87",
+        "arch.json config.rms_norm_eps 1e-06"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D8",
+      "kind": "head_dim",
+      "severity": "should",
+      "role": "value/output pair",
+      "detail": "head_dim is computed as hidden_size/num_attention_heads. Equal to config.head_dim (128) for Qwen3-8B, but wrong for other Qwen3 sizes; read config.head_dim.",
+      "evidence": [
+        "utils/rotation_utils.py:283",
+        "utils/rotation_utils.py:324",
+        "quant_utils.py:25",
+        "quant_utils.py:228"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D9",
+      "kind": "other",
+      "severity": "should",
+      "role": "quantizer parameters",
+      "detail": "block_mse_init_static's fine pass calls the block without attention_mask (repo bug); with a prefix this changes the masking. Pass the same mask/position_embeddings as the coarse pass.",
+      "evidence": [
+        "quant_utils.py:481"
+      ],
+      "repo_support": "missing"
+    },
+    {
+      "id": "D10",
+      "kind": "layer_pattern",
+      "severity": "info",
+      "role": "MLP output projection",
+      "detail": "intermediate_size 12288 = 12 x 1024, which get_hadK supports (K=12), so R4 applies as written.",
+      "evidence": [
+        "utils/hadamard_utils.py:9-63",
+        "arch.json config.intermediate_size 12288"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D11",
+      "kind": "attention_bias",
+      "severity": "info",
+      "role": "linear biases",
+      "detail": "Qwen3 has no linear biases and untied embeddings, so the bias-rotation and tied-embedding paths are unused.",
+      "evidence": [
+        "arch.json attention_bias false",
+        "arch.json tied_embeddings false"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D12",
+      "kind": "qk_norm",
+      "severity": "info",
+      "role": "per-head q/k norms",
+      "detail": "R3 Hadamard and K quantization sit in the apply_rotary_pos_emb wrapper, i.e. after q_norm/k_norm and RoPE and before the cache write, which is the right place. Never use --k_pre_rope (would quantize before k_norm/RoPE) and never fold R3 into weights.",
+      "evidence": [
+        "utils/rotation_utils.py:315-345",
+        "method.md Porting notes 3"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D13",
+      "kind": "gqa",
+      "severity": "info",
+      "role": "value/output pair",
+      "detail": "GQA 32/8 is already handled: rotate_ov_proj reshapes by KV heads, k_cache_mse_init uses repeat_kv, K/V scales are [8, 1].",
+      "evidence": [
+        "utils/rotation_utils.py:247-272",
+        "quant_utils.py:340-395"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D14",
+      "kind": "save_load",
+      "severity": "info",
+      "detail": "No released W4A4 kernel: int_linear_real is weight-only GPTQ-style packing with dequant+fp16 matmul. The artifact is fake-quant fp16 weights plus scales, so no VRAM/speed win without a later kernel stage, and vLLM export is activation_bits_unsupported.",
+      "evidence": [
+        "quantize/int_linear_real.py:155-167",
+        "README.md:13"
+      ],
+      "repo_support": "partial"
+    },
+    {
+      "id": "D15",
+      "kind": "qk_norm",
+      "severity": "info",
+      "role": "Q activations",
+      "detail": "Q is never quantized; the R3 Hadamard on q is applied after q_norm and RoPE inside the RoPE wrapper, so q_norm only changes what precedes R3, not the invariant (same Hadamard on q and k after RoPE).",
+      "evidence": [
+        "utils/rotation_utils.py:337-339",
+        "arch.json layer0.norms self_attn.q_norm"
+      ],
+      "repo_support": "supported"
+    },
+    {
+      "id": "D16",
+      "kind": "other",
+      "severity": "must",
+      "role": "MLP output projection",
+      "detail": "Qwen3-8B layer 16 (only that layer) has token-wise outliers in the down_proj input (after the R4 Hadamard) triggered by the content token \"2\" (id 17) at arbitrary positions: per-token max top-1/median up to 2166 over 32 Pile samples. Prefixing only absorbs outliers at fixed initial/delimiter positions, so it cannot remove a content-triggered one, and the O2 per-tensor static A4 scale cannot cover both the outlier token and the bulk: block 16 mlp.down_proj_input_quantizer MSE-init best_loss 9.51 (block 15: 0.0015) at clip factor 1.0, block val loss 0.108 -> 28-32 for the rest of block-AP. Use PrefixQuant-O1 (paper Table 1: per-channel W4, per-token dynamic A4, group-wise 128 dynamic KV4) with the learnable per-layer activation clipping (--activation_clipping), keeping the prefix tokens, rotations, mse_init and block-AP. The artifact then carries clipping factors (bound_factor) instead of activation/KV scales; reload must rebuild dynamic quantizers and load them.",
+      "evidence": [
+        "jobs/20261106T201841Z-53a7a2 log: block 16 mlp.down_proj_input_quantizer best_loss 9.51 clip 1.0; blocks 16-18 val_loss 28-32",
+        "parent GPU probe: layer-16 down_proj input top-1/median up to 2166 on token id 17",
+        "paper Table 1 (PrefixQuant-O1: per-token dynamic activation, group-wise dynamic KV) and Sec. block-wise fine-tuning (trainable tensor-wise clipping for O1)",
+        "README.md:55 (--activation_clipping for dynamic quantization)",
+        "quantize/quantizer.py:153-163 (dynamic mode, bound_factor)",
+        "utils/quant_utils.py:507-549 (block_mse_init_dynamic)"
+      ],
+      "repo_support": "supported"
+    }
+  ],
+  "smoke": {
+    "weight_bits": 4,
+    "group_size": null,
+    "max_rel_error": 0.5,
+    "min_coverage": 1.0
+  },
+  "recipes": [],
+  "notes": "Target W4A4KV4 static (O2) with mse_init and --epochs 20 block-AP fine-tuning (smoke cuts epochs to a few steps). Weights per-output-channel, so group_size null. lm_head is not a decoder-layer linear, so default smoke targets are the 7 linears per layer. diagnose_fix (job 20261106T201841Z-53a7a2): O2 static A4 failed at layer 16 (D16); the port now targets PrefixQuant-O1 (per-token dynamic A4 with learnable clipping, group-wise dynamic KV4), same smoke gate."
+}

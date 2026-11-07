@@ -11,6 +11,7 @@ when the run is not beneficial (`library.py --record-attempt`).
 | Model | GPU | Method | Paper | Repo | Port | Stop | Issues | PPL ratio | Retries | Job |
 | --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |
 | Qwen/Qwen2.5-1.5B-Instruct | g5.2xlarge | QuaRot | [paper](https://arxiv.org/abs/2404.00456) | [repo](https://github.com/spcl/QuaRot) |  | budget_exhausted | throughput_unchanged, packed_quality_gap | 1.5042 | 20/18 | 20260920T200447Z-c3daf2 |
+| Qwen/Qwen3-8B | vast-rtx3090 | PrefixQuant | [paper](https://arxiv.org/abs/2410.05265) | [repo](https://github.com/ChenMnZ/PrefixQuant) | [port](ports/attempts/Qwen_Qwen3-8B__vast-rtx3090__PrefixQuant) | not_beneficial | vram_unchanged, throughput_unchanged | 1.1531 | 2/14 | 20261107T001415Z-5642d6 |
 | google/gemma-2-2b-it | g5.2xlarge | SpinQuant | [paper](https://arxiv.org/abs/2405.16406) | [repo](https://github.com/facebookresearch/SpinQuant) |  | budget_exhausted | ppl_exploded, throughput_unchanged | 8.7589 | 14/14 | 20260921T062939Z-883090 |
 | microsoft/Phi-3.5-mini-instruct | vast-rtx3090 | OmniQuant | [paper](https://arxiv.org/abs/2308.13137) | [repo](https://github.com/OpenGVLab/OmniQuant) | [port](ports/attempts/microsoft_Phi-3.5-mini-instruct__vast-rtx3090__OmniQuant) | verify_failed | loader_arch |  | 1/14 | 20261103T000643Z-1b9a18 |
 
