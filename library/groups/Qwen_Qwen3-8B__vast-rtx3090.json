@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "model_id": "Qwen/Qwen3-8B",
+  "gpu_instance": "vast-rtx3090",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "fp16_baseline": {
+    "perplexity": 9.657565503476947,
+    "tokens_per_s": 3493.4794027318935,
+    "peak_vram_gb": 18.46218729019165
+  },
+  "methods": [
+    {
+      "method_name": "PrefixQuant",
+      "slug": "prefixquant-qwen3-8b-vastrtx3090",
+      "job_id": "20261107T033248Z-1b1409",
+      "quality_ok": true,
+      "ppl": 11.121597430392551,
+      "ppl_ratio": 1.1515943046297246,
+      "tokens_per_s": 6588.465102334037,
+      "peak_vram_gb": 11.998438358306885,
+      "improved_throughput": true,
+      "improved_vram": true,
+      "packed": false,
+      "artifact_dir": "quantized/prefixquant-qwen3-8b-vastrtx3090",
+      "hub_url": "https://huggingface.co/chris320211/prefixquant-qwen3-8b-vastrtx3090",
+      "arxiv_id": "2410.05265",
+      "paper_url": "https://arxiv.org/abs/2410.05265",
+      "repo_url": "https://github.com/ChenMnZ/PrefixQuant",
+      "repo_commit": "60b74237cf2cf20e3354569d998ab708ff598ce3",
+      "verification_status": "passed",
+      "rank": 1
+    }
+  ],
+  "best": {
+    "method_name": "PrefixQuant",
+    "slug": "prefixquant-qwen3-8b-vastrtx3090",
+    "job_id": "20261107T033248Z-1b1409",
+    "rank": 1,
+    "why": "quality_ok, then higher WikiText-2 tok/s, then lower peak VRAM, prefer packed, then lower ppl_ratio",
+    "artifact_dir": "quantized/prefixquant-qwen3-8b-vastrtx3090",
+    "hub_url": "https://huggingface.co/chris320211/prefixquant-qwen3-8b-vastrtx3090"
+  }
+}

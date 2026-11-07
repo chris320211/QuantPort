@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "prefixquant_w4a4_int8_storage",
+  "kind": "port",
+  "port": "library/ports/Qwen_Qwen3-8B__vast-rtx3090__PrefixQuant",
+  "match": {
+    "format": ["w4a4_int8_storage"],
+    "quant_method": ["prefixquant"],
+    "w_bits": [4],
+    "a_bits": [4],
+    "weight_quant": ["per_channel"],
+    "act_quant": ["per_token"],
+    "w_sym": [true],
+    "a_sym": [true],
+    "online_transforms": [true]
+  },
+  "requires": ["torch", "triton", "fast_hadamard_transform"],
+  "min_compute_capability": "8.0",
+  "tuned_on": [
+    {
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "compute_capability": "8.6",
+      "torch": "2.7.1+cu128",
+      "triton": "3.3.1"
+    }
+  ],
+  "results": [
+    {
+      "method_name": "PrefixQuant",
+      "model_id": "Qwen/Qwen3-8B",
+      "gpu_instance": "vast-rtx3090",
+      "job_id": "20261107T033248Z-1b1409",
+      "ppl_ratio": 1.1516,
+      "prefill_tokens_per_s": 6588.5,
+      "fp16_prefill_tokens_per_s": 3493.5,
+      "peak_vram_gb": 12.0,
+      "fp16_peak_vram_gb": 18.46,
+      "port": "library/ports/Qwen_Qwen3-8B__vast-rtx3090__PrefixQuant"
+    }
+  ],
+  "notes": "Replaces fake-quant fp16 W4A4 (2650 tok/s, 18.5 GB) with 4-bit codes stored in int8 and the shared w8a8_int8 Triton GEMM (exact for 4-bit codes): 6588 tok/s, 12.0 GB, same PPL. Pieces in the port overlay.patch: quantize/int_linear_packed.py (fused RMSNorm + per-token A4 quant with learned clip, per-token A4 quant for o_proj/down_proj inputs incl. looped K=12288 with cached had_K, group-wise KV4 fake quant; bit-exact vs the repo quantizers), utils/packed_runtime.py (convert fake-quant artifact to int8 codes + fp16 per-channel scales with a bit-exact check, meta-device loader, prefix-aware flash SDPA that front-pads the query by the prefix length). int4 two-per-byte storage was exact but 5-25% slower per GEMM at M=2048, so int8 storage is kept. Remaining prefill hot spots: fp16 lm_head (37 ms) and the 12x12 Hadamard bmm on the down_proj input (~8 ms). Not vLLM-servable (A4)."
+}

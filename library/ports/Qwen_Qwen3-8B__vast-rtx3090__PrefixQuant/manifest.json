@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "method_id": "prefixquant-qwen3-8b-vastrtx3090",
+  "model_id": "Qwen/Qwen3-8B",
+  "base_commit": "60b74237cf2cf20e3354569d998ab708ff598ce3",
+  "patch_sha256": "bcf1fd619a6ee60deaea0f1de4c221c73972fba3f4d116269dc82761ae9bf8d4",
+  "rationale": "kernel_triton on top of diagnose_fix/96cd8939c4d64e3d (all of it kept; job 20261107T001415Z-5642d6 verified, benchmark quality_ok, diagnose kernel: vram_unchanged/throughput_unchanged). The e0 artifact stored fp16 fake-quant weights and ran every quantizer as fp16 torch ops. New format w4a4_int8_storage: utils/packed_runtime.convert_artifact turns the verified fake-quant artifact into int8 W4 codes ([-8,7]) + fp16 per-channel weight_scale per decoder projection (each code checked to reproduce its fp16 weight bit for bit, incl. the fp16 clamp_ste of the scale), clipping factors / prefix KV / configs copied, embeddings/lm_head/norms fp16 (16.4 -> 9.4 GB). The adapter loads it on the meta device and copies integer tensors straight to the GPU (load peak 8.8 GB). Kernels: shared w8a8_int8 Triton int8 GEMM copied unchanged into quantize/triton_w8a8.py (per-token act scale x per-channel weight scale epilogue = exact W4A4 with 4-bit codes in int8 lanes; tune_config on RTX 3090 sm_86 picked the default 128x128x64 tile for all four shapes); new quantize/int_linear_packed.py: fused RMSNorm + per-token A4 quant with learned clip (bit-exact vs QuantRMSNorm+UniformAffineQuantizer in fp16), per-token A4 quant for o_proj and down_proj inputs (after fast_hadamard_transform R4, had_K cached on GPU), group-wise KV4 fake quant for K (after R3+RoPE) and V (bit-exact). Attention: prefix-aware SDPA registered as prefixquant_sdpa: without padding the query is front-padded by the prefix length so flash runs with is_causal (exact bottom-right mask), decode q_len=1 unmasked, padding or long offsets fall back to the transformers 4D mask. The repo real_quant path is weight-only W4A16 (asserts input/k/v bits >= 16, needs asym zero points), so it cannot carry W4A4KV4; the int8 GEMM keeps A4. Packed int4 (two per byte) was exact but 5-25 percent slower per GEMM at M=2048 on sm_86, so int8 storage. Full-model check vs e0 fake-quant: WikiText-2 PPL 11.122 vs 11.136, 2048-token prefill 7529 vs 2880 tok/s, peak eval VRAM 12.0 vs 18.5 GB.",
+  "evidence_files": [
+    "jobs/20261107T001415Z-5642d6/benchmark.json",
+    "jobs/20261107T001415Z-5642d6/diagnose.json"
+  ],
+  "target_modules": [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj"
+  ],
+  "inference_adapter_path": "quant_agent_inference_adapter.py",
+  "addresses": [
+    "D1",
+    "D2",
+    "D3",
+    "D4",
+    "D5",
+    "D6",
+    "D7",
+    "D8",
+    "D9",
+    "D16"
+  ]
+}

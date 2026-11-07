@@ -201,11 +201,18 @@ index 0835330..5a4a11e 100644
  
 diff --git a/quant_agent_inference_adapter.py b/quant_agent_inference_adapter.py
 new file mode 100644
-index 0000000..fd3013a
+index 0000000..2eedff7
 --- /dev/null
 +++ b/quant_agent_inference_adapter.py
-@@ -0,0 +1,43 @@
-+"""QuantPort inference adapter for PrefixQuant artifacts (W4A4KV4, O1 dynamic or O2 static; fake-quant fp16).
+@@ -0,0 +1,54 @@
++"""QuantPort inference adapter for PrefixQuant artifacts (W4A4KV4, O1 dynamic or O2 static).
++
++Packed artifacts (``prefixequant_config.json`` has ``packed_format: w4a4_int8_storage``, written by
++``utils.packed_runtime.convert_artifact``) load through ``utils.packed_runtime.load_packed_model``:
++int8 W4 codes + fp16 per-channel scales run on the Triton int8 GEMM with per-token A4 codes, the
++fused RMSNorm+A4 kernel, Triton KV4 fake quant and prefix-aware flash SDPA; the model is built on
++the meta device and the integer weights are copied straight to the GPU (no fp16 projections).
++Fake-quant artifacts load as before:
 +
 +Loads the SAVED artifact at ``model_path`` (never a Hub id): the stock causal-LM class with the
 +saved fake-quant fp16 weights, then ``utils.prefix_runtime.attach_quantization`` rebuilds the
@@ -230,6 +237,7 @@ index 0000000..fd3013a
 +    from transformers import AutoModelForCausalLM, AutoTokenizer
 +
 +    from utils import prefix_runtime
++    from utils import packed_runtime
 +
 +    torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
 +    if str(device).startswith("cpu"):
@@ -237,6 +245,9 @@ index 0000000..fd3013a
 +    tokenizer = AutoTokenizer.from_pretrained(
 +        model_path, trust_remote_code=trust_remote_code, local_files_only=True
 +    )
++    if packed_runtime.is_packed(model_path):
++        model = packed_runtime.load_packed_model(model_path, device=device, dtype=torch_dtype)
++        return model, tokenizer
 +    model = AutoModelForCausalLM.from_pretrained(
 +        model_path,
 +        torch_dtype=torch_dtype,
@@ -438,6 +449,346 @@ index 936af44..054c171 100644
          self.fwd_kwargs = dict()
          self.fwd_func = F.linear
          self.register_parameter('weight',org_module.weight) # trainable
+diff --git a/quantize/int_linear_packed.py b/quantize/int_linear_packed.py
+new file mode 100644
+index 0000000..054cac7
+--- /dev/null
++++ b/quantize/int_linear_packed.py
+@@ -0,0 +1,334 @@
++"""Real-integer PrefixQuant-O1 modules (format ``w4a4_int8_storage``).
++
++The fake-quant path (``int_linear_fake.QuantLinear`` + ``UniformAffineQuantizer``) keeps fp16
++weights on the W4 grid and fake-quantizes activations in fp16. Here the same numbers are run as
++integers:
++
++* weights: the W4 per-channel symmetric codes (``[-8, 7]``) stored as int8 ``weight`` [out, in]
++  plus the fp16 per-channel ``weight_scale`` [out, 1] (the clamped ``weight_quantizer.scale``);
++* activations: per-token dynamic symmetric 4-bit codes with the learned clipping factor
++  (``bound_factor``), produced by a Triton kernel that rounds exactly like the fp16 torch
++  quantizer (fp16 intermediate casts, round half to even, clamp to ``[-8, 7]``);
++* GEMM: the shared ``w8a8_int8`` Triton int8 x int8 -> int32 tensor-core kernel
++  (``quantize/triton_w8a8.py``, copied unchanged) with the scale epilogue
++  acc * act_scale[m] * weight_scale[n]. 4-bit codes in int8 lanes make this exact W4A4.
++
++Kernels written here:
++
++1. ``_rmsnorm_quant4_kernel``: QuantRMSNorm (fp32 RMS, fp16 weight multiply) fused with its
++   per-token A4 output quantizer; writes int8 codes + fp32 scale (for q/k/v or gate/up) and the
++   fp16 fake-quant value (what the fake path returns, for shapes and any non-packed consumer).
++2. ``_act_quant4_kernel`` / ``_act_quant4_looped_kernel``: per-token A4 quantizer of the o_proj
++   and down_proj inputs (the latter after the R4 online Hadamard, fast_hadamard_transform).
++3. ``_group_fake_quant4_kernel``: group-wise (head_dim) dynamic KV4 fake quantization of K (after
++   R3 + RoPE, unclipped) and V (v_proj output, clipped), fp16 in/out, same rounding as torch.
++
++Triton value arguments are Python floats/ints; clipping factors are read through pointers so no
++host sync is needed.
++"""
++import math
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++
++from quantize import triton_w8a8
++
++FORMAT = 'w4a4_int8_storage'
++QMIN = -8
++QMAX = 7
++_SCALE_MIN = 1e-4
++_SCALE_MAX = 1e4
++
++
++@triton.jit
++def _round_half_even(v):
++    r = tl.floor(v + 0.5)
++    tie = (r - v) == 0.5
++    odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++    return tl.where(tie & odd, r - 1.0, r)
++
++
++@triton.jit
++def _scale_from_amax(amax, bf_ptr, HAS_CLIP: tl.constexpr):
++    """fp16 torch order: amax * bound_factor -> 2 * . -> / 15 -> clamp(1e-4, 1e4), each cast to fp16."""
++    if HAS_CLIP:
++        bf = tl.load(bf_ptr).to(tl.float32)
++        amax = (amax * bf).to(tl.float16).to(tl.float32)
++    rng = (2.0 * amax).to(tl.float16).to(tl.float32)
++    scale = tl.math.div_rn(rng, 15.0).to(tl.float16).to(tl.float32)
++    scale = tl.minimum(tl.maximum(scale, 1e-4), 1e4).to(tl.float16).to(tl.float32)
++    return scale
++
++
++@triton.jit
++def _codes(x, scale):
++    v = tl.math.div_rn(x, scale).to(tl.float16).to(tl.float32)
++    r = _round_half_even(v)
++    return tl.minimum(tl.maximum(r, -8.0), 7.0)
++
++
++@triton.jit
++def _rmsnorm_quant4_kernel(
++    x_ptr, w_ptr, bf_ptr, dq_ptr, q_ptr, s_ptr,
++    K, eps, stride_x, stride_dq, stride_q,
++    HAS_CLIP: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < K
++    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
++    var = tl.sum(x * x, axis=0) / K
++    xn = (x * tl.math.rsqrt(var + eps)).to(tl.float16).to(tl.float32)
++    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
++    xn = (xn * w).to(tl.float16).to(tl.float32)
++    amax = tl.max(tl.where(mask, tl.abs(xn), 0.0), axis=0)
++    scale = _scale_from_amax(amax, bf_ptr, HAS_CLIP)
++    r = _codes(xn, scale)
++    tl.store(q_ptr + row * stride_q + offs, r.to(tl.int8), mask=mask)
++    tl.store(dq_ptr + row * stride_dq + offs, (r * scale).to(dq_ptr.dtype.element_ty), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _act_quant4_kernel(
++    x_ptr, bf_ptr, q_ptr, s_ptr, K, stride_x, stride_q,
++    HAS_CLIP: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < K
++    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
++    amax = tl.max(tl.abs(x), axis=0)
++    scale = _scale_from_amax(amax, bf_ptr, HAS_CLIP)
++    r = _codes(x, scale)
++    tl.store(q_ptr + row * stride_q + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _act_quant4_looped_kernel(
++    x_ptr, bf_ptr, q_ptr, s_ptr, K, stride_x, stride_q,
++    HAS_CLIP: tl.constexpr, BLOCK_K: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    x_row = x_ptr + row * stride_x
++    q_row = q_ptr + row * stride_q
++    offs = tl.arange(0, BLOCK_K)
++    run_max = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        run_max = tl.maximum(run_max, tl.abs(x))
++    scale = _scale_from_amax(tl.max(run_max, axis=0), bf_ptr, HAS_CLIP)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        tl.store(q_row + k0 + offs, _codes(x, scale).to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _group_fake_quant4_kernel(
++    x_ptr, bf_ptr, y_ptr, n_rows,
++    HAS_CLIP: tl.constexpr, GROUP: tl.constexpr, ROWS: tl.constexpr,
++):
++    pid = tl.program_id(0).to(tl.int64)
++    rows = pid * ROWS + tl.arange(0, ROWS)
++    cols = tl.arange(0, GROUP)
++    rmask = rows < n_rows
++    ptrs = rows[:, None] * GROUP + cols[None, :]
++    x = tl.load(x_ptr + ptrs, mask=rmask[:, None], other=0.0).to(tl.float32)
++    amax = tl.max(tl.abs(x), axis=1)
++    scale = _scale_from_amax(amax, bf_ptr, HAS_CLIP)
++    r = _codes(x, scale[:, None])
++    tl.store(y_ptr + ptrs, (r * scale[:, None]).to(y_ptr.dtype.element_ty), mask=rmask[:, None])
++
++
++def _rows(x):
++    x2d = x.reshape(-1, x.shape[-1])
++    if x2d.stride(-1) != 1:
++        x2d = x2d.contiguous()
++    return x2d
++
++
++def rmsnorm_quant4(x, weight, eps, bound_factor=None):
++    """Fused QuantRMSNorm + A4 per-token output quantizer -> (fp16 fake-quant, int8 codes, fp32 scale)."""
++    x2d = _rows(x)
++    m, k = x2d.shape
++    dq = torch.empty((m, k), dtype=x.dtype, device=x.device)
++    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
++    s = torch.empty((m,), dtype=torch.float32, device=x.device)
++    if m:
++        block = triton.next_power_of_2(int(k))
++        _rmsnorm_quant4_kernel[(int(m),)](
++            x2d, weight, bound_factor if bound_factor is not None else weight, dq, q, s,
++            int(k), float(eps), int(x2d.stride(0)), int(dq.stride(0)), int(q.stride(0)),
++            HAS_CLIP=bound_factor is not None, BLOCK_K=block, num_warps=8 if block >= 4096 else 4)
++    return dq.view(x.shape), q, s
++
++
++def act_quant4(x2d, bound_factor=None):
++    """Per-token dynamic symmetric A4 (learned clip) -> (int8 codes [M, K], fp32 scale [M])."""
++    m, k = x2d.shape
++    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
++    s = torch.empty((m,), dtype=torch.float32, device=x2d.device)
++    if m:
++        block = triton.next_power_of_2(int(k))
++        args = (x2d, bound_factor if bound_factor is not None else x2d, q, s, int(k), int(x2d.stride(0)), int(q.stride(0)))
++        if block <= 4096:
++            _act_quant4_kernel[(int(m),)](*args, HAS_CLIP=bound_factor is not None, BLOCK_K=block, num_warps=8)
++        else:
++            _act_quant4_looped_kernel[(int(m),)](*args, HAS_CLIP=bound_factor is not None, BLOCK_K=4096, num_warps=8)
++    return q, s
++
++
++def group_fake_quant4(x, group_size, bound_factor=None, out=None):
++    """Group-wise (last dim, ``group_size`` = head_dim) dynamic symmetric 4-bit fake quantization."""
++    if x.shape[-1] % group_size:
++        raise ValueError(f'last dim {x.shape[-1]} is not a multiple of group size {group_size}')
++    src = x if x.is_contiguous() else x.contiguous()
++    y = out if out is not None else torch.empty_like(src)
++    n_rows = src.numel() // group_size
++    if n_rows:
++        rows = 16
++        _group_fake_quant4_kernel[(triton.cdiv(n_rows, rows),)](
++            src, bound_factor if bound_factor is not None else src, y, int(n_rows),
++            HAS_CLIP=bound_factor is not None, GROUP=int(group_size), ROWS=rows, num_warps=4)
++    return y
++
++
++class ClipFactor(nn.Module):
++    """Holds a dynamic quantizer's learned clipping factor under the fake path's state-dict name."""
++
++    def __init__(self, clipping=True):
++        super().__init__()
++        if clipping:
++            self.bound_factor = nn.Parameter(torch.ones(1, dtype=torch.float16), requires_grad=False)
++        else:
++            self.bound_factor = None
++
++
++class PackedQuantRMSNorm(nn.Module):
++    """QuantRMSNorm with a dynamic A4 output quantizer, run as one Triton kernel.
++
++    Returns the fp16 fake-quant tensor (identical to the fake path's output) and attaches
++    ``_pq_codes = (int8 codes [M, K], fp32 scale [M])`` to it; the PackedQuantLinear consumers
++    (q/k/v_proj, gate/up_proj) read those codes instead of re-quantizing.
++    """
++
++    def __init__(self, hidden_size, eps, clipping=True, dtype=torch.float16):
++        super().__init__()
++        self.register_buffer('weight', torch.empty(hidden_size, dtype=dtype))
++        self.variance_epsilon = eps
++        self.output_quantizer = ClipFactor(clipping)
++
++    def forward(self, x):
++        dq, q, s = rmsnorm_quant4(x, self.weight, self.variance_epsilon, self.output_quantizer.bound_factor)
++        dq._pq_codes = (q, s)
++        return dq
++
++
++class PackedQuantLinear(nn.Module):
++    """W4 (int8 storage) x A4 linear with the shared int8 Triton GEMM.
++
++    ``input_source``: 'norm' (codes come attached from PackedQuantRMSNorm), or 'dynamic'
++    (own per-token A4 input quantizer with a learned clip, optionally after the R4 online
++    Hadamard). ``output_group``: group size of the dynamic V-cache fake quantizer applied to the
++    output (v_proj), or 0.
++    """
++
++    def __init__(self, in_features, out_features, bias=False, input_source='norm', online_had=False,
++                 output_group=0, clipping=True, dtype=torch.float16):
++        super().__init__()
++        self.in_features = in_features
++        self.out_features = out_features
++        self.register_buffer('weight', torch.empty((out_features, in_features), dtype=torch.int8))
++        self.register_buffer('weight_scale', torch.empty((out_features, 1), dtype=dtype))
++        if bias:
++            self.register_buffer('bias', torch.empty(out_features, dtype=dtype))
++        else:
++            self.bias = None
++        self.input_source = input_source
++        self.input_quantizer = ClipFactor(clipping) if input_source == 'dynamic' else None
++        self.online_had = online_had
++        self.had_K = None
++        self.had_n = 1
++        self.had_scale = 1.0
++        self.output_group = output_group
++        self.output_quantizer = ClipFactor(clipping) if output_group else None
++        self.gemm_config = None  # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, warps, stages) or None = default
++        self._warned = False
++
++    def setup_online_had(self, device, dtype):
++        """R4 online Hadamard of the fake path (hadamard_utils.matmul_hadU_cuda), had_K kept on device."""
++        import utils.hadamard_utils as hadamard_utils
++        had_K, K = hadamard_utils.get_hadK(self.in_features)
++        self.had_n = int(K)
++        self.had_K = None if had_K is None else had_K.to(device=device, dtype=dtype)
++        # matmul_hadU_cuda passes 1/sqrt(n) as a float32 tensor; use that exact value
++        self.had_scale = float(1.0 / torch.tensor(self.in_features).sqrt())
++
++    def _hadamard(self, x):
++        import fast_hadamard_transform
++        n = x.shape[-1]
++        if self.had_n == 1:
++            return fast_hadamard_transform.hadamard_transform(x.contiguous(), self.had_scale)
++        inp = x.reshape(-1, self.had_n, n // self.had_n)
++        inp = fast_hadamard_transform.hadamard_transform(inp.contiguous(), self.had_scale)
++        inp = self.had_K @ inp
++        return inp.reshape(x.shape)
++
++    def dequantized_weight(self, dtype):
++        return (self.weight.to(dtype) * self.weight_scale.to(dtype))
++
++    def forward(self, x):
++        lead = x.shape[:-1]
++        if self.input_source == 'dynamic':
++            if self.online_had:
++                x = self._hadamard(x)
++            q, s = act_quant4(_rows(x), self.input_quantizer.bound_factor)
++        else:
++            codes = getattr(x, '_pq_codes', None)
++            if codes is None:
++                # not fed by a PackedQuantRMSNorm (x is already the fake-quant value): dense fallback
++                if not self._warned:
++                    print(f'[prefixquant packed] {self.__class__.__name__}: input without int codes, dense fallback')
++                    self._warned = True
++                out = F.linear(x, self.dequantized_weight(x.dtype), self.bias)
++                return self._output_quant(out)
++            q, s = codes
++        out = triton_w8a8.w8a8_matmul(q, s, self.weight, self.weight_scale, self.bias, x.dtype, self.gemm_config)
++        return self._output_quant(out.view(*lead, self.out_features))
++
++    def _output_quant(self, out):
++        if self.output_group:
++            out = group_fake_quant4(out, self.output_group, self.output_quantizer.bound_factor)
++        return out
++
++    def extra_repr(self):
++        return (f'in={self.in_features}, out={self.out_features}, input={self.input_source}, '
++                f'online_had={self.online_had}, out_group={self.output_group}, format={FORMAT}')
++
++
++def pack_weight(weight, scale, check=True):
++    """Fake-quant fp16 weight on the W4 grid + its quantizer scale -> (int8 codes, fp16 scale).
++
++    The fake path computed weight = fp16(round(w / s).clamp(-8, 7) * s) with s = scale.clamp(1e-4, 1e4)
++    in fp16, so the codes are recovered exactly; ``check`` asserts that fp16(codes * s) reproduces
++    every stored weight bit for bit (i.e. the artifact really is on the grid).
++    """
++    s16 = scale.to(torch.float16).reshape(-1, 1)
++    # quantizer.clamp_ste in fp16: (clamp(s) - s) + s, which is not exactly clamp(s) when s is
++    # out of range (block-AP can drive a scale below 1e-4, even negative)
++    s16 = (s16.clamp(_SCALE_MIN, _SCALE_MAX) - s16) + s16
++    w32 = weight.float()
++    codes = torch.round(w32 / s16.float()).clamp_(QMIN, QMAX)
++    if check:
++        back = (codes.to(torch.float16) * s16)
++        bad = (back != weight.to(torch.float16)).sum().item()
++        if bad:
++            raise RuntimeError(f'weight is not on the W4 grid of its scale: {bad} of {weight.numel()} values differ')
++    return codes.to(torch.int8), s16.contiguous()
 diff --git a/quantize/quantizer.py b/quantize/quantizer.py
 index f546e85..714b057 100644
 --- a/quantize/quantizer.py
@@ -464,6 +815,268 @@ index f546e85..714b057 100644
          
      def deactivate(self):
          self.enable = False
+diff --git a/quantize/triton_w8a8.py b/quantize/triton_w8a8.py
+new file mode 100644
+index 0000000..f99dd7e
+--- /dev/null
++++ b/quantize/triton_w8a8.py
+@@ -0,0 +1,256 @@
++"""W8A8 int8 linear for any artifact saved in the `w8a8_int8` format.
++
++The format: every quantized linear stores an int8 ``weight`` [out, in] (K-major)
++and a float per-output-channel ``weight_scale`` [out, 1]; activations are
++quantized at runtime, symmetric int8 per token. It is method-agnostic
++(SmoothQuant writes it; so can any method that folds its transform into the
++weights offline), and it is the layout `export_vllm.py` maps to
++compressed-tensors `int-quantized`.
++
++Kernels:
++
++1. ``_act_quant_kernel`` / ``_act_quant_looped_kernel``: per-token absmax,
++   fp32 scale and int8 codes in one pass (the looped variant for K > 4096).
++   Codes and scales are bit-identical to rounding in the activation dtype the
++   way torch does (clamp 1e-5, /127, round half to even).
++2. ``_w8a8_gemm_kernel``: int8 x int8 -> int32 tensor-core GEMM with a fused
++   epilogue, acc * act_scale[m] * weight_scale[n] (+ bias[n]) -> fp16/bf16.
++   Any M, so decode and prefill share one kernel.
++
++``w8a8_linear_reference`` is the dense fp16 path for CPU or for checking.
++Needs torch and triton (bundled with CUDA torch); int8 ``tl.dot`` needs sm_80+.
++Copy this file into an inference adapter, or import it by path; it has no other
++dependencies.
++"""
++import time
++
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++
++
++
++@triton.jit
++def _act_quant_kernel(
++    x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm,
++    BLOCK_K: tl.constexpr,
++):
++    """Per-token absmax int8 quantization of one row of x (fp16/bf16)."""
++    row = tl.program_id(0).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    mask = offs < K
++    x_raw = tl.load(x_ptr + row * stride_xm + offs, mask=mask, other=0.0)
++    act_ty = x_raw.dtype
++    x = x_raw.to(tl.float32)
++    amax = tl.max(tl.abs(x), axis=0)
++    # Mirror torch on the activation dtype: clamp, cast, divide, cast.
++    amax = tl.maximum(amax, 1e-5).to(act_ty).to(tl.float32)
++    scale = tl.math.div_rn(amax, 127.0).to(act_ty).to(tl.float32)
++    v = tl.math.div_rn(x, scale).to(act_ty).to(tl.float32)
++    # Round half to even, like torch.round; |v| <= ~127.5 so v + 0.5 is exact.
++    r = tl.floor(v + 0.5)
++    tie = (r - v) == 0.5
++    odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++    r = tl.where(tie & odd, r - 1.0, r)
++    r = tl.minimum(tl.maximum(r, -127.0), 127.0)
++    tl.store(q_ptr + row * stride_qm + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _act_quant_looped_kernel(
++    x_ptr, q_ptr, s_ptr, K, stride_xm, stride_qm,
++    BLOCK_K: tl.constexpr,
++):
++    """Same math as _act_quant_kernel for long rows: absmax pass, then quantize pass."""
++    row = tl.program_id(0).to(tl.int64)
++    x_row = x_ptr + row * stride_xm
++    q_row = q_ptr + row * stride_qm
++    offs = tl.arange(0, BLOCK_K)
++    run_max = tl.zeros((BLOCK_K,), dtype=tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        run_max = tl.maximum(run_max, tl.abs(x))
++    act_ty = x_ptr.dtype.element_ty
++    amax = tl.max(run_max, axis=0)
++    amax = tl.maximum(amax, 1e-5).to(act_ty).to(tl.float32)
++    scale = tl.math.div_rn(amax, 127.0).to(act_ty).to(tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        mask = (k0 + offs) < K
++        x = tl.load(x_row + k0 + offs, mask=mask, other=0.0).to(tl.float32)
++        v = tl.math.div_rn(x, scale).to(act_ty).to(tl.float32)
++        r = tl.floor(v + 0.5)
++        tie = (r - v) == 0.5
++        odd = (r - 2.0 * tl.floor(r * 0.5)) != 0.0
++        r = tl.where(tie & odd, r - 1.0, r)
++        r = tl.minimum(tl.maximum(r, -127.0), 127.0)
++        tl.store(q_row + k0 + offs, r.to(tl.int8), mask=mask)
++    tl.store(s_ptr + row, scale)
++
++
++@triton.jit
++def _w8a8_gemm_kernel(
++    a_ptr, b_ptr, c_ptr, as_ptr, bs_ptr, bias_ptr,
++    M, N, K,
++    stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
++    HAS_BIAS: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    GROUP_M: tl.constexpr,
++):
++    """C[M, N] = (A_int8[M, K] @ B_int8[N, K]^T) * a_scale[M] * b_scale[N] + bias[N]."""
++    pid = tl.program_id(0)
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    num_pid_in_group = GROUP_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    # Wrap out-of-range rows/cols onto valid memory; the store is masked.
++    offs_am = offs_m % M
++    offs_bn = offs_n % N
++    offs_k = tl.arange(0, BLOCK_K)
++    a_ptrs = a_ptr + offs_am[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
++    b_ptrs = b_ptr + offs_bn[None, :].to(tl.int64) * stride_bn + offs_k[:, None] * stride_bk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
++    for k in range(0, tl.cdiv(K, BLOCK_K)):
++        if EVEN_K:
++            a = tl.load(a_ptrs)
++            b = tl.load(b_ptrs)
++        else:
++            k_left = K - k * BLOCK_K
++            a = tl.load(a_ptrs, mask=offs_k[None, :] < k_left, other=0)
++            b = tl.load(b_ptrs, mask=offs_k[:, None] < k_left, other=0)
++        acc = tl.dot(a, b, acc, out_dtype=tl.int32)
++        a_ptrs += BLOCK_K * stride_ak
++        b_ptrs += BLOCK_K * stride_bk
++
++    a_scale = tl.load(as_ptr + offs_am).to(tl.float32)
++    b_scale = tl.load(bs_ptr + offs_bn).to(tl.float32)
++    out = acc.to(tl.float32) * a_scale[:, None] * b_scale[None, :]
++    if HAS_BIAS:
++        bias = tl.load(bias_ptr + offs_bn).to(tl.float32)
++        out = out + bias[None, :]
++    c_ptrs = c_ptr + offs_m[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
++    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++    tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask)
++
++
++def quantize_activation_int8(x):
++    """x [M, K] fp16/bf16 contiguous -> (int8 codes [M, K], fp32 per-token scale [M])."""
++    m, k = x.shape
++    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
++    scale = torch.empty((m,), dtype=torch.float32, device=x.device)
++    if m == 0:
++        return q, scale
++    block_k = triton.next_power_of_2(int(k))
++    args = (x, q, scale, int(k), int(x.stride(0)), int(q.stride(0)))
++    if block_k <= 4096:
++        # Whole row in registers: one read of x.
++        _act_quant_kernel[(int(m),)](*args, BLOCK_K=block_k, num_warps=8)
++    else:
++        # Long rows: absmax pass + quantize pass over 4096-wide chunks; the
++        # second read hits L2. Measured at copy bandwidth on sm_86.
++        _act_quant_looped_kernel[(int(m),)](*args, BLOCK_K=4096, num_warps=8)
++    return q, scale
++
++
++def _gemm_config(m, n, k):
++    """Default (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages).
++
++    Tuned on sm_86 (RTX 3090, see kernel.json `tuned_on`). On another compute
++    capability, run `tune_config` on the model's shapes and pass the result as
++    `config` to `w8a8_matmul`.
++    """
++    if m <= 16:
++        return 16, 64, 256, 1, 4, 3
++    if m <= 64:
++        return 64, 64, 128, 8, 4, 4
++    return 128, 128, 64, 8, 4, 4
++
++
++def w8a8_matmul(q, a_scale, weight, weight_scale, bias, out_dtype, config=None):
++    """int8 q [M, K] x int8 weight [N, K] -> out_dtype [M, N] with the dequant epilogue."""
++    m, k = q.shape
++    n = weight.shape[0]
++    out = torch.empty((m, n), dtype=out_dtype, device=q.device)
++    if m == 0:
++        return out
++    block_m, block_n, block_k, group_m, warps, stages = config or _gemm_config(m, n, k)
++    grid = (triton.cdiv(int(m), block_m) * triton.cdiv(int(n), block_n),)
++    _w8a8_gemm_kernel[grid](
++        q, weight, out, a_scale, weight_scale, bias if bias is not None else a_scale,
++        int(m), int(n), int(k),
++        int(q.stride(0)), int(q.stride(1)),
++        int(weight.stride(0)), int(weight.stride(1)),
++        int(out.stride(0)), int(out.stride(1)),
++        HAS_BIAS=bias is not None,
++        EVEN_K=(int(k) % block_k == 0),
++        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=group_m,
++        num_warps=warps, num_stages=stages,
++    )
++    return out
++
++
++def w8a8_linear(x2d, weight, weight_scale, bias):
++    """Real int8 W8A8 linear: Triton per-token quant, then int8 GEMM + epilogue."""
++    q, a_scale = quantize_activation_int8(x2d)
++    return w8a8_matmul(q, a_scale, weight, weight_scale, bias, x2d.dtype)
++
++
++def w8a8_linear_reference(x, weight, weight_scale, bias):
++    """fp16 dequant reference: same quantization, dense fp16 matmul. CPU-safe."""
++    x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / 127
++    x_q = torch.round(x / x_scale).clamp_(-127, 127).mul_(x_scale)
++    w = weight.to(x.dtype).mul_(weight_scale.reshape(-1, 1).to(x.dtype))
++    b = None if bias is None else bias.to(x.dtype)
++    return F.linear(x_q, w, b)
++
++
++CONFIG_CANDIDATES = (
++    (128, 128, 64, 8, 4, 4),
++    (128, 128, 64, 8, 8, 3),
++    (128, 256, 64, 8, 8, 3),
++    (64, 128, 128, 8, 4, 4),
++    (64, 64, 128, 8, 4, 4),
++    (16, 64, 256, 1, 4, 3),
++)
++
++
++def tune_config(m, n, k, *, device="cuda", candidates=CONFIG_CANDIDATES, iters=20):
++    """Time each candidate tile config on random int8 inputs of this shape; return the fastest.
++
++    Use once per (M, N, K) on a GPU whose compute capability is not in kernel.json
++    `tuned_on`, then pass the result as `config` to `w8a8_matmul`.
++    """
++    q = torch.randint(-127, 128, (m, k), dtype=torch.int8, device=device)
++    w = torch.randint(-127, 128, (n, k), dtype=torch.int8, device=device)
++    a_scale = torch.rand(m, dtype=torch.float32, device=device)
++    w_scale = torch.rand(n, 1, dtype=torch.float16, device=device)
++    best, best_t = None, float("inf")
++    for config in candidates:
++        try:
++            w8a8_matmul(q, a_scale, w, w_scale, None, torch.float16, config)
++        except Exception:  # a tile the GPU cannot fit (shared memory, registers)
++            continue
++        torch.cuda.synchronize(device)
++        start = time.perf_counter()
++        for _ in range(iters):
++            w8a8_matmul(q, a_scale, w, w_scale, None, torch.float16, config)
++        torch.cuda.synchronize(device)
++        elapsed = (time.perf_counter() - start) / iters
++        if elapsed < best_t:
++            best, best_t = config, elapsed
++    if best is None:
++        raise RuntimeError(f"no candidate config ran for M={m} N={n} K={k}")
++    return best
 diff --git a/utils/data_utils.py b/utils/data_utils.py
 index ea7e77c..dac9fcc 100644
 --- a/utils/data_utils.py
@@ -897,6 +1510,425 @@ index ae4a17d..864a960 100644
 +            kwargs["past_key_values"] = get_kv_cache(self.prefixed_key_values, bs)
          return self.model.forward(*args, **kwargs)
 \ No newline at end of file
+diff --git a/utils/packed_runtime.py b/utils/packed_runtime.py
+new file mode 100644
+index 0000000..fc15b20
+--- /dev/null
++++ b/utils/packed_runtime.py
+@@ -0,0 +1,413 @@
++"""Packed (real-integer) PrefixQuant-O1 artifacts: convert a fake-quant artifact, load, run.
++
++Format ``w4a4_int8_storage`` (see quantize/int_linear_packed.py): every decoder projection
++stores its W4 codes as int8 ``weight`` [out, in] + fp16 ``weight_scale`` [out, 1]; the residual
++norms, embeddings, lm_head, q_norm/k_norm stay fp16; the learned clipping factors keep their
++fake-path names (``*.input_quantizer.bound_factor``, ``*.output_quantizer.bound_factor``);
++the fp16 prefix KV and ``prefixequant_config.json`` are copied unchanged.
++
++``convert_artifact`` reads the verified fake-quant artifact shard by shard (fp16 weights on the
++grid of ``weight_quantizer.scale``) and writes the packed one, checking that every code
++reproduces its fp16 weight bit for bit. ``load_packed_model`` builds the model on the meta device,
++swaps in the packed modules, allocates on the GPU and copies the saved tensors in (no fp16
++copy of the projections is ever built), then attaches the R3 Hadamard + K4 wrapper, the prefix
++KV injection and the prefix-aware SDPA attention.
++
++Attention (``prefixquant_sdpa``): with the P-token prefix in the cache a prefill has
++q_len = L, kv_len = P + L, so ``is_causal`` (top-left aligned) cannot be used directly. When the
++caller has no padding the query is front-padded with P zero rows, which makes the causal mask
++square (row P + i sees keys 0..P + i, exactly the bottom-right mask), SDPA runs its flash kernel
++with ``is_causal=True`` and the P padded rows are dropped. Decode (q_len = 1) attends to the whole
++cache without a mask. Anything else (padding, long offsets) uses the 4D mask transformers built.
++"""
++import json
++import math
++import os
++import shutil
++import types
++
++import torch
++import torch.nn.functional as F
++from transformers.cache_utils import Cache, DynamicCache
++
++import utils.model_utils as model_utils
++from quantize import int_linear_packed as packed
++from quantize.int_linear_packed import FORMAT, PackedQuantLinear, PackedQuantRMSNorm
++
++QUANT_CONFIG_FILE = 'prefixequant_config.json'
++ATTN_IMPL = 'prefixquant_sdpa'
++PREFIX_PAD_LIMIT = 64
++ATTN_PROJ = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
++MLP_PROJ = ('gate_proj', 'up_proj', 'down_proj')
++SHARD_BYTES = 4 * 1024 ** 3
++COPY_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json',
++              'special_tokens_map.json', 'added_tokens.json', 'vocab.json', 'merges.txt',
++              'tokenizer.model', 'chat_template.jinja', model_utils.PREFIX_KV_FILE)
++
++
++# ----------------------------------------------------------------------------- config
++
++def read_config(model_path):
++    with open(os.path.join(model_path, QUANT_CONFIG_FILE)) as handle:
++        return json.load(handle)
++
++
++def is_packed(model_path):
++    path = os.path.join(model_path, QUANT_CONFIG_FILE)
++    if not os.path.exists(path):
++        return False
++    return read_config(model_path).get('packed_format') == FORMAT
++
++
++def check_supported(qcfg):
++    """The packed path implements PrefixQuant-O1 exactly; refuse anything else."""
++    want = {'wbits': 4, 'w_group_size': -1, 'w_asym': False, 'input_bits': 4, 'input_group_size': -1,
++            'input_asym': False, 'input_mode': 'dynamic', 'kv_asym': False, 'k_pre_rope': False}
++    bad = {k: qcfg.get(k) for k, v in want.items() if qcfg.get(k) != v}
++    for key in ('k_bits', 'v_bits'):
++        if qcfg.get(key, 16) < 16 and (qcfg.get('kv_mode') != 'dynamic' or qcfg.get(key) != 4):
++            bad[key] = (qcfg.get(key), qcfg.get('kv_mode'))
++    if bad:
++        raise ValueError(f'packed {FORMAT} supports PrefixQuant-O1 (W4 per-channel sym, dynamic per-token A4 sym, '
++                         f'dynamic KV4 sym); artifact differs: {bad}')
++
++
++def kernel_quant_config(qcfg):
++    """Keys `kernels.py match` reads from quantization_config.json."""
++    return {
++        'format': FORMAT,
++        'quant_method': 'prefixquant',
++        'w_bits': 4,
++        'a_bits': 4,
++        'kv_bits': 4 if qcfg.get('k_bits', 16) < 16 else 16,
++        'weight_quant': 'per_channel',
++        'act_quant': 'per_token',
++        'w_sym': True,
++        'a_sym': True,
++        'online_transforms': True,
++        'weight_storage': 'int8 codes in [-8, 7] + fp16 per-channel scale',
++        'kernels': 'Triton int8 GEMM (shared w8a8_int8) + fused RMSNorm/A4 quant + group KV4 fake quant; '
++                   'prefix-aware flash SDPA',
++    }
++
++
++# ----------------------------------------------------------------------------- conversion
++
++def _weight_files(model_path):
++    index = os.path.join(model_path, 'model.safetensors.index.json')
++    if os.path.exists(index):
++        with open(index) as handle:
++            return sorted(set(json.load(handle)['weight_map'].values()))
++    return ['model.safetensors']
++
++
++def _layer_proj(key):
++    """'model.layers.3.self_attn.q_proj.weight' -> 'model.layers.3.self_attn.q_proj' for decoder projections."""
++    if not key.endswith('.weight') or '.layers.' not in key:
++        return None
++    prefix = key[:-len('.weight')]
++    if prefix.split('.')[-1] in ATTN_PROJ + MLP_PROJ:
++        return prefix
++    return None
++
++
++@torch.no_grad()
++def convert_artifact(src, dst, device='cuda', log=print):
++    """Fake-quant PrefixQuant-O1 artifact at ``src`` -> packed ``w4a4_int8_storage`` artifact at ``dst``."""
++    from safetensors import safe_open
++    from safetensors.torch import save_file
++
++    if os.path.abspath(src) == os.path.abspath(dst):
++        raise ValueError('convert into a new directory, not in place')
++    qcfg = read_config(src)
++    check_supported(qcfg)
++    os.makedirs(dst, exist_ok=True)
++
++    handles = {name: safe_open(os.path.join(src, name), framework='pt') for name in _weight_files(src)}
++    where = {key: name for name, h in handles.items() for key in h.keys()}
++    out_keys = {}
++    projections = 0
++    for key in sorted(where):
++        if key.endswith('.weight_quantizer.scale'):
++            continue  # folded into <proj>.weight_scale
++        tensor = handles[where[key]].get_tensor(key)
++        proj = _layer_proj(key)
++        if proj is not None:
++            scale_key = proj + '.weight_quantizer.scale'
++            if scale_key not in where:
++                raise RuntimeError(f'{key}: no {scale_key} in the artifact')
++            scale = handles[where[scale_key]].get_tensor(scale_key)
++            codes, wscale = packed.pack_weight(tensor.to(device), scale.to(device), check=True)
++            out_keys[proj + '.weight'] = codes.cpu()
++            out_keys[proj + '.weight_scale'] = wscale.cpu()
++            projections += 1
++            continue
++        if key.endswith('bound_factor') and tensor.dim() == 0:
++            tensor = tensor.reshape(1)  # legacy 0-dim factor
++        out_keys[key] = tensor.contiguous()
++    if projections == 0:
++        raise RuntimeError('no decoder projections found to pack')
++
++    # shard and write
++    shards, current, size = [], {}, 0
++    for key in sorted(out_keys):
++        nbytes = out_keys[key].numel() * out_keys[key].element_size()
++        if current and size + nbytes > SHARD_BYTES:
++            shards.append(current)
++            current, size = {}, 0
++        current[key] = out_keys[key]
++        size += nbytes
++    shards.append(current)
++    weight_map, total = {}, 0
++    for i, shard in enumerate(shards):
++        name = f'model-{i + 1:05d}-of-{len(shards):05d}.safetensors'
++        save_file(shard, os.path.join(dst, name), metadata={'format': 'pt', 'packed_format': FORMAT})
++        for key, tensor in shard.items():
++            weight_map[key] = name
++            total += tensor.numel() * tensor.element_size()
++    with open(os.path.join(dst, 'model.safetensors.index.json'), 'w') as handle:
++        json.dump({'metadata': {'total_size': total, 'packed_format': FORMAT}, 'weight_map': weight_map}, handle, indent=2)
++
++    for name in COPY_FILES:
++        path = os.path.join(src, name)
++        if os.path.exists(path):
++            shutil.copy2(path, os.path.join(dst, name))
++    qcfg = dict(qcfg)
++    qcfg['packed_format'] = FORMAT
++    qcfg['real_quant'] = True
++    qcfg['packed_from'] = os.path.abspath(src)
++    with open(os.path.join(dst, QUANT_CONFIG_FILE), 'w') as handle:
++        json.dump(qcfg, handle, indent=4)
++    log(f'packed {projections} projections into {len(shards)} shard(s), {total / 1e9:.2f} GB of tensors')
++    return {'projections': projections, 'shards': len(shards), 'tensor_bytes': total}
++
++
++# ----------------------------------------------------------------------------- attention
++
++def prefix_sdpa_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None,
++                          is_causal=None, **kwargs):
++    q_len, kv_len = query.shape[2], key.shape[2]
++    offset = kv_len - q_len
++    if kwargs.get('pq_dense_causal', False) and 0 <= offset <= PREFIX_PAD_LIMIT and dropout == 0.0:
++        gqa = query.shape[1] != key.shape[1]
++        if q_len == 1:
++            out = F.scaled_dot_product_attention(query, key, value, scale=scaling, enable_gqa=gqa)
++        else:
++            if offset:
++                pad = query.new_zeros(query.shape[0], query.shape[1], offset, query.shape[3])
++                query = torch.cat([pad, query], dim=2)
++            out = F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=scaling, enable_gqa=gqa)
++            if offset:
++                out = out[:, :, offset:]
++        return out.transpose(1, 2).contiguous(), None
++    from transformers.integrations.sdpa_attention import sdpa_attention_forward
++    return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
++                                  is_causal=is_causal, **kwargs)
++
++
++def register_attention():
++    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++    try:
++        ALL_ATTENTION_FUNCTIONS[ATTN_IMPL] = prefix_sdpa_attention
++    except TypeError:
++        ALL_ATTENTION_FUNCTIONS.register(ATTN_IMPL, prefix_sdpa_attention)
++
++
++# ----------------------------------------------------------------------------- R3 + K4 wrapper
++
++def _qk_wrapper_class():
++    from fast_hadamard_transform import hadamard_transform
++    from utils.rotation_utils import QKRotationWrapper
++
++    class PackedQKRotationWrapper(QKRotationWrapper):
++        """QKRotationWrapper with the K4 group quantizer as one Triton kernel (same numbers)."""
++
++        def forward(self, *args, **kwargs):
++            q, k = self.func(*args, **kwargs)
++            dtype = q.dtype
++            if self.online_had:
++                q = hadamard_transform(q.float(), scale=1 / math.sqrt(q.shape[-1])).to(dtype)
++                k = hadamard_transform(k.float(), scale=1 / math.sqrt(k.shape[-1])).to(dtype)
++            if self.use_k_quant and self.k_bits < 16:
++                # groups of head_dim along the last axis == the fake path's transpose/flatten grouping
++                k = packed.group_fake_quant4(k, self.k_group, self.k_bound_factor)
++            return q, k
++
++    return PackedQKRotationWrapper
++
++
++def add_qk_wrapper(layer, rope_function_name, config, qcfg):
++    import functools
++    import quantize.monkeypatch as monkeypatch
++    cls = _qk_wrapper_class()
++    attn = layer.self_attn
++    wrapper = monkeypatch.add_wrapper_after_function_call_in_method(
++        attn, 'forward', rope_function_name,
++        functools.partial(cls, config=config, online_had=bool(qcfg.get('qk_online_had'))))
++    setattr(attn, f'{rope_function_name}_qk_rotation_wrapper', wrapper)
++    k_bits = qcfg.get('k_bits', 16)
++    wrapper.use_k_quant = k_bits < 16
++    wrapper.k_bits = k_bits
++    head_dim = model_utils.get_head_dim(config)
++    group = qcfg.get('kv_group_size', head_dim)
++    if group not in (-1, head_dim):
++        raise ValueError(f'K quant group {group} must be head_dim {head_dim}')
++    wrapper.k_group = head_dim
++    wrapper.k_bound_factor = None  # init_k_quantizer builds the K quantizer without clipping
++    return wrapper
++
++
++# ----------------------------------------------------------------------------- model build + load
++
++def _build_skeleton(model_path, dtype, qcfg):
++    from transformers import AutoConfig, AutoModelForCausalLM
++
++    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
++    clipping = bool(qcfg.get('activation_clipping'))
++    v_group = qcfg.get('kv_group_size', 128) if qcfg.get('v_bits', 16) < 16 else 0
++    eps = model_utils.get_rms_norm_eps(config)
++    with torch.device('meta'):
++        model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype, attn_implementation='sdpa')
++        for layer in model_utils.get_layers(model):
++            attn, mlp = layer.self_attn, layer.mlp
++            for name in ATTN_PROJ:
++                lin = getattr(attn, name)
++                setattr(attn, name, PackedQuantLinear(
++                    lin.in_features, lin.out_features, bias=lin.bias is not None,
++                    input_source='dynamic' if name == 'o_proj' else 'norm',
++                    output_group=v_group if name == 'v_proj' else 0, clipping=clipping, dtype=dtype))
++            for name in MLP_PROJ:
++                lin = getattr(mlp, name)
++                setattr(mlp, name, PackedQuantLinear(
++                    lin.in_features, lin.out_features, bias=lin.bias is not None,
++                    input_source='dynamic' if name == 'down_proj' else 'norm',
++                    online_had=bool(qcfg.get('down_online_had')) and name == 'down_proj',
++                    clipping=clipping, dtype=dtype))
++            for name in ('input_layernorm', 'post_attention_layernorm'):
++                norm = getattr(layer, name)
++                setattr(layer, name, PackedQuantRMSNorm(norm.weight.shape[0], eps, clipping=clipping, dtype=dtype))
++    return model
++
++
++@torch.no_grad()
++def _load_tensors(model, model_path, device):
++    from safetensors import safe_open
++
++    state = dict(model.named_parameters())
++    state.update(dict(model.named_buffers()))
++    persistent = set(model.state_dict().keys())
++    expected = {k for k in state if k in persistent}
++    seen = set()
++    for name in _weight_files(model_path):
++        with safe_open(os.path.join(model_path, name), framework='pt') as handle:
++            for key in handle.keys():
++                if key not in expected:
++                    raise RuntimeError(f'unexpected tensor in packed artifact: {key}')
++                tensor = handle.get_tensor(key)
++                target = state[key]
++                if tensor.shape != target.shape:
++                    if tensor.numel() == target.numel():
++                        tensor = tensor.reshape(target.shape)
++                    else:
++                        raise RuntimeError(f'{key}: saved {tuple(tensor.shape)} vs built {tuple(target.shape)}')
++                if tensor.dtype != target.dtype and target.dtype != torch.int8:
++                    tensor = tensor.to(target.dtype)
++                elif target.dtype == torch.int8 and tensor.dtype != torch.int8:
++                    raise RuntimeError(f'{key}: expected int8 codes, got {tensor.dtype}')
++                target.copy_(tensor)
++                seen.add(key)
++    missing = sorted(expected - seen)
++    if missing:
++        raise RuntimeError(f'packed artifact is missing {len(missing)} tensors: {missing[:8]}')
++
++
++def load_packed_model(model_path, device='cuda', dtype=torch.float16):
++    if not str(device).startswith('cuda'):
++        raise RuntimeError(f'{FORMAT} artifacts need CUDA (Triton int8 GEMM); got device={device}')
++    if dtype != torch.float16:
++        dtype = torch.float16  # the kernels reproduce the fp16 fake-quant numerics
++    qcfg = read_config(model_path)
++    check_supported(qcfg)
++    model = _build_skeleton(model_path, dtype, qcfg)
++    model.to_empty(device=device)
++    _load_tensors(model, model_path, device)
++    for param in model.parameters():
++        param.requires_grad = False
++    model_utils.restore_rope_fp32(model)  # inv_freq is a non-persistent buffer: recompute on device
++    for module in model.modules():
++        if isinstance(module, PackedQuantLinear) and module.online_had:
++            module.setup_online_had(device, dtype)
++    rope_function_name = model_utils.get_rope_function_name(model)
++    for layer in model_utils.get_layers(model):
++        add_qk_wrapper(layer, rope_function_name, model.config, qcfg)
++    try:
++        from transformers import GenerationConfig
++        model.generation_config = GenerationConfig.from_pretrained(model_path, local_files_only=True)
++    except Exception:
++        pass
++    register_attention()
++    model.config._attn_implementation = ATTN_IMPL
++
++    prefix = None
++    if qcfg.get('set_prefixed_tokens'):
++        prefix = model_utils.load_prefixed_key_values(model_path, device=device, dtype=dtype)
++        if prefix is None:
++            raise RuntimeError('artifact has set_prefixed_tokens but no prefixed_key_values file')
++    install_prefix(model, prefix)
++    model.eval()
++    clip = [k for k, _ in model.named_parameters() if k.endswith('bound_factor')]
++    model.quant_agent_runtime = {
++        'format': FORMAT,
++        'packed_linears': sum(isinstance(m, PackedQuantLinear) for m in model.modules()),
++        'fused_norm_quant': sum(isinstance(m, PackedQuantRMSNorm) for m in model.modules()),
++        'input_mode': qcfg.get('input_mode'),
++        'kv_mode': qcfg.get('kv_mode'),
++        'activation_clipping': bool(qcfg.get('activation_clipping')),
++        'clipping_factors': len(clip),
++        'prefixed_tokens': qcfg.get('prefixed_tokens'),
++        'prefix_length': 0 if prefix is None else int(prefix[0][0].shape[-2]),
++        'down_online_had': bool(qcfg.get('down_online_had')),
++        'qk_online_had': bool(qcfg.get('qk_online_had')),
++        'attention': ATTN_IMPL,
++    }
++    return model
++
++
++def install_prefix(model, prefixed_key_values):
++    """prefix_runtime.install_prefix plus the no-padding flag the prefix-aware SDPA reads."""
++    base = model.__class__
++    if getattr(base, '_quant_agent_prefix_class', False):
++        base = base.__mro__[1]
++    model._quant_agent_prefix_kv = prefixed_key_values
++    model._quant_agent_prefix_len = 0 if prefixed_key_values is None else int(prefixed_key_values[0][0].shape[-2])
++
++    def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
++                inputs_embeds=None, labels=None, use_cache=None, cache_position=None, **kwargs):
++        prefix_len = self._quant_agent_prefix_len
++        ref = input_ids if input_ids is not None else inputs_embeds
++        if prefix_len and ref is not None:
++            if past_key_values is None:
++                past_key_values = DynamicCache()
++            if (isinstance(past_key_values, Cache)
++                    and not getattr(past_key_values, '_quant_agent_prefix_len', 0)
++                    and past_key_values.get_seq_length() == 0):
++                model_utils.fill_prefix_cache(past_key_values, self._quant_agent_prefix_kv, ref.shape[0])
++                past_key_values._quant_agent_prefix_len = prefix_len
++            shift = getattr(past_key_values, '_quant_agent_prefix_len', 0)
++            if shift:
++                if attention_mask is not None and attention_mask.dim() == 2:
++                    attention_mask = torch.cat(
++                        [attention_mask.new_ones((attention_mask.shape[0], shift)), attention_mask], dim=-1)
++                if cache_position is not None:
++                    cache_position = cache_position + shift
++                if position_ids is not None:
++                    position_ids = position_ids + shift
++        dense = attention_mask is None or (attention_mask.dim() == 2 and bool(attention_mask.all()))
++        kwargs['pq_dense_causal'] = dense
++        return base.forward(self, input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
++                            past_key_values=past_key_values, inputs_embeds=inputs_embeds, labels=labels,
++                            use_cache=use_cache, cache_position=cache_position, **kwargs)
++
++    model.__class__ = type('Prefixed' + base.__name__, (base,),
++                           {'forward': forward, '_quant_agent_prefix_class': True, '__module__': base.__module__})
++    return model
 diff --git a/utils/prefix_runtime.py b/utils/prefix_runtime.py
 new file mode 100644
 index 0000000..97917b3

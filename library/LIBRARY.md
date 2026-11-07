@@ -52,6 +52,15 @@ GPU: NVIDIA GeForce RTX 3090
 
 PPL ratio is against the same runtime's 16-bit model. vLLM reserves its KV cache up front, so its VRAM is not shown. SmoothQuant: export drift 0.9999 vs this board (≤ 1.02); vLLM 0.30.0, Transformers 4.46.3, 2026-11-02.
 
+## Qwen/Qwen3-8B on vast-rtx3090
+GPU: NVIDIA GeForce RTX 3090
+
+| Model | GPU | Method | Paper | Repo | Port | Hugging Face | vLLM | PPL ratio | tok/s | VRAM GB |
+| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| Qwen/Qwen3-8B | vast-rtx3090 | PrefixQuant | [paper](https://arxiv.org/abs/2410.05265) | [repo](https://github.com/ChenMnZ/PrefixQuant) | [port](ports/Qwen_Qwen3-8B__vast-rtx3090__PrefixQuant) | [hub](https://huggingface.co/chris320211/prefixquant-qwen3-8b-vastrtx3090) |  | 1.1516 | 6588.5 | 11.998 |
+
+**Best:** PrefixQuant (`prefixquant-qwen3-8b-vastrtx3090`).
+
 ## google/gemma-2-2b-it on g5.2xlarge
 GPU: NVIDIA A10G
 

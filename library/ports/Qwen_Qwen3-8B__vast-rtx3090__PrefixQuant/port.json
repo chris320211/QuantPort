@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "kind": "attempt",
+  "kind": "contribution",
   "model_id": "Qwen/Qwen3-8B",
   "model_type": "qwen3",
   "method_name": "PrefixQuant",
   "gpu_instance": "vast-rtx3090",
   "slug": "prefixquant-qwen3-8b-vastrtx3090",
-  "job_id": "20261107T001415Z-5642d6",
+  "job_id": "20261107T033248Z-1b1409",
   "repo_url": "https://github.com/ChenMnZ/PrefixQuant",
   "repo_commit": "60b74237cf2cf20e3354569d998ab708ff598ce3",
-  "patch_sha256": "25bf41420cf826a064e0e0cfca9e2a75d7ff85d3445635acc06fbbc5e82db78d",
+  "patch_sha256": "bcf1fd619a6ee60deaea0f1de4c221c73972fba3f4d116269dc82761ae9bf8d4",
   "files": [
     "differences.json",
     "manifest.json",
